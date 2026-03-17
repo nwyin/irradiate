@@ -294,6 +294,7 @@ fn collect_expr_mutations(
             add_string_mutation(s, source, cursor, mutations);
         }
         Expression::Call(call) => {
+            add_method_mutations(call, source, cursor, mutations);
             collect_expr_mutations(&call.func, source, cursor, mutations, ignored);
             for arg in &call.args {
                 collect_expr_mutations(&arg.value, source, cursor, mutations, ignored);
@@ -700,6 +701,43 @@ fn add_augassign_mutations(
     );
 }
 
+/// String method swaps: .lower() ↔ .upper(), .lstrip() ↔ .rstrip(), etc.
+static METHOD_SWAPS: &[(&str, &str)] = &[
+    ("lower", "upper"),
+    ("upper", "lower"),
+    ("lstrip", "rstrip"),
+    ("rstrip", "lstrip"),
+    ("find", "rfind"),
+    ("rfind", "find"),
+];
+
+fn add_method_mutations(
+    call: &cst::Call,
+    source: &str,
+    cursor: &mut usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // Only mutate if the call target is an attribute access (i.e., obj.method())
+    if let Expression::Attribute(attr) = &*call.func {
+        let method_name = codegen_node(&attr.attr);
+        let method_trimmed = method_name.trim();
+
+        for &(from, to) in METHOD_SWAPS {
+            if method_trimmed == from {
+                find_and_record(
+                    &method_name,
+                    &method_name.replace(from, to),
+                    "method_swap",
+                    source,
+                    cursor,
+                    mutations,
+                );
+                break;
+            }
+        }
+    }
+}
+
 // --- Utility ---
 
 fn codegen_node<'a>(node: &impl Codegen<'a>) -> String {
@@ -889,5 +927,52 @@ mod tests {
             .iter()
             .find(|m| m.operator == "lambda_mutation");
         assert!(lam.is_some(), "Should find lambda → None mutation");
+    }
+
+    #[test]
+    fn test_method_swap_lower_upper() {
+        let source = "def foo(s):\n    return s.lower()\n";
+        let fms = collect_file_mutations(source);
+        let method_mut = fms[0].mutations.iter().find(|m| m.operator == "method_swap");
+        assert!(method_mut.is_some(), "Should find .lower() → .upper() mutation");
+        let m = method_mut.unwrap();
+        assert_eq!(m.original, "lower");
+        assert_eq!(m.replacement, "upper");
+    }
+
+    #[test]
+    fn test_method_swap_lstrip_rstrip() {
+        let source = "def foo(s):\n    return s.lstrip()\n";
+        let fms = collect_file_mutations(source);
+        let method_mut = fms[0].mutations.iter().find(|m| m.operator == "method_swap");
+        assert!(method_mut.is_some());
+        let m = method_mut.unwrap();
+        assert_eq!(m.original, "lstrip");
+        assert_eq!(m.replacement, "rstrip");
+    }
+
+    #[test]
+    fn test_chained_method_swaps() {
+        let source = "def foo(s):\n    return s.lower().lstrip()\n";
+        let fms = collect_file_mutations(source);
+        let method_muts: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "method_swap")
+            .collect();
+        assert_eq!(method_muts.len(), 2, "Should find 2 method swap mutations");
+    }
+
+    #[test]
+    fn test_non_matching_method_not_mutated() {
+        let source = "def foo(s):\n    return s.strip()\n";
+        let fms = collect_file_mutations(source);
+        // No mutations at all means no method_swap mutations — the function is excluded entirely
+        let method_muts: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "method_swap")
+            .collect();
+        assert!(method_muts.is_empty(), ".strip() is not in METHOD_SWAPS");
     }
 }
