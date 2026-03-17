@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -33,6 +33,9 @@ pub struct PoolConfig {
     /// Must include harness_dir, mutants_dir, and the project source parent so
     /// sibling module imports in mutated code resolve correctly.
     pub pythonpath: String,
+    /// Respawn workers after this many mutants to prevent pytest state accumulation.
+    /// Set to 0 to disable recycling.
+    pub worker_recycle_after: usize,
 }
 
 impl Default for PoolConfig {
@@ -46,6 +49,7 @@ impl Default for PoolConfig {
             timeout_multiplier: 10.0,
             default_timeout: Duration::from_secs(30),
             pythonpath: String::new(),
+            worker_recycle_after: 100,
         }
     }
 }
@@ -101,7 +105,7 @@ pub async fn run_worker_pool(
 
     let num_workers = config.num_workers.min(work_items.len());
 
-    // Spawn workers
+    // Spawn initial workers
     let mut processes: Vec<Child> = Vec::new();
     for i in 0..num_workers {
         let child = spawn_worker(i, config, &harness_dir, &socket_path)?;
@@ -151,6 +155,107 @@ fn spawn_worker(
     Ok(child)
 }
 
+/// Spawn a tokio task that forwards messages between the orchestrator and a connected worker.
+///
+/// Returns a sender for sending OrchestratorMessages to the worker.
+fn spawn_worker_task(
+    worker_id: usize,
+    reader: tokio::net::unix::OwnedReadHalf,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    event_tx: mpsc::Sender<WorkerEvent>,
+    default_timeout: Duration,
+    timeout_multiplier: f64,
+) -> mpsc::Sender<OrchestratorMessage> {
+    let (msg_tx, mut msg_rx) = mpsc::channel::<OrchestratorMessage>(8);
+    let mut reader = BufReader::new(reader);
+
+    tokio::spawn(async move {
+        // Spawn writer task
+        let (write_tx, mut write_rx) = mpsc::channel::<String>(8);
+        tokio::spawn(async move {
+            while let Some(data) = write_rx.recv().await {
+                if writer.write_all(data.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        loop {
+            tokio::select! {
+                msg = msg_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            let json = serde_json::to_string(&msg).unwrap() + "\n";
+                            if write_tx.send(json).await.is_err() {
+                                let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+                line = async {
+                    let mut line = String::new();
+                    match timeout(default_timeout.mul_f64(timeout_multiplier), reader.read_line(&mut line)).await {
+                        Ok(Ok(0)) => None, // EOF
+                        Ok(Ok(_)) => Some(Ok(line)),
+                        Ok(Err(e)) => Some(Err(e)),
+                        Err(_) => Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "worker timed out"))),
+                    }
+                } => {
+                    match line {
+                        None => {
+                            let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
+                            break;
+                        }
+                        Some(Ok(line)) => {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            match serde_json::from_str::<WorkerMessage>(line.trim()) {
+                                Ok(WorkerMessage::Result { mutant, exit_code, duration }) => {
+                                    let status = MutantStatus::from_exit_code(exit_code, false);
+                                    let _ = event_tx.send(WorkerEvent::Result {
+                                        worker_id,
+                                        result: MutantResult {
+                                            mutant_name: mutant,
+                                            exit_code,
+                                            duration,
+                                            status,
+                                        },
+                                    }).await;
+                                }
+                                Ok(WorkerMessage::Ready { .. }) => {
+                                    let _ = event_tx.send(WorkerEvent::Ready { worker_id }).await;
+                                }
+                                Ok(WorkerMessage::Error { mutant, message, .. }) => {
+                                    let _ = event_tx.send(WorkerEvent::Error {
+                                        worker_id,
+                                        message,
+                                        mutant,
+                                    }).await;
+                                }
+                                Err(e) => {
+                                    warn!("Worker {worker_id}: failed to parse message: {e}: {line}");
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            if e.kind() == std::io::ErrorKind::TimedOut {
+                                warn!("Worker {worker_id}: timed out");
+                            }
+                            let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    msg_tx
+}
+
 async fn dispatch_work(
     listener: UnixListener,
     mut processes: Vec<Child>,
@@ -172,139 +277,19 @@ async fn dispatch_work(
     let mut active_mutants: HashMap<usize, String> = HashMap::new(); // worker_id -> mutant_name
     let mut next_worker_id: usize = 0;
 
-    // Accept connections with a timeout
-    let num_workers = processes.len();
+    // Recycling state
+    let mut worker_recycle_counts: HashMap<usize, usize> = HashMap::new();
+    let mut recycled_worker_ids: HashSet<usize> = HashSet::new();
+    // Number of spawned workers whose connection we're still waiting to accept.
+    // Starts at num_workers (initial workers already spawned before dispatch_work is called).
+    let mut pending_accepts: usize = processes.len();
+
+    let recycle_after = config.worker_recycle_after;
     let accept_timeout = Duration::from_secs(30);
+    let default_timeout = config.default_timeout;
+    let timeout_multiplier = config.timeout_multiplier;
 
-    for _ in 0..num_workers {
-        let worker_id = next_worker_id;
-        next_worker_id += 1;
-
-        let (stream, _) = timeout(accept_timeout, listener.accept())
-            .await
-            .context("Timeout waiting for worker to connect")?
-            .context("Failed to accept worker connection")?;
-
-        let (reader, writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let mut writer = writer;
-
-        // Read the ready message
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .context("Failed to read ready message")?;
-        let ready_msg: WorkerMessage =
-            serde_json::from_str(line.trim()).context("Failed to parse ready message")?;
-
-        match &ready_msg {
-            WorkerMessage::Ready { pid, .. } => {
-                info!("Worker {worker_id} (pid {pid}) connected and ready");
-            }
-            _ => {
-                warn!("Worker {worker_id} sent unexpected first message: {ready_msg:?}");
-            }
-        }
-
-        // Create a channel for sending messages to this worker
-        let (msg_tx, mut msg_rx) = mpsc::channel::<OrchestratorMessage>(8);
-        worker_senders.insert(worker_id, msg_tx);
-        idle_workers.push(worker_id);
-
-        // Spawn a task to handle this worker's communication
-        let event_tx = event_tx.clone();
-        let default_timeout = config.default_timeout;
-        let timeout_multiplier = config.timeout_multiplier;
-        tokio::spawn(async move {
-            // Spawn writer task
-            let (write_tx, mut write_rx) = mpsc::channel::<String>(8);
-            tokio::spawn(async move {
-                while let Some(data) = write_rx.recv().await {
-                    if writer.write_all(data.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            loop {
-                tokio::select! {
-                    msg = msg_rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                let json = serde_json::to_string(&msg).unwrap() + "\n";
-                                if write_tx.send(json).await.is_err() {
-                                    let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
-                                    break;
-                                }
-                            }
-                            None => break, // channel closed
-                        }
-                    }
-                    line = async {
-                        let mut line = String::new();
-                        match timeout(default_timeout.mul_f64(timeout_multiplier), reader.read_line(&mut line)).await {
-                            Ok(Ok(0)) => None, // EOF
-                            Ok(Ok(_)) => Some(Ok(line)),
-                            Ok(Err(e)) => Some(Err(e)),
-                            Err(_) => Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "worker timed out"))),
-                        }
-                    } => {
-                        match line {
-                            None => {
-                                let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
-                                break;
-                            }
-                            Some(Ok(line)) => {
-                                if line.trim().is_empty() {
-                                    continue;
-                                }
-                                match serde_json::from_str::<WorkerMessage>(line.trim()) {
-                                    Ok(WorkerMessage::Result { mutant, exit_code, duration }) => {
-                                        let status = MutantStatus::from_exit_code(exit_code, false);
-                                        let _ = event_tx.send(WorkerEvent::Result {
-                                            worker_id,
-                                            result: MutantResult {
-                                                mutant_name: mutant,
-                                                exit_code,
-                                                duration,
-                                                status,
-                                            },
-                                        }).await;
-                                    }
-                                    Ok(WorkerMessage::Ready { .. }) => {
-                                        let _ = event_tx.send(WorkerEvent::Ready { worker_id }).await;
-                                    }
-                                    Ok(WorkerMessage::Error { mutant, message, .. }) => {
-                                        let _ = event_tx.send(WorkerEvent::Error {
-                                            worker_id,
-                                            message,
-                                            mutant,
-                                        }).await;
-                                    }
-                                    Err(e) => {
-                                        warn!("Worker {worker_id}: failed to parse message: {e}: {line}");
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                if e.kind() == std::io::ErrorKind::TimedOut {
-                                    warn!("Worker {worker_id}: timed out");
-                                }
-                                let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Drop the original event_tx so the channel closes when all spawned tasks finish
-    drop(event_tx);
-
-    // Main dispatch loop
+    // Main dispatch loop — accepts initial worker connections and processes events
     loop {
         // Dispatch work to idle workers
         while let Some(&worker_id) = idle_workers.last() {
@@ -339,89 +324,200 @@ async fn dispatch_work(
         if results.len() >= total_items {
             break;
         }
-        if results.len() + active_mutants.len() == 0 && work_queue.is_empty() {
+        if results.len() + active_mutants.len() == 0 && work_queue.is_empty() && pending_accepts == 0 {
             break;
         }
 
-        // Wait for events
-        match event_rx.recv().await {
-            Some(WorkerEvent::Ready { worker_id }) => {
-                debug!("Worker {worker_id} ready");
-                if !idle_workers.contains(&worker_id) {
-                    idle_workers.push(worker_id);
-                }
+        // Stuck detection: no workers available, no active work, no pending accepts, but work remains
+        if idle_workers.is_empty()
+            && active_mutants.is_empty()
+            && !work_queue.is_empty()
+            && pending_accepts == 0
+            && worker_senders.is_empty()
+        {
+            error!(
+                "No available workers; marking {} remaining items as errors",
+                work_queue.len()
+            );
+            for item in work_queue.drain(..).rev() {
+                results.push(MutantResult {
+                    mutant_name: item.mutant_name,
+                    exit_code: -1,
+                    duration: 0.0,
+                    status: MutantStatus::Error,
+                });
             }
-            Some(WorkerEvent::Result { worker_id, result }) => {
-                info!(
-                    "Mutant {} -> {:?} ({:.3}s)",
-                    result.mutant_name, result.status, result.duration
-                );
-                active_mutants.remove(&worker_id);
-                results.push(result);
-                idle_workers.push(worker_id);
-            }
-            Some(WorkerEvent::Error {
-                worker_id,
-                message,
-                mutant,
-            }) => {
-                error!("Worker {worker_id} error: {message}");
-                if let Some(mutant_name) = mutant.or_else(|| active_mutants.remove(&worker_id)) {
-                    results.push(MutantResult {
-                        mutant_name,
-                        exit_code: -1,
-                        duration: 0.0,
-                        status: MutantStatus::Error,
-                    });
-                }
-                active_mutants.remove(&worker_id);
-                idle_workers.push(worker_id);
-            }
-            Some(WorkerEvent::Disconnected { worker_id }) => {
-                warn!("Worker {worker_id} disconnected");
-                // Record any active mutant as error
-                if let Some(mutant_name) = active_mutants.remove(&worker_id) {
-                    results.push(MutantResult {
-                        mutant_name,
-                        exit_code: -1,
-                        duration: 0.0,
-                        status: MutantStatus::Error,
-                    });
-                }
-                worker_senders.remove(&worker_id);
+            break;
+        }
 
-                // Respawn if we still have work
-                if !work_queue.is_empty() {
-                    info!("Respawning worker to replace {worker_id}");
-                    let new_id = next_worker_id;
-                    next_worker_id += 1;
-                    match spawn_worker(new_id, config, harness_dir, socket_path) {
-                        Ok(child) => {
-                            processes.push(child);
-                            // The new worker will connect and we'd need to accept it.
-                            // For simplicity in this version, we continue without the respawned worker.
-                            // The remaining workers will pick up the slack.
-                            warn!("Respawned worker {new_id} — but hot-accept not yet implemented, continuing with remaining workers");
+        tokio::select! {
+            // Accept a pending worker connection (initial or replacement)
+            r = timeout(accept_timeout, listener.accept()), if pending_accepts > 0 => {
+                pending_accepts -= 1;
+                match r {
+                    Ok(Ok((stream, _))) => {
+                        let worker_id = next_worker_id;
+                        next_worker_id += 1;
+
+                        let (reader, writer) = stream.into_split();
+                        let mut buf_reader = BufReader::new(reader);
+
+                        // Read the ready message
+                        let mut line = String::new();
+                        match timeout(Duration::from_secs(10), buf_reader.read_line(&mut line)).await {
+                            Ok(Ok(0)) => {
+                                error!("Worker {worker_id}: disconnected before sending ready message");
+                            }
+                            Ok(Ok(_)) => {
+                                match serde_json::from_str::<WorkerMessage>(line.trim()) {
+                                    Ok(WorkerMessage::Ready { pid, .. }) => {
+                                        info!("Worker {worker_id} (pid {pid}) connected and ready");
+                                        let msg_tx = spawn_worker_task(
+                                            worker_id,
+                                            buf_reader.into_inner(),
+                                            writer,
+                                            event_tx.clone(),
+                                            default_timeout,
+                                            timeout_multiplier,
+                                        );
+                                        worker_senders.insert(worker_id, msg_tx);
+                                        idle_workers.push(worker_id);
+                                    }
+                                    Ok(other) => {
+                                        warn!("Worker {worker_id}: unexpected first message: {other:?}");
+                                    }
+                                    Err(e) => {
+                                        error!("Worker {worker_id}: failed to parse ready message: {e}");
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                error!("Worker {worker_id}: error reading ready message: {e}");
+                            }
+                            Err(_) => {
+                                error!("Worker {worker_id}: timeout reading ready message");
+                            }
                         }
-                        Err(e) => {
-                            error!("Failed to respawn worker: {e}");
-                        }
+                    }
+                    Ok(Err(e)) => {
+                        error!("Failed to accept worker connection: {e}");
+                    }
+                    Err(_) => {
+                        error!("Timeout waiting for worker connection");
                     }
                 }
             }
-            None => {
-                // All event senders dropped — workers all disconnected
-                warn!("All workers disconnected");
-                // Record remaining active mutants as errors
-                for (_, mutant_name) in active_mutants.drain() {
-                    results.push(MutantResult {
-                        mutant_name,
-                        exit_code: -1,
-                        duration: 0.0,
-                        status: MutantStatus::Error,
-                    });
+
+            // Process events from workers
+            event = event_rx.recv() => {
+                match event {
+                    Some(WorkerEvent::Ready { worker_id }) => {
+                        debug!("Worker {worker_id} ready");
+                        if !idle_workers.contains(&worker_id) {
+                            idle_workers.push(worker_id);
+                        }
+                    }
+                    Some(WorkerEvent::Result { worker_id, result }) => {
+                        info!(
+                            "Mutant {} -> {:?} ({:.3}s)",
+                            result.mutant_name, result.status, result.duration
+                        );
+                        active_mutants.remove(&worker_id);
+                        results.push(result);
+
+                        let count = worker_recycle_counts.entry(worker_id).or_insert(0);
+                        *count += 1;
+
+                        if recycle_after > 0 && *count >= recycle_after && !work_queue.is_empty() {
+                            // Recycle: send shutdown, spawn a fresh replacement
+                            info!("Worker {worker_id}: recycling after {count} mutants");
+                            if let Some(sender) = worker_senders.remove(&worker_id) {
+                                let _ = sender.send(OrchestratorMessage::Shutdown).await;
+                            }
+                            worker_recycle_counts.remove(&worker_id);
+                            recycled_worker_ids.insert(worker_id);
+
+                            let spawn_id = next_worker_id; // ID the replacement will be assigned on accept
+                            match spawn_worker(spawn_id, config, harness_dir, socket_path) {
+                                Ok(child) => {
+                                    processes.push(child);
+                                    pending_accepts += 1;
+                                    info!("Spawned replacement worker {spawn_id}");
+                                }
+                                Err(e) => {
+                                    error!("Failed to spawn replacement worker: {e}");
+                                    // Stuck detection will surface the lack of workers if needed
+                                }
+                            }
+                            // Do NOT add worker_id back to idle_workers — it is being recycled
+                        } else {
+                            idle_workers.push(worker_id);
+                        }
+                    }
+                    Some(WorkerEvent::Error {
+                        worker_id,
+                        message,
+                        mutant,
+                    }) => {
+                        error!("Worker {worker_id} error: {message}");
+                        if let Some(mutant_name) = mutant.or_else(|| active_mutants.remove(&worker_id)) {
+                            results.push(MutantResult {
+                                mutant_name,
+                                exit_code: -1,
+                                duration: 0.0,
+                                status: MutantStatus::Error,
+                            });
+                        }
+                        active_mutants.remove(&worker_id);
+                        idle_workers.push(worker_id);
+                    }
+                    Some(WorkerEvent::Disconnected { worker_id }) => {
+                        if recycled_worker_ids.remove(&worker_id) {
+                            // Expected: we asked this worker to shut down for recycling
+                            debug!("Worker {worker_id}: recycled cleanly");
+                        } else {
+                            warn!("Worker {worker_id} disconnected unexpectedly");
+                            // Record any active mutant as error
+                            if let Some(mutant_name) = active_mutants.remove(&worker_id) {
+                                results.push(MutantResult {
+                                    mutant_name,
+                                    exit_code: -1,
+                                    duration: 0.0,
+                                    status: MutantStatus::Error,
+                                });
+                            }
+                            worker_senders.remove(&worker_id);
+
+                            // Respawn if we still have work
+                            if !work_queue.is_empty() {
+                                let spawn_id = next_worker_id;
+                                info!("Respawning worker {spawn_id} to replace crashed {worker_id}");
+                                match spawn_worker(spawn_id, config, harness_dir, socket_path) {
+                                    Ok(child) => {
+                                        processes.push(child);
+                                        pending_accepts += 1;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to respawn worker: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // All event_tx clones dropped — all worker tasks finished
+                        warn!("All worker tasks finished");
+                        for (_, mutant_name) in active_mutants.drain() {
+                            results.push(MutantResult {
+                                mutant_name,
+                                exit_code: -1,
+                                duration: 0.0,
+                                status: MutantStatus::Error,
+                            });
+                        }
+                        break;
+                    }
                 }
-                break;
             }
         }
     }

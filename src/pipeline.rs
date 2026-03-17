@@ -21,6 +21,8 @@ pub struct RunConfig {
     pub covered_only: bool,
     pub python: PathBuf,
     pub mutant_filter: Option<Vec<String>>,
+    /// Respawn workers after this many mutants (0 = disabled).
+    pub worker_recycle_after: usize,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -188,6 +190,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
             tests_dir: PathBuf::from(&config.tests_dir),
             timeout_multiplier: config.timeout_multiplier,
             pythonpath: pythonpath.clone(),
+            worker_recycle_after: config.worker_recycle_after,
             ..Default::default()
         };
 

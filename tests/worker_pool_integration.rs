@@ -172,6 +172,119 @@ async fn test_worker_pool_surviving_mutant() {
     );
 }
 
+/// INV-1: With recycling enabled, results must be identical to no-recycling.
+/// Use recycle_after=1 to force recycling after every single mutant — maximally exercises
+/// the recycle code path.
+#[tokio::test]
+async fn test_worker_pool_with_recycling() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+
+    assert!(
+        fixture.join("tests/test_simple.py").exists(),
+        "Test fixture must exist"
+    );
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__mutmut_"))
+        .expect("Should have an add mutant");
+
+    let is_pos_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_is_positive__mutmut_"))
+        .expect("Should have an is_positive mutant");
+
+    let greet_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_greet__mutmut_"))
+        .expect("Should have a greet mutant");
+
+    let work_items = vec![
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+        },
+        WorkItem {
+            mutant_name: is_pos_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
+        },
+        WorkItem {
+            mutant_name: greet_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_greet".to_string()],
+        },
+    ];
+
+    // recycle_after=1: worker is replaced after every single mutant
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: fixture.clone(),
+        mutants_dir: _tmp.path().to_path_buf(),
+        tests_dir: fixture.join("tests"),
+        timeout_multiplier: 10.0,
+        worker_recycle_after: 1,
+        ..Default::default()
+    };
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete with recycling");
+
+    assert_eq!(results.len(), 3, "Should have results for all 3 mutants");
+
+    for result in &results {
+        println!(
+            "  {} -> {:?} (exit_code={}, duration={:.3}s)",
+            result.mutant_name, result.status, result.exit_code, result.duration
+        );
+        assert_eq!(
+            result.status,
+            MutantStatus::Killed,
+            "Mutant {} should be killed even with recycling, got {:?}",
+            result.mutant_name,
+            result.status
+        );
+    }
+}
+
+/// Verify that recycle_after=0 disables recycling (single long-lived worker per slot).
+#[tokio::test]
+async fn test_worker_pool_recycle_disabled() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__mutmut_"))
+        .expect("Should have an add mutant");
+
+    let work_items = vec![WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+    }];
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: fixture.clone(),
+        mutants_dir: _tmp.path().to_path_buf(),
+        tests_dir: fixture.join("tests"),
+        timeout_multiplier: 10.0,
+        worker_recycle_after: 0, // disabled
+        ..Default::default()
+    };
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete with recycling disabled");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, MutantStatus::Killed);
+}
+
 #[tokio::test]
 async fn test_stats_collection() {
     let fixture = fixture_dir();

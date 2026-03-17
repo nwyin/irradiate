@@ -43,6 +43,10 @@ enum Commands {
         /// Python interpreter path
         #[arg(long, default_value = "python3")]
         python: String,
+
+        /// Respawn workers after N mutants to prevent pytest state accumulation (0 to disable)
+        #[arg(long, default_value_t = 100)]
+        worker_recycle_after: usize,
     },
 
     /// Display mutation testing results
@@ -78,6 +82,7 @@ async fn main() -> Result<()> {
             no_stats,
             covered_only,
             python,
+            worker_recycle_after,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config =
@@ -102,6 +107,7 @@ async fn main() -> Result<()> {
                 } else {
                     Some(mutant_names)
                 },
+                worker_recycle_after,
             })
             .await
         }
