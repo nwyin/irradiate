@@ -21,8 +21,16 @@ fi
 # Clean previous run
 rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 
-# Run mutation testing
-(cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1)
+# Run mutation testing (capture output for validation checks)
+RUN_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+echo "$RUN_OUTPUT"
+
+# Verify forced-fail validation ran
+if ! echo "$RUN_OUTPUT" | grep -q "forced-fail"; then
+    echo "FAIL: Expected 'forced-fail' in pipeline output — forced-fail validation may not have run"
+    exit 1
+fi
+echo "  forced-fail validation: OK"
 
 # Verify results
 echo ""

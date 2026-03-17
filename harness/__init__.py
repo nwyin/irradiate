@@ -1,5 +1,7 @@
 # irradiate harness — imported as irradiate_harness in mutated Python files
-active_mutant = None
+import os
+
+active_mutant = os.environ.get("IRRADIATE_ACTIVE_MUTANT")
 
 
 class ProgrammaticFailException(Exception):

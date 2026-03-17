@@ -98,6 +98,10 @@ pub async fn run(config: RunConfig) -> Result<()> {
     validate_clean_run(&config.python, &project_dir, &harness_dir, &mutants_dir, &config.tests_dir)?;
     eprintln!("  done");
 
+    eprintln!("Running forced-fail validation...");
+    validate_fail_run(&config.python, &project_dir, &harness_dir, &mutants_dir, &config.tests_dir)?;
+    eprintln!("  done");
+
     // Phase 4: Mutation testing
     eprintln!("Running mutation testing ({total_mutants} mutants, {} workers)...", config.workers);
     let start = Instant::now();
@@ -393,6 +397,42 @@ fn validate_clean_run(
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("Clean test run failed:\n{stdout}\n{stderr}");
+    }
+
+    Ok(())
+}
+
+fn validate_fail_run(
+    python: &Path,
+    project_dir: &Path,
+    harness_dir: &Path,
+    mutants_dir: &Path,
+    tests_dir: &str,
+) -> Result<()> {
+    let pythonpath = format!(
+        "{}:{}:{}",
+        harness_dir.display(),
+        mutants_dir.display(),
+        project_dir.join("src").display(),
+    );
+
+    let output = std::process::Command::new(python)
+        .arg("-m")
+        .arg("pytest")
+        .arg("-x")
+        .arg("-q")
+        .arg(tests_dir)
+        .env("PYTHONPATH", &pythonpath)
+        .env("IRRADIATE_ACTIVE_MUTANT", "fail")
+        .current_dir(project_dir)
+        .output()
+        .context("Failed to run forced-fail validation")?;
+
+    if output.status.success() {
+        bail!(
+            "Forced-fail validation failed: tests passed when they should have failed. \
+             The trampoline may not be wired correctly."
+        );
     }
 
     Ok(())
