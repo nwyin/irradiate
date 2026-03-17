@@ -1,3 +1,4 @@
+use irradiate::codegen;
 use irradiate::harness;
 use irradiate::orchestrator::{run_worker_pool, PoolConfig};
 use irradiate::protocol::{MutantStatus, WorkItem};
@@ -11,12 +12,10 @@ fn project_root() -> PathBuf {
 /// Find the Python interpreter in the test fixture's venv.
 fn fixture_python() -> PathBuf {
     let root = project_root();
-    let venv_python = root
-        .join("tests/fixtures/simple_project/.venv/bin/python3");
+    let venv_python = root.join("tests/fixtures/simple_project/.venv/bin/python3");
     if venv_python.exists() {
         venv_python
     } else {
-        // Fall back to system python
         PathBuf::from("python3")
     }
 }
@@ -25,16 +24,27 @@ fn fixture_dir() -> PathBuf {
     project_root().join("tests/fixtures/simple_project")
 }
 
+/// Generate mutants on the fly from the fixture source, writing to a temp directory.
+/// Returns (TempDir handle, list of mutant keys).
+fn generate_test_mutants() -> (tempfile::TempDir, Vec<String>) {
+    let source =
+        std::fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
+    let mutated =
+        codegen::mutate_file(&source, "simple_lib").expect("fixture should produce mutations");
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("simple_lib")).unwrap();
+    std::fs::write(tmp.path().join("simple_lib/__init__.py"), &mutated.source).unwrap();
+
+    (tmp, mutated.mutant_names)
+}
+
 #[tokio::test]
 async fn test_worker_pool_dispatches_mutants() {
     let fixture = fixture_dir();
     let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
 
-    // Verify fixture exists
-    assert!(
-        fixture.join("mutants/simple_lib/__init__.py").exists(),
-        "Trampolined fixture must exist"
-    );
     assert!(
         fixture.join("tests/test_simple.py").exists(),
         "Test fixture must exist"
@@ -44,31 +54,48 @@ async fn test_worker_pool_dispatches_mutants() {
         num_workers: 2,
         python,
         project_dir: fixture.clone(),
-        mutants_dir: fixture.join("mutants"),
+        mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         timeout_multiplier: 10.0,
         ..Default::default()
     };
 
+    // Pick one add mutant (should be killed by test_add)
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__mutmut_"))
+        .expect("Should have an add mutant");
+
+    // Pick an is_positive mutant (should be killed by test_is_positive)
+    let is_pos_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_is_positive__mutmut_"))
+        .expect("Should have an is_positive mutant");
+
+    // Pick a greet mutant (should be killed by test_greet)
+    let greet_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_greet__mutmut_"))
+        .expect("Should have a greet mutant");
+
     let work_items = vec![
-        // Mutant 1: add(a,b) returns a - b. Should be KILLED by test_add.
         WorkItem {
-            mutant_name: "simple_lib.x_add__mutmut_1".to_string(),
+            mutant_name: add_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_add".to_string()],
         },
-        // Mutant 2: add(a,b) returns a * b. Should be KILLED by test_add.
         WorkItem {
-            mutant_name: "simple_lib.x_add__mutmut_2".to_string(),
-            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
-        },
-        // Mutant 3: is_positive uses >= instead of >. Should be KILLED (is_positive(0) would return True).
-        WorkItem {
-            mutant_name: "simple_lib.x_is_positive__mutmut_1".to_string(),
+            mutant_name: is_pos_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
+        },
+        WorkItem {
+            mutant_name: greet_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_greet".to_string()],
         },
     ];
 
-    let results = run_worker_pool(&config, work_items).await.expect("Worker pool should complete");
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete");
 
     assert_eq!(results.len(), 3, "Should have results for all 3 mutants");
 
@@ -91,17 +118,20 @@ async fn test_worker_pool_dispatches_mutants() {
 async fn test_worker_pool_empty_work() {
     let fixture = fixture_dir();
     let python = fixture_python();
+    let (_tmp, _) = generate_test_mutants();
 
     let config = PoolConfig {
         num_workers: 1,
         python,
         project_dir: fixture.clone(),
-        mutants_dir: fixture.join("mutants"),
+        mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         ..Default::default()
     };
 
-    let results = run_worker_pool(&config, vec![]).await.expect("Empty work should succeed");
+    let results = run_worker_pool(&config, vec![])
+        .await
+        .expect("Empty work should succeed");
     assert!(results.is_empty());
 }
 
@@ -109,25 +139,18 @@ async fn test_worker_pool_empty_work() {
 async fn test_worker_pool_surviving_mutant() {
     let fixture = fixture_dir();
     let python = fixture_python();
+    let (_tmp, _) = generate_test_mutants();
 
     let config = PoolConfig {
         num_workers: 1,
         python,
         project_dir: fixture.clone(),
-        mutants_dir: fixture.join("mutants"),
+        mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         ..Default::default()
     };
 
-    // Mutant: greet returns "XXHello, XX" + name
-    // test_greet checks greet("World") == "Hello, World"
-    // "XXHello, XX" + "World" = "XXHello, XXWorld" != "Hello, World"
-    // So this should be KILLED.
-    //
-    // But mutant 2: greet returns "Hello, " - name -> TypeError -> KILLED
-    //
-    // To test a surviving mutant, we'd need one that the tests don't catch.
-    // Let's use a mutant name that doesn't match any function — the trampoline
+    // Use a mutant name that doesn't match any function — the trampoline
     // will call the original, so tests pass -> survived.
     let work_items = vec![WorkItem {
         mutant_name: "simple_lib.x_nonexistent__mutmut_1".to_string(),
@@ -138,7 +161,9 @@ async fn test_worker_pool_surviving_mutant() {
         ],
     }];
 
-    let results = run_worker_pool(&config, work_items).await.expect("Worker pool should complete");
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete");
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].status,
@@ -151,6 +176,7 @@ async fn test_worker_pool_surviving_mutant() {
 async fn test_stats_collection() {
     let fixture = fixture_dir();
     let python = fixture_python();
+    let (_tmp, _) = generate_test_mutants();
 
     // Extract harness
     let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
@@ -159,16 +185,11 @@ async fn test_stats_collection() {
         &python,
         &fixture,
         &harness_dir,
-        &fixture.join("mutants"),
+        &_tmp.path().to_path_buf(),
         "tests",
     )
     .expect("Stats collection should succeed");
 
-    // The stats plugin records hits to trampolined functions.
-    // Our fixture has add, is_positive, greet trampolined.
-    // test_add calls add -> hits simple_lib.x_add
-    // test_is_positive calls is_positive -> hits simple_lib.x_is_positive
-    // test_greet calls greet -> hits simple_lib.x_greet
     println!("tests_by_function: {:?}", test_stats.tests_by_function);
     println!("duration_by_test: {:?}", test_stats.duration_by_test);
 
@@ -181,7 +202,6 @@ async fn test_stats_collection() {
 
     // Check that function coverage was recorded
     if !test_stats.tests_by_function.is_empty() {
-        // If stats plugin worked, we should see function -> test mappings
         let add_tests = test_stats.tests_for_function("simple_lib.x_add");
         println!("Tests covering add: {:?}", add_tests);
     }

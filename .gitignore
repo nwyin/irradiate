@@ -12,6 +12,10 @@ venv/
 # irradiate runtime
 .irradiate/
 
+# Generated mutants in test fixtures
+tests/fixtures/simple_project/mutants/
+tests/fixtures/simple_project/.irradiate/
+
 # Vendor (reference only, cloned separately)
 /vendor/
 
