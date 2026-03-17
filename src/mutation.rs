@@ -688,7 +688,7 @@ fn add_method_mutations(
 
         for &(from, to) in METHOD_SWAPS {
             if method_trimmed == from {
-                let func_text = codegen_node(&call.func);
+                let func_text = codegen_node(&*call.func);
                 if let Some(pos) = func_text.rfind(from) {
                     record_mutation(from, to, "method_swap", expr_start + pos, mutations);
                 }
