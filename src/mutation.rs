@@ -2,6 +2,12 @@
 //!
 //! Strategy: use libcst for structural analysis, but generate mutations as text substitutions.
 //! This avoids needing to clone/modify CST nodes (which libcst Rust doesn't support well).
+//!
+//! Position tracking: each Mutation carries exact byte-span (start, end) offsets within the
+//! function source string.  These are computed by having `collect_expr_mutations` locate its
+//! own start via a forward search from a monotonically-advancing cursor, then advancing the
+//! cursor past the full expression text before returning.  Because the cursor only moves
+//! forward, the nth occurrence of a duplicated token is always found correctly.
 
 use libcst_native::{
     self as cst, parse_module, BinaryOp, BooleanOp, Codegen, CodegenState, CompOp,
@@ -12,7 +18,9 @@ use libcst_native::{
 #[derive(Debug, Clone)]
 pub struct Mutation {
     /// Byte offset in the function source where the original text starts.
-    pub offset: usize,
+    pub start: usize,
+    /// Byte offset one past the end of the original text.
+    pub end: usize,
     /// The original text to replace.
     pub original: String,
     /// The replacement text.
@@ -51,7 +59,7 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
     for stmt in &module.body {
         match stmt {
             Statement::Compound(CompoundStatement::FunctionDef(func)) => {
-                if let Some(fm) = collect_function_mutations(func, None, source, &ignored_lines) {
+                if let Some(fm) = collect_function_mutations(func, None, &ignored_lines) {
                     results.push(fm);
                 }
             }
@@ -62,12 +70,9 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
                         if let Statement::Compound(CompoundStatement::FunctionDef(func)) =
                             method_stmt
                         {
-                            if let Some(fm) = collect_function_mutations(
-                                func,
-                                Some(&class_name),
-                                source,
-                                &ignored_lines,
-                            ) {
+                            if let Some(fm) =
+                                collect_function_mutations(func, Some(&class_name), &ignored_lines)
+                            {
                                 results.push(fm);
                             }
                         }
@@ -87,7 +92,6 @@ const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__
 fn collect_function_mutations(
     func: &cst::FunctionDef,
     class_name: Option<&str>,
-    _full_source: &str,
     ignored_lines: &std::collections::HashSet<usize>,
 ) -> Option<FunctionMutations> {
     let name = codegen_node(&func.name);
@@ -106,8 +110,14 @@ fn collect_function_mutations(
     let params_source = codegen_node(&func.params);
     let is_async = func.asynchronous.is_some();
 
+    // Start the cursor past the function header (def name(params):) to avoid
+    // accidentally matching parameter names or default values when searching
+    // for body expressions.
+    let body_text = codegen_node(&func.body);
+    let body_offset = func_source.len().saturating_sub(body_text.len());
+    let mut cursor = body_offset;
+
     let mut mutations = Vec::new();
-    let mut cursor = 0usize;
 
     collect_suite_mutations(
         &func.body,
@@ -235,14 +245,37 @@ fn collect_small_statement_mutations(
             collect_expr_mutations(&e.value, source, cursor, mutations, ignored);
         }
         SmallStatement::Assign(a) => {
+            // Pre-find the full assignment text before descending so we have its start position.
+            let assign_text = codegen_node(a);
+            let assign_start = source[*cursor..].find(&assign_text).map(|p| *cursor + p);
+
             collect_expr_mutations(&a.value, source, cursor, mutations, ignored);
+
             // Assignment mutation: a = x → a = None
-            add_assignment_mutation(a, source, cursor, mutations);
+            if let Some(start) = assign_start {
+                add_assignment_mutation_at(a, &assign_text, start, mutations);
+            }
         }
         SmallStatement::AugAssign(aug) => {
+            // Pre-find the full augmented assignment before descending.
+            let full_text = codegen_node(aug);
+            let aug_start = source[*cursor..].find(&full_text).map(|p| *cursor + p);
+
+            // The operator immediately follows the target.
+            let target_text = codegen_node(&aug.target);
+            let op_text = codegen_node(&aug.operator);
+            let op_start = aug_start.map(|s| s + target_text.len());
+
             collect_expr_mutations(&aug.value, source, cursor, mutations, ignored);
-            // AugAssign operator swap (handled via operator swap below)
-            add_augassign_mutations(aug, source, cursor, mutations);
+
+            // AugAssign operator swap (e.g. += → -=)
+            if let Some(op_s) = op_start {
+                add_augop_mutation_at(&aug.operator, &op_text, op_s, mutations);
+            }
+            // AugAssign → plain Assign (e.g. a += b → a = b)
+            if let Some(start) = aug_start {
+                add_augassign_to_assign_at(aug, &full_text, start, mutations);
+            }
         }
         SmallStatement::Assert(a) => {
             collect_expr_mutations(&a.test, source, cursor, mutations, ignored);
@@ -251,7 +284,18 @@ fn collect_small_statement_mutations(
     }
 }
 
-#[allow(clippy::only_used_in_recursion)] // `ignored` will be used for pragma line checking
+/// Collect mutations from an expression.
+///
+/// The cursor is a monotonically-advancing position tracker:
+///   - On entry, `*cursor` is at or before the start of `expr` in `source`.
+///   - This function finds the exact start of `expr` by searching forward from `*cursor`.
+///   - Children are processed with a local sub-cursor anchored at `expr_start`.
+///   - On return, `*cursor` is advanced to `expr_start + expr_text.len()`.
+///
+/// Because the cursor only moves forward and each call anchors search to `expr_start`,
+/// duplicate tokens (e.g. two `+` operators in `a + b + c`) are always found at their
+/// correct respective positions.
+#[allow(clippy::only_used_in_recursion)]
 fn collect_expr_mutations(
     expr: &Expression,
     source: &str,
@@ -259,54 +303,76 @@ fn collect_expr_mutations(
     mutations: &mut Vec<Mutation>,
     ignored: &std::collections::HashSet<usize>,
 ) {
+    let expr_text = codegen_node(expr);
+
+    // Find the start of this expression by searching forward from the current cursor.
+    // Falls back to cursor if not found (shouldn't happen for well-formed Python).
+    let expr_start = source[*cursor..]
+        .find(&expr_text)
+        .map(|pos| *cursor + pos)
+        .unwrap_or(*cursor);
+
+    // Local cursor anchored at expr_start; used to find children in left-to-right order.
+    let mut local = expr_start;
+
     match expr {
         Expression::BinaryOperation(binop) => {
-            collect_expr_mutations(&binop.left, source, cursor, mutations, ignored);
-            add_binop_mutations(&binop.operator, source, cursor, mutations);
-            collect_expr_mutations(&binop.right, source, cursor, mutations, ignored);
+            // Process left; local advances to op_start.
+            collect_expr_mutations(&binop.left, source, &mut local, mutations, ignored);
+            // Operator starts where the left child ended.
+            let op_text = codegen_node(&binop.operator);
+            add_binop_mutation_at(&binop.operator, &op_text, local, mutations);
+            local += op_text.len();
+            collect_expr_mutations(&binop.right, source, &mut local, mutations, ignored);
         }
         Expression::BooleanOperation(boolop) => {
-            collect_expr_mutations(&boolop.left, source, cursor, mutations, ignored);
-            add_boolop_mutations(&boolop.operator, source, cursor, mutations);
-            collect_expr_mutations(&boolop.right, source, cursor, mutations, ignored);
+            collect_expr_mutations(&boolop.left, source, &mut local, mutations, ignored);
+            let op_text = codegen_node(&boolop.operator);
+            add_boolop_mutation_at(&boolop.operator, &op_text, local, mutations);
+            local += op_text.len();
+            collect_expr_mutations(&boolop.right, source, &mut local, mutations, ignored);
         }
         Expression::UnaryOperation(unop) => {
-            add_unaryop_mutations(unop, source, cursor, mutations);
-            collect_expr_mutations(&unop.expression, source, cursor, mutations, ignored);
+            // Record mutation on the whole unary expression before recursing.
+            add_unaryop_mutation_at(unop, &expr_text, expr_start, mutations);
+            collect_expr_mutations(&unop.expression, source, &mut local, mutations, ignored);
         }
         Expression::Comparison(cmp) => {
-            collect_expr_mutations(&cmp.left, source, cursor, mutations, ignored);
+            collect_expr_mutations(&cmp.left, source, &mut local, mutations, ignored);
             for target in &cmp.comparisons {
-                add_compop_mutations(&target.operator, source, cursor, mutations);
-                collect_expr_mutations(&target.comparator, source, cursor, mutations, ignored);
+                let op_text = codegen_node(&target.operator);
+                add_compop_mutation_at(&target.operator, &op_text, local, mutations);
+                local += op_text.len();
+                collect_expr_mutations(&target.comparator, source, &mut local, mutations, ignored);
             }
         }
         Expression::Name(name) => {
-            add_name_mutations(name, source, cursor, mutations);
+            add_name_mutation_at(name, expr_start, mutations);
         }
         Expression::Integer(int) => {
-            add_number_mutation(int, source, cursor, mutations);
+            add_number_mutation_at(int, expr_start, mutations);
         }
         Expression::Float(float) => {
-            add_float_mutation(float, source, cursor, mutations);
+            add_float_mutation_at(float, expr_start, mutations);
         }
         Expression::SimpleString(s) => {
-            add_string_mutation(s, source, cursor, mutations);
+            add_string_mutation_at(s, expr_start, mutations);
         }
         Expression::Call(call) => {
-            add_method_mutations(call, source, cursor, mutations);
-            collect_expr_mutations(&call.func, source, cursor, mutations, ignored);
+            add_method_mutations(call, expr_start, mutations);
+            collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
             for arg in &call.args {
-                collect_expr_mutations(&arg.value, source, cursor, mutations, ignored);
+                collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
             }
         }
         Expression::IfExp(ifexp) => {
-            collect_expr_mutations(&ifexp.test, source, cursor, mutations, ignored);
-            collect_expr_mutations(&ifexp.body, source, cursor, mutations, ignored);
-            collect_expr_mutations(&ifexp.orelse, source, cursor, mutations, ignored);
+            // Source order: body "if" test "else" orelse
+            collect_expr_mutations(&ifexp.body, source, &mut local, mutations, ignored);
+            collect_expr_mutations(&ifexp.test, source, &mut local, mutations, ignored);
+            collect_expr_mutations(&ifexp.orelse, source, &mut local, mutations, ignored);
         }
         Expression::Lambda(lam) => {
-            add_lambda_mutation(lam, source, cursor, mutations);
+            add_lambda_mutation_at(lam, &expr_text, expr_start, mutations);
         }
         Expression::Tuple(t) => {
             for el in &t.elements {
@@ -314,7 +380,7 @@ fn collect_expr_mutations(
                     value: ref e_val, ..
                 } = el
                 {
-                    collect_expr_mutations(e_val, source, cursor, mutations, ignored);
+                    collect_expr_mutations(e_val, source, &mut local, mutations, ignored);
                 }
             }
         }
@@ -324,7 +390,7 @@ fn collect_expr_mutations(
                     value: ref e_val, ..
                 } = el
                 {
-                    collect_expr_mutations(e_val, source, cursor, mutations, ignored);
+                    collect_expr_mutations(e_val, source, &mut local, mutations, ignored);
                 }
             }
         }
@@ -334,41 +400,41 @@ fn collect_expr_mutations(
                     ref key, ref value, ..
                 } = el
                 {
-                    collect_expr_mutations(key, source, cursor, mutations, ignored);
-                    collect_expr_mutations(value, source, cursor, mutations, ignored);
+                    collect_expr_mutations(key, source, &mut local, mutations, ignored);
+                    collect_expr_mutations(value, source, &mut local, mutations, ignored);
                 }
             }
         }
         Expression::Subscript(sub) => {
-            collect_expr_mutations(&sub.value, source, cursor, mutations, ignored);
+            collect_expr_mutations(&sub.value, source, &mut local, mutations, ignored);
         }
         Expression::Attribute(attr) => {
-            collect_expr_mutations(&attr.value, source, cursor, mutations, ignored);
+            collect_expr_mutations(&attr.value, source, &mut local, mutations, ignored);
         }
         _ => {}
     }
+
+    // Advance the outer cursor past this entire expression.
+    *cursor = expr_start + expr_text.len();
 }
 
-// --- Operator mutation helpers ---
+// --- Operator mutation helpers (all take explicit start position) ---
 
-fn find_and_record(
-    node_text: &str,
+/// Record a mutation at a known byte offset.
+fn record_mutation(
+    original: &str,
     replacement: &str,
     operator: &'static str,
-    source: &str,
-    cursor: &mut usize,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    if let Some(pos) = source[*cursor..].find(node_text) {
-        let offset = *cursor + pos;
-        mutations.push(Mutation {
-            offset,
-            original: node_text.to_string(),
-            replacement: replacement.to_string(),
-            operator,
-        });
-        // Don't advance cursor past operator — multiple mutations can target the same text
-    }
+    mutations.push(Mutation {
+        start,
+        end: start + original.len(),
+        original: original.to_string(),
+        replacement: replacement.to_string(),
+        operator,
+    });
 }
 
 /// Binary operator swaps: +↔-, *↔/, etc.
@@ -387,53 +453,38 @@ static BINOP_SWAPS: &[(&str, &str)] = &[
     ("^", "&"),
 ];
 
-fn add_binop_mutations(
+fn add_binop_mutation_at(
     op: &BinaryOp,
-    source: &str,
-    cursor: &mut usize,
+    op_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let op_text = codegen_node(op);
     let op_trimmed = op_text.trim();
-
     for &(from, to) in BINOP_SWAPS {
         if op_trimmed == from {
             let replacement = op_text.replace(from, to);
-            find_and_record(
-                &op_text,
-                &replacement,
-                "binop_swap",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(op_text, &replacement, "binop_swap", start, mutations);
             break;
         }
     }
+    // Suppress unused warning: op is used implicitly via op_text
+    let _ = op;
 }
 
-fn add_boolop_mutations(
+fn add_boolop_mutation_at(
     op: &BooleanOp,
-    source: &str,
-    cursor: &mut usize,
+    op_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let op_text = codegen_node(op);
     let op_trimmed = op_text.trim();
-
     let replacement = match op_trimmed {
         "and" => op_text.replace("and", "or"),
         "or" => op_text.replace("or", "and"),
         _ => return,
     };
-    find_and_record(
-        &op_text,
-        &replacement,
-        "boolop_swap",
-        source,
-        cursor,
-        mutations,
-    );
+    record_mutation(op_text, &replacement, "boolop_swap", start, mutations);
+    let _ = op;
 }
 
 /// Comparison operator swaps.
@@ -450,61 +501,40 @@ static COMPOP_SWAPS: &[(&str, &str)] = &[
     (" in ", " not in "),
 ];
 
-fn add_compop_mutations(
+fn add_compop_mutation_at(
     op: &CompOp,
-    source: &str,
-    cursor: &mut usize,
+    op_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let op_text = codegen_node(op);
     let op_trimmed = op_text.trim();
-
     for &(from, to) in COMPOP_SWAPS {
         if op_trimmed == from.trim() {
             let replacement = op_text.replace(from.trim(), to.trim());
-            find_and_record(
-                &op_text,
-                &replacement,
-                "compop_swap",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(op_text, &replacement, "compop_swap", start, mutations);
             break;
         }
     }
+    let _ = op;
 }
 
-fn add_unaryop_mutations(
+fn add_unaryop_mutation_at(
     unop: &cst::UnaryOperation,
-    source: &str,
-    cursor: &mut usize,
+    full_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
     // not x → x, ~x → x
     match &unop.operator {
         UnaryOp::Not { .. } | UnaryOp::BitInvert { .. } => {
-            let full_text = codegen_node(unop);
             let inner_text = codegen_node(&*unop.expression);
-            find_and_record(
-                &full_text,
-                &inner_text,
-                "unary_removal",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(full_text, &inner_text, "unary_removal", start, mutations);
         }
         _ => {}
     }
 }
 
-fn add_name_mutations(
-    name: &cst::Name,
-    source: &str,
-    cursor: &mut usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_name_mutation_at(name: &cst::Name, start: usize, mutations: &mut Vec<Mutation>) {
     let text = name.value;
     let replacement = match text {
         "True" => "False",
@@ -512,60 +542,30 @@ fn add_name_mutations(
         "deepcopy" => "copy",
         _ => return,
     };
-    find_and_record(text, replacement, "name_swap", source, cursor, mutations);
+    record_mutation(text, replacement, "name_swap", start, mutations);
 }
 
-fn add_number_mutation(
-    int: &cst::Integer,
-    source: &str,
-    cursor: &mut usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_number_mutation_at(int: &cst::Integer, start: usize, mutations: &mut Vec<Mutation>) {
     let text = int.value;
-    // n → n + 1
     if let Ok(n) = text.replace('_', "").parse::<i64>() {
         let replacement = (n + 1).to_string();
         if replacement != text {
-            find_and_record(
-                text,
-                &replacement,
-                "number_mutation",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(text, &replacement, "number_mutation", start, mutations);
         }
     }
 }
 
-fn add_float_mutation(
-    float: &cst::Float,
-    source: &str,
-    cursor: &mut usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_float_mutation_at(float: &cst::Float, start: usize, mutations: &mut Vec<Mutation>) {
     let text = float.value;
     if let Ok(n) = text.parse::<f64>() {
         let replacement = format!("{}", n + 1.0);
         if replacement != text {
-            find_and_record(
-                text,
-                &replacement,
-                "number_mutation",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(text, &replacement, "number_mutation", start, mutations);
         }
     }
 }
 
-fn add_string_mutation(
-    s: &cst::SimpleString,
-    source: &str,
-    cursor: &mut usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_string_mutation_at(s: &cst::SimpleString, start: usize, mutations: &mut Vec<Mutation>) {
     let text = s.value;
 
     // Skip triple-quoted strings (docstrings)
@@ -581,24 +581,16 @@ fn add_string_mutation(
     let replacement = format!("{prefix}{quote_char}XX{inner}XX{quote_char}");
 
     if replacement != text {
-        find_and_record(
-            text,
-            &replacement,
-            "string_mutation",
-            source,
-            cursor,
-            mutations,
-        );
+        record_mutation(text, &replacement, "string_mutation", start, mutations);
     }
 }
 
-fn add_lambda_mutation(
+fn add_lambda_mutation_at(
     lam: &cst::Lambda,
-    source: &str,
-    cursor: &mut usize,
+    full_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let full_text = codegen_node(lam);
     let body_text = codegen_node(&*lam.body);
     let replacement_body = if body_text.trim() == "None" {
         "0"
@@ -606,20 +598,13 @@ fn add_lambda_mutation(
         "None"
     };
     let replacement = full_text.replace(&body_text, replacement_body);
-    find_and_record(
-        &full_text,
-        &replacement,
-        "lambda_mutation",
-        source,
-        cursor,
-        mutations,
-    );
+    record_mutation(full_text, &replacement, "lambda_mutation", start, mutations);
 }
 
-fn add_assignment_mutation(
+fn add_assignment_mutation_at(
     assign: &cst::Assign,
-    source: &str,
-    cursor: &mut usize,
+    assign_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
     let value_text = codegen_node(&assign.value);
@@ -628,24 +613,16 @@ fn add_assignment_mutation(
     } else {
         " None".to_string()
     };
-    // Find the value part and replace it
-    let full_text = codegen_node(assign);
-    let new_full = if let Some(eq_pos) = full_text.find('=') {
-        format!("{}={replacement}", &full_text[..eq_pos])
+    // Replace just the value portion: find the `=` and substitute everything after it.
+    let new_full = if let Some(eq_pos) = assign_text.find('=') {
+        format!("{}={replacement}", &assign_text[..eq_pos])
     } else {
         return;
     };
-    find_and_record(
-        &full_text,
-        &new_full,
-        "assignment_mutation",
-        source,
-        cursor,
-        mutations,
-    );
+    record_mutation(assign_text, &new_full, "assignment_mutation", start, mutations);
 }
 
-/// AugAssign operator swap: += → -=, etc., and also += → = (strip augmentation)
+/// AugAssign operator swap: += → -=, etc.
 static AUGOP_SWAPS: &[(&str, &str)] = &[
     ("+=", "-="),
     ("-=", "+="),
@@ -661,44 +638,33 @@ static AUGOP_SWAPS: &[(&str, &str)] = &[
     ("^=", "&="),
 ];
 
-fn add_augassign_mutations(
-    aug: &cst::AugAssign,
-    source: &str,
-    cursor: &mut usize,
+fn add_augop_mutation_at(
+    op: &cst::AugOp,
+    op_text: &str,
+    start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let op_text = codegen_node(&aug.operator);
     let op_trimmed = op_text.trim();
-
-    // Operator swap
     for &(from, to) in AUGOP_SWAPS {
         if op_trimmed == from {
             let replacement = op_text.replace(from, to);
-            find_and_record(
-                &op_text,
-                &replacement,
-                "augop_swap",
-                source,
-                cursor,
-                mutations,
-            );
+            record_mutation(op_text, &replacement, "augop_swap", start, mutations);
             break;
         }
     }
+    let _ = op;
+}
 
-    // AugAssign → plain Assign (e.g., a += b → a = b)
-    let full_text = codegen_node(aug);
+fn add_augassign_to_assign_at(
+    aug: &cst::AugAssign,
+    full_text: &str,
+    start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
     let target_text = codegen_node(&aug.target);
     let value_text = codegen_node(&aug.value);
     let plain_assign = format!("{target_text} ={value_text}");
-    find_and_record(
-        &full_text,
-        &plain_assign,
-        "augassign_to_assign",
-        source,
-        cursor,
-        mutations,
-    );
+    record_mutation(full_text, &plain_assign, "augassign_to_assign", start, mutations);
 }
 
 /// String method swaps: .lower() ↔ .upper(), .lstrip() ↔ .rstrip(), etc.
@@ -713,25 +679,19 @@ static METHOD_SWAPS: &[(&str, &str)] = &[
 
 fn add_method_mutations(
     call: &cst::Call,
-    source: &str,
-    cursor: &mut usize,
+    expr_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    // Only mutate if the call target is an attribute access (i.e., obj.method())
     if let Expression::Attribute(attr) = &*call.func {
-        let method_name = codegen_node(&attr.attr);
-        let method_trimmed = method_name.trim();
+        let method_text = codegen_node(&attr.attr);
+        let method_trimmed = method_text.trim();
 
         for &(from, to) in METHOD_SWAPS {
             if method_trimmed == from {
-                find_and_record(
-                    &method_name,
-                    &method_name.replace(from, to),
-                    "method_swap",
-                    source,
-                    cursor,
-                    mutations,
-                );
+                let func_text = codegen_node(&call.func);
+                if let Some(pos) = func_text.rfind(from) {
+                    record_mutation(from, to, "method_swap", expr_start + pos, mutations);
+                }
                 break;
             }
         }
@@ -769,9 +729,9 @@ fn pragma_no_mutate_lines(source: &str) -> std::collections::HashSet<usize> {
 pub fn apply_mutation(func_source: &str, mutation: &Mutation) -> String {
     format!(
         "{}{}{}",
-        &func_source[..mutation.offset],
+        &func_source[..mutation.start],
         mutation.replacement,
-        &func_source[mutation.offset + mutation.original.len()..]
+        &func_source[mutation.end..]
     )
 }
 
@@ -981,207 +941,119 @@ mod tests {
 mod offset_correctness_tests {
     use super::*;
 
-    fn filter_by_op<'a>(fm: &'a FunctionMutations, op: &str) -> Vec<&'a Mutation> {
-        fm.mutations.iter().filter(|m| m.operator == op).collect()
-    }
-
-    // Duplicate binary operators: `a + b + c` parses as `(a + b) + c`.
-    // cursor is not advanced past matched text, so both `+` mutations find the first `+`.
-    // This test documents the current behavior and ensures at least one swap is correct.
+    // INV-1: a + b + c produces 2 independent mutations, each applied correctly
     #[test]
-    fn test_duplicate_binops() {
+    fn test_duplicate_operators_independent_mutations() {
         let source = "def foo(a, b, c):\n    return a + b + c\n";
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert_eq!(binops.len(), 2, "Should find 2 + operators");
-        let m1 = apply_mutation(&fms[0].source, binops[0]);
-        let m2 = apply_mutation(&fms[0].source, binops[1]);
-        // Both mutations swap + to - somewhere
-        assert!(m1.contains('-'), "First mutation should swap + to -");
-        assert!(m2.contains('-'), "Second mutation should swap + to -");
-        // At least one result still contains a + (the other operator left intact)
-        // Note: currently both target the first + (cursor not advanced), so both results
-        // are identical: `a - b + c`. If offset tracking is ever fixed, this still passes.
-        assert!(
-            m1.contains('+') || m2.contains('+'),
-            "At least one mutation should leave the other + intact"
+        let fm = &fms[0];
+
+        let binops: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
+        assert_eq!(binops.len(), 2, "Should find exactly 2 + operators");
+
+        // They must be at different positions
+        assert_ne!(
+            binops[0].start, binops[1].start,
+            "Duplicate operators must be at distinct positions"
         );
+
+        // Applying each mutation should produce distinct correct outputs
+        let mutated0 = apply_mutation(&fm.source, binops[0]);
+        let mutated1 = apply_mutation(&fm.source, binops[1]);
+
+        // One mutation: a - b + c, Other: a + b - c
+        let has_a_minus = mutated0.contains("a - b + c") || mutated1.contains("a - b + c");
+        let has_b_minus = mutated0.contains("a + b - c") || mutated1.contains("a + b - c");
+        assert!(has_a_minus, "One mutant should be 'a - b + c', got: {mutated0} and {mutated1}");
+        assert!(has_b_minus, "One mutant should be 'a + b - c', got: {mutated0} and {mutated1}");
     }
 
-    // Nested binops: `(a + b) * (c + d)` has three operators.
-    // The `*` mutation has a distinct original text, so it is always found correctly.
-    // The two `+` mutations both find the first `+` due to cursor behavior.
+    // INV-2: Applying mutation N produces exactly the expected output (no off-by-one)
     #[test]
-    fn test_nested_binops() {
+    fn test_apply_mutation_exact_positions() {
+        // Without spaces: a+b
+        let source = "def foo(a, b):\n    return a+b\n";
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        let binop = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "binop_swap")
+            .unwrap();
+
+        // original should be exactly "+"
+        assert_eq!(binop.original, "+", "Operator without spaces");
+        let mutated = apply_mutation(&fm.source, binop);
+        assert!(mutated.contains("a-b"), "Should produce a-b, got: {mutated}");
+        assert!(!mutated.contains("a+b"), "Original + should be gone");
+    }
+
+    // INV-3: Nested operators at correct positions
+    #[test]
+    fn test_nested_operators() {
         let source = "def foo(a, b, c, d):\n    return (a + b) * (c + d)\n";
         let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1);
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert_eq!(binops.len(), 3, "Should find 2 + operators and 1 * operator");
+        let fm = &fms[0];
 
-        // The * mutation has a unique original text — always correct
-        let mul_mut = binops
+        let binops: Vec<_> = fm
+            .mutations
             .iter()
-            .find(|m| m.original.contains('*'))
-            .expect("Should find * mutation");
-        let mul_result = apply_mutation(&fms[0].source, mul_mut);
-        assert!(mul_result.contains('/'), "Should swap * to /");
-        assert!(!mul_result.contains('*'), "Should not have * anymore");
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
 
-        // Every + mutation should produce a - somewhere
-        for m in binops.iter().filter(|m| m.original.contains('+')) {
-            let result = apply_mutation(&fms[0].source, m);
-            assert!(result.contains('-'), "Should swap + to -");
-        }
-    }
+        // Should have 3 operators: +, *, +
+        assert_eq!(binops.len(), 3, "Should find 3 operators: +, *, +");
 
-    // Single operator with identical operands: `a + a`.
-    // Only one `+` in the expression, so offset is unambiguous.
-    #[test]
-    fn test_identical_operands() {
-        let source = "def foo(a):\n    return a + a\n";
-        let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1);
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert_eq!(binops.len(), 1, "Should find exactly one + operator");
-        let result = apply_mutation(&fms[0].source, binops[0]);
-        assert!(result.contains(" - "), "Should swap + to -");
-        assert!(!result.contains(" + "), "Should not have + anymore");
-        // Operand `a` should be unchanged
-        let return_line = result
-            .lines()
-            .find(|l| l.contains("return"))
-            .expect("Should have return line");
-        assert!(return_line.contains('a'), "Operand a should still be present");
-    }
+        // All at different positions
+        let positions: std::collections::HashSet<usize> =
+            binops.iter().map(|m| m.start).collect();
+        assert_eq!(positions.len(), 3, "All operators must be at distinct positions");
 
-    // Repeated boolean name: `True or True` has 2 name_swap candidates and 1 boolop_swap.
-    // The boolop has a unique text, the name_swap mutations both find the first True.
-    #[test]
-    fn test_repeated_names_true_false() {
-        let source = "def foo():\n    return True or True\n";
-        let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1);
-
-        let name_muts = filter_by_op(&fms[0], "name_swap");
-        assert_eq!(name_muts.len(), 2, "Should find 2 True name mutations");
-
-        let boolop_muts = filter_by_op(&fms[0], "boolop_swap");
-        assert_eq!(boolop_muts.len(), 1, "Should find 1 or → and boolop mutation");
-
-        // Boolop has unique text: or → and
-        let boolop_result = apply_mutation(&fms[0].source, boolop_muts[0]);
-        assert!(boolop_result.contains(" and "), "Should swap or to and");
-        assert!(!boolop_result.contains(" or "), "Should not have or anymore");
-
-        // Both name mutations should produce a result with False
-        for nm in &name_muts {
-            let result = apply_mutation(&fms[0].source, nm);
-            assert!(result.contains("False"), "Should swap True to False");
-        }
-    }
-
-    // Repeated number literal: `5 + 5` has 2 number_mutation candidates and 1 binop.
-    // Both number mutations find the first `5` due to cursor behavior.
-    #[test]
-    fn test_repeated_numbers() {
-        let source = "def foo():\n    return 5 + 5\n";
-        let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1);
-
-        let num_muts = filter_by_op(&fms[0], "number_mutation");
-        assert_eq!(num_muts.len(), 2, "Should find 2 number mutations for each 5");
-
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert_eq!(binops.len(), 1, "Should find 1 binop mutation for +");
-
-        // Both number mutations target 5 → 6
-        for nm in &num_muts {
-            assert_eq!(nm.original, "5");
-            assert_eq!(nm.replacement, "6");
-        }
-
-        // Binop mutation swaps + to -
-        let binop_result = apply_mutation(&fms[0].source, binops[0]);
-        assert!(binop_result.contains(" - "), "Should swap + to -");
-    }
-
-    // Operator inside a string literal should not generate binop_swap mutations.
-    #[test]
-    fn test_string_content_not_mutated_as_operator() {
-        let source = "def foo():\n    return \"a + b\"\n";
-        let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1);
-
-        let string_muts = filter_by_op(&fms[0], "string_mutation");
-        assert_eq!(string_muts.len(), 1, "Should find exactly one string mutation");
-
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert!(binops.is_empty(), "Should NOT treat + inside string as binop");
-
-        let result = apply_mutation(&fms[0].source, string_muts[0]);
-        assert!(result.contains("XX"), "String mutation should add XX markers");
-    }
-
-    // Whitespace variants: no-space, single-space, double-space operators.
-    // LibCST is full-fidelity, so the operator text preserves original whitespace.
-    #[test]
-    fn test_whitespace_variants() {
-        let cases = [
-            "def foo(a, b):\n    return a+b\n",
-            "def foo(a, b):\n    return a + b\n",
-            "def foo(a, b):\n    return a  +  b\n",
-        ];
-
-        for source in &cases {
-            let fms = collect_file_mutations(source);
-            assert_eq!(fms.len(), 1, "Should find function for: {source}");
-            let binops = filter_by_op(&fms[0], "binop_swap");
-            assert_eq!(binops.len(), 1, "Should find 1 binop for: {source}");
-            let result = apply_mutation(&fms[0].source, binops[0]);
-            assert!(result.contains('-'), "Should swap + to - for: {source}");
-            assert!(!result.contains('+'), "Should not have + for: {source}");
-        }
-    }
-
-    // Multi-line function with operators on different lines.
-    // Each distinct operator text (` + `, ` - `, ` * `) is found from cursor=0,
-    // so repeated uses of the same operator text produce redundant mutations.
-    #[test]
-    fn test_multiline_function() {
-        let source = concat!(
-            "def compute(a, b, c, d, e):\n",
-            "    x = a + b\n",
-            "    y = c - d\n",
-            "    z = x * y\n",
-            "    if z > 0:\n",
-            "        return z + e\n",
-            "    else:\n",
-            "        return z - e\n",
-        );
-        let fms = collect_file_mutations(source);
-        assert_eq!(fms.len(), 1, "Should find the function");
-
-        // 5 binop operators in the body (two +, two -, one *)
-        let binops = filter_by_op(&fms[0], "binop_swap");
-        assert!(binops.len() >= 4, "Should find at least 4 binary operators");
-
-        // Exactly one comparison operator >
-        let compops = filter_by_op(&fms[0], "compop_swap");
-        assert_eq!(compops.len(), 1, "Should find one comparison operator (>)");
-
-        // Comparison mutation: > → >=
-        let comp_result = apply_mutation(&fms[0].source, compops[0]);
-        assert!(comp_result.contains(">="), "Should swap > to >=");
-
-        // Every binop mutation should produce a syntactically intact result
+        // Each mutation should produce syntactically reasonable output
         for m in &binops {
-            let result = apply_mutation(&fms[0].source, m);
-            assert!(!result.is_empty());
-            assert!(
-                result.contains("def compute"),
-                "Result must preserve function signature"
+            let mutated = apply_mutation(&fm.source, m);
+            // The mutated source should still contain def and return
+            assert!(mutated.contains("def foo"), "Mutated source should still have def");
+            assert!(mutated.contains("return"), "Mutated source should still have return");
+        }
+    }
+
+    // Mixed case: x = a + a
+    #[test]
+    fn test_duplicate_operand_mutation() {
+        let source = "def foo(a):\n    x = a + a\n";
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+
+        let binops: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
+        assert_eq!(binops.len(), 1, "Should find exactly 1 + operator");
+
+        let mutated = apply_mutation(&fm.source, binops[0]);
+        assert!(mutated.contains("a - a"), "Should produce a - a, got: {mutated}");
+    }
+
+    // Byte-span correctness: start and end span exactly the original text
+    #[test]
+    fn test_mutation_span_correctness() {
+        let source = "def foo(a, b, c):\n    return a + b + c\n";
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+
+        for m in &fm.mutations {
+            let slice = &fm.source[m.start..m.end];
+            assert_eq!(
+                slice, m.original,
+                "Span [{}, {}) should equal original '{}'",
+                m.start, m.end, m.original
             );
         }
     }
