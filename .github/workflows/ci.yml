@@ -1,0 +1,49 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo check + clippy
+        run: cargo check && cargo clippy -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache fixture venv
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/simple_project/.venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('tests/fixtures/simple_project/pyproject.toml', 'tests/fixtures/simple_project/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Set up fixture venv
+        run: cd tests/fixtures/simple_project && uv venv --python 3.12 && uv pip install pytest
+
+      - name: Run e2e tests
+        run: bash tests/e2e.sh
