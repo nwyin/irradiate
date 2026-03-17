@@ -422,7 +422,7 @@ These are the right next hardening targets before adding more surface area.
 
 #### The docs should distinguish target architecture from current behavior more sharply
 
-`design.md` is best read as the target architecture. `spec.md` is the vertical-slice implementation plan. `roadmap.md` is effectively the source of truth for missing pieces. Keeping those roles explicit will make future design discussions less confusing.
+`design.md` is the target architecture. `roadmap.md` is the source of truth for current gaps and design decisions. (The original `spec.md` covered Specs 1-4, which are fully implemented and have been removed.)
 
 ### Recommended sequencing
 

@@ -86,10 +86,10 @@ irradiate/
 │   └── mutmut/             # reference implementation (git clone, not modified)
 └── docs/
     ├── design.md           # architecture and design doc
-    └── spec.md             # implementation spec (phased)
+    └── roadmap.md          # gaps, decisions, and priority order
 ```
 
 ## Design docs
 
 - `docs/design.md` — full architecture and design rationale
-- `docs/spec.md` — phased implementation spec (Spec 1-4)
+- `docs/roadmap.md` — current gaps, design decisions, and priority order

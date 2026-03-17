@@ -2,7 +2,7 @@
 
 Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).
 
-> This document describes the target architecture and design direction. For the narrower implementation contract of the current vertical slice, see `docs/spec.md`. For gaps and follow-up work, see `docs/roadmap.md`.
+> This document describes the target architecture and design direction. For current gaps, design decisions, and follow-up work, see `docs/roadmap.md`.
 
 ## Why
 
