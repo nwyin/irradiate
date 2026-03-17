@@ -16,13 +16,13 @@ enum Commands {
         /// Specific mutant names to test (default: all)
         mutant_names: Vec<String>,
 
-        /// Path(s) to source code to mutate
-        #[arg(long, default_value = "src")]
-        paths_to_mutate: String,
+        /// Path(s) to source code to mutate (default: "src", overrides pyproject.toml)
+        #[arg(long)]
+        paths_to_mutate: Option<String>,
 
-        /// Path to test directory
-        #[arg(long, default_value = "tests")]
-        tests_dir: String,
+        /// Path to test directory (default: "tests", overrides pyproject.toml)
+        #[arg(long)]
+        tests_dir: Option<String>,
 
         /// Number of worker processes
         #[arg(long)]
@@ -79,9 +79,19 @@ async fn main() -> Result<()> {
             covered_only,
             python,
         } => {
+            // Load pyproject.toml config; CLI flags override config values.
+            let file_config =
+                irradiate::config::load_config(&std::env::current_dir()?)?;
+
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
-                paths_to_mutate: PathBuf::from(paths_to_mutate),
-                tests_dir,
+                paths_to_mutate: PathBuf::from(
+                    paths_to_mutate
+                        .or(file_config.paths_to_mutate)
+                        .unwrap_or_else(|| "src".to_string()),
+                ),
+                tests_dir: tests_dir
+                    .or(file_config.tests_dir)
+                    .unwrap_or_else(|| "tests".to_string()),
                 workers: workers.unwrap_or_else(num_cpus::get),
                 timeout_multiplier,
                 no_stats,

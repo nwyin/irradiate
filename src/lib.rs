@@ -1,4 +1,5 @@
 pub mod codegen;
+pub mod config;
 pub mod harness;
 pub mod mutation;
 pub mod orchestrator;
