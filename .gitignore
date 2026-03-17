@@ -19,6 +19,9 @@ tests/fixtures/simple_project/.irradiate/
 # Vendor (reference only, cloned separately)
 /vendor/
 
+# Hive worktrees
+.worktrees/
+
 # OS
 .DS_Store
 *.swp
