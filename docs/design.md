@@ -2,6 +2,8 @@
 
 Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).
 
+> This document describes the target architecture and design direction. For the narrower implementation contract of the current vertical slice, see `docs/spec.md`. For gaps and follow-up work, see `docs/roadmap.md`.
+
 ## Why
 
 Mutation testing is painfully slow. The bottleneck isn't generating mutants — it's running the test suite once per mutant. A typical mutation testing run looks like:

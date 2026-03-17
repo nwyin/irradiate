@@ -2,6 +2,8 @@
 
 Mutation testing for Python, written in Rust. Full end-to-end pipeline: parse Python → generate trampolined mutants → orchestrate pytest worker pool → report results.
 
+> This document is the implementation contract for the current vertical slice, not the full aspirational architecture in `docs/design.md`. Where the repo diverges in practice, `docs/roadmap.md` should be treated as the current gap list.
+
 ## Verification (all phases)
 
 ```bash
