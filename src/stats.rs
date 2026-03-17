@@ -42,22 +42,17 @@ impl TestStats {
 ///
 /// This runs pytest once with `--irradiate-stats` and `MUTANT_UNDER_TEST=stats`
 /// (or rather, sets up the harness so that `active_mutant = "stats"`).
+///
+/// `pythonpath` must be pre-built by the caller using `pipeline::build_pythonpath`
+/// so that all subprocess invocations use identical PYTHONPATH construction logic.
 pub fn collect_stats(
     python: &Path,
     project_dir: &Path,
-    harness_dir: &Path,
-    mutants_dir: &Path,
+    pythonpath: &str,
     tests_dir: &str,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
     std::fs::create_dir_all(stats_output.parent().unwrap())?;
-
-    let pythonpath = format!(
-        "{}:{}:{}",
-        harness_dir.display(),
-        mutants_dir.display(),
-        project_dir.join("src").display(),
-    );
 
     info!("Collecting stats with PYTHONPATH={pythonpath}");
 
@@ -69,7 +64,7 @@ pub fn collect_stats(
         .arg("irradiate_harness.stats_plugin")
         .arg("-q")
         .arg(tests_dir)
-        .env("PYTHONPATH", &pythonpath)
+        .env("PYTHONPATH", pythonpath)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)
         .current_dir(project_dir)
         .output()

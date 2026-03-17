@@ -29,6 +29,10 @@ pub struct PoolConfig {
     pub timeout_multiplier: f64,
     /// Default timeout if no baseline duration is known.
     pub default_timeout: Duration,
+    /// Pre-built PYTHONPATH string for worker subprocesses.
+    /// Must include harness_dir, mutants_dir, and the project source parent so
+    /// sibling module imports in mutated code resolve correctly.
+    pub pythonpath: String,
 }
 
 impl Default for PoolConfig {
@@ -41,6 +45,7 @@ impl Default for PoolConfig {
             tests_dir: PathBuf::from("tests"),
             timeout_multiplier: 10.0,
             default_timeout: Duration::from_secs(30),
+            pythonpath: String::new(),
         }
     }
 }
@@ -133,10 +138,7 @@ fn spawn_worker(
         .env("IRRADIATE_SOCKET", socket_path)
         .env("IRRADIATE_MUTANTS_DIR", &config.mutants_dir)
         .env("IRRADIATE_TESTS_DIR", &config.tests_dir)
-        .env(
-            "PYTHONPATH",
-            format!("{}:{}", harness_dir.display(), config.mutants_dir.display()),
-        )
+        .env("PYTHONPATH", &config.pythonpath)
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

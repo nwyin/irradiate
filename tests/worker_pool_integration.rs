@@ -1,6 +1,7 @@
 use irradiate::codegen;
 use irradiate::harness;
 use irradiate::orchestrator::{run_worker_pool, PoolConfig};
+use irradiate::pipeline;
 use irradiate::protocol::{MutantStatus, WorkItem};
 use irradiate::stats;
 use std::path::PathBuf;
@@ -180,14 +181,10 @@ async fn test_stats_collection() {
     // Extract harness
     let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
 
-    let test_stats = stats::collect_stats(
-        &python,
-        &fixture,
-        &harness_dir,
-        &_tmp.path().to_path_buf(),
-        "tests",
-    )
-    .expect("Stats collection should succeed");
+    let mutants_dir = _tmp.path().to_path_buf();
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &mutants_dir, &fixture.join("src"));
+    let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, "tests")
+        .expect("Stats collection should succeed");
 
     println!("tests_by_function: {:?}", test_stats.tests_by_function);
     println!("duration_by_test: {:?}", test_stats.duration_by_test);

@@ -31,7 +31,11 @@ def main():
     mutants_dir = os.environ.get("IRRADIATE_MUTANTS_DIR", "mutants")
     tests_dir = os.environ.get("IRRADIATE_TESTS_DIR", "tests")
 
-    # Add mutants dir to sys.path so mutated modules can be imported
+    # Defensively add mutants_dir to sys.path so mutated modules can be
+    # imported even if PYTHONPATH was not set by the caller. In normal
+    # operation the orchestrator sets PYTHONPATH (via pipeline::build_pythonpath)
+    # which already includes mutants_dir, so this is a no-op guard against
+    # misconfigured invocations (e.g. running worker.py by hand).
     if mutants_dir not in sys.path:
         sys.path.insert(0, os.path.abspath(mutants_dir))
 
