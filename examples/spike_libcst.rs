@@ -59,16 +59,17 @@ fn main() {
             binop.left.codegen(&mut left_state);
             let mut right_state = CodegenState::default();
             binop.right.codegen(&mut right_state);
-            println!("Left: '{}', Right: '{}'", left_state.tokens, right_state.tokens);
+            println!(
+                "Left: '{}', Right: '{}'",
+                left_state.tokens, right_state.tokens
+            );
 
             // Now generate the mutated expression as text
             let mutated_expr = format!("{} - {}", left_state.tokens, right_state.tokens);
             println!("\n=== Mutated expression ===\n{mutated_expr}");
 
             // Generate full mutated function
-            let mutated_func = format!(
-                "def x_add__mutmut_1(a, b):\n    return {mutated_expr}\n"
-            );
+            let mutated_func = format!("def x_add__mutmut_1(a, b):\n    return {mutated_expr}\n");
             println!("\n=== Mutated function ===\n{mutated_func}");
 
             // Verify it parses

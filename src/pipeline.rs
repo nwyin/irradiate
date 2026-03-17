@@ -1,15 +1,15 @@
 //! Full mutation testing pipeline: mutate → stats → validate → test → report.
 
-use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
 use crate::codegen::mutate_file;
 use crate::harness;
 use crate::orchestrator::{run_worker_pool, PoolConfig};
 use crate::protocol::{MutantResult, MutantStatus, WorkItem};
 use crate::stats;
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Configuration for a mutation testing run.
 pub struct RunConfig {
@@ -95,15 +95,30 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Phase 3: Validation
     eprintln!("Running clean tests...");
-    validate_clean_run(&config.python, &project_dir, &harness_dir, &mutants_dir, &config.tests_dir)?;
+    validate_clean_run(
+        &config.python,
+        &project_dir,
+        &harness_dir,
+        &mutants_dir,
+        &config.tests_dir,
+    )?;
     eprintln!("  done");
 
     eprintln!("Running forced-fail validation...");
-    validate_fail_run(&config.python, &project_dir, &harness_dir, &mutants_dir, &config.tests_dir)?;
+    validate_fail_run(
+        &config.python,
+        &project_dir,
+        &harness_dir,
+        &mutants_dir,
+        &config.tests_dir,
+    )?;
     eprintln!("  done");
 
     // Phase 4: Mutation testing
-    eprintln!("Running mutation testing ({total_mutants} mutants, {} workers)...", config.workers);
+    eprintln!(
+        "Running mutation testing ({total_mutants} mutants, {} workers)...",
+        config.workers
+    );
     let start = Instant::now();
 
     // Build work items
@@ -140,7 +155,13 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // For no-stats mode, we need all test IDs — collect them from a dummy pytest run
     let work_items = if config.no_stats {
         // Use all tests discovered by the worker
-        let all_tests = discover_tests(&config.python, &project_dir, &harness_dir, &mutants_dir, &config.tests_dir)?;
+        let all_tests = discover_tests(
+            &config.python,
+            &project_dir,
+            &harness_dir,
+            &mutants_dir,
+            &config.tests_dir,
+        )?;
         work_items
             .into_iter()
             .map(|mut item| {
@@ -253,13 +274,17 @@ pub fn show(mutant_name: &str) -> Result<()> {
     let all_meta = load_all_meta(&mutants_dir)?;
 
     if !all_meta.iter().any(|(name, _)| name == mutant_name) {
-        bail!("Mutant '{mutant_name}' not found. Run `irradiate results --all` to see all mutants.");
+        bail!(
+            "Mutant '{mutant_name}' not found. Run `irradiate results --all` to see all mutants."
+        );
     }
 
     // mutant_name = "module.x_func__mutmut_N"
     // We need the module (for file lookup) and the local variant name (for function lookup)
     let (module, local_variant) = mutant_name.split_once('.').unwrap_or(("", mutant_name));
-    let (local_func_mangled, _) = local_variant.rsplit_once("__mutmut_").unwrap_or((local_variant, ""));
+    let (local_func_mangled, _) = local_variant
+        .rsplit_once("__mutmut_")
+        .unwrap_or((local_variant, ""));
     let orig_name = format!("{local_func_mangled}__mutmut_orig");
 
     // Find the mutated source file
@@ -277,7 +302,10 @@ pub fn show(mutant_name: &str) -> Result<()> {
     let orig_marker = format!("def {orig_name}(");
     let mutant_marker = format!("def {local_variant}(");
 
-    match (extract_function(&content, &orig_marker), extract_function(&content, &mutant_marker)) {
+    match (
+        extract_function(&content, &orig_marker),
+        extract_function(&content, &mutant_marker),
+    ) {
         (Some(orig), Some(mutant)) => {
             println!("# {mutant_name}");
             for line in diff_lines(&orig, &mutant) {
@@ -285,7 +313,10 @@ pub fn show(mutant_name: &str) -> Result<()> {
             }
         }
         _ => {
-            bail!("Could not extract functions for '{mutant_name}' from {}", source_file.display());
+            bail!(
+                "Could not extract functions for '{mutant_name}' from {}",
+                source_file.display()
+            );
         }
     }
 
@@ -363,7 +394,10 @@ fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn path_to_module(rel_path: &Path) -> String {
-    let s = rel_path.with_extension("").to_string_lossy().replace(['/', '\\'], ".");
+    let s = rel_path
+        .with_extension("")
+        .to_string_lossy()
+        .replace(['/', '\\'], ".");
     // Strip __init__ suffix
     s.strip_suffix(".__init__").unwrap_or(&s).to_string()
 }
@@ -479,7 +513,10 @@ fn write_meta_files(
     results: &[MutantResult],
 ) -> Result<()> {
     // Build result lookup
-    let result_map: HashMap<&str, &MutantResult> = results.iter().map(|r| (r.mutant_name.as_str(), r)).collect();
+    let result_map: HashMap<&str, &MutantResult> = results
+        .iter()
+        .map(|r| (r.mutant_name.as_str(), r))
+        .collect();
 
     for (module, names) in all_names {
         let mut meta = FileMeta::default();
@@ -571,7 +608,9 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64) {
     };
 
     eprintln!();
-    eprintln!("Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)");
+    eprintln!(
+        "Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
+    );
     eprintln!("  Killed:    {killed}");
     eprintln!("  Survived:  {survived}");
     if no_tests > 0 {

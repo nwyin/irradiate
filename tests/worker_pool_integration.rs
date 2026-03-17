@@ -27,8 +27,7 @@ fn fixture_dir() -> PathBuf {
 /// Generate mutants on the fly from the fixture source, writing to a temp directory.
 /// Returns (TempDir handle, list of mutant keys).
 fn generate_test_mutants() -> (tempfile::TempDir, Vec<String>) {
-    let source =
-        std::fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
+    let source = std::fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
     let mutated =
         codegen::mutate_file(&source, "simple_lib").expect("fixture should produce mutations");
 

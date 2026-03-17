@@ -68,7 +68,10 @@ def main():
     buf = b""
 
     # Send ready
-    send_message(sock, {"type": "ready", "pid": os.getpid(), "tests": list(collector.items.keys())})
+    send_message(
+        sock,
+        {"type": "ready", "pid": os.getpid(), "tests": list(collector.items.keys())},
+    )
 
     while True:
         msg, buf = recv_message(sock, buf)
@@ -98,12 +101,15 @@ def main():
                         items_to_run.append(collector.items[tid])
 
                 if not items_to_run:
-                    send_message(sock, {
-                        "type": "result",
-                        "mutant": mutant_name,
-                        "exit_code": 33,
-                        "duration": 0.0,
-                    })
+                    send_message(
+                        sock,
+                        {
+                            "type": "result",
+                            "mutant": mutant_name,
+                            "exit_code": 33,
+                            "duration": 0.0,
+                        },
+                    )
                     irradiate_harness.active_mutant = None
                     continue
 
@@ -115,20 +121,26 @@ def main():
 
                 duration = time.monotonic() - start
 
-                send_message(sock, {
-                    "type": "result",
-                    "mutant": mutant_name,
-                    "exit_code": exit_code,
-                    "duration": duration,
-                })
-            except Exception as e:
+                send_message(
+                    sock,
+                    {
+                        "type": "result",
+                        "mutant": mutant_name,
+                        "exit_code": exit_code,
+                        "duration": duration,
+                    },
+                )
+            except Exception:
                 duration = time.monotonic() - start
-                send_message(sock, {
-                    "type": "error",
-                    "mutant": mutant_name,
-                    "message": traceback.format_exc(),
-                    "duration": duration,
-                })
+                send_message(
+                    sock,
+                    {
+                        "type": "error",
+                        "mutant": mutant_name,
+                        "message": traceback.format_exc(),
+                        "duration": duration,
+                    },
+                )
             finally:
                 irradiate_harness.active_mutant = None
 

@@ -23,8 +23,10 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         return None;
     }
 
-    let mutated_func_names: std::collections::HashSet<&str> =
-        function_mutations.iter().map(|fm| fm.name.as_str()).collect();
+    let mutated_func_names: std::collections::HashSet<&str> = function_mutations
+        .iter()
+        .map(|fm| fm.name.as_str())
+        .collect();
 
     let mut output = String::new();
     let mut all_mutant_names = Vec::new();
@@ -102,18 +104,36 @@ mod tests {
         let source = "def add(a, b):\n    return a + b\n";
         let result = mutate_file(source, "simple_lib").unwrap();
 
-        assert!(result.source.contains("import irradiate_harness"), "Should have harness import");
-        assert!(result.source.contains("x_add__mutmut_orig"), "Should have original renamed");
-        assert!(result.source.contains("x_add__mutmut_1"), "Should have mutant variant");
-        assert!(result.source.contains("x_add__mutmut_mutants"), "Should have lookup dict");
-        assert!(!result.mutant_names.is_empty(), "Should produce mutant names");
+        assert!(
+            result.source.contains("import irradiate_harness"),
+            "Should have harness import"
+        );
+        assert!(
+            result.source.contains("x_add__mutmut_orig"),
+            "Should have original renamed"
+        );
+        assert!(
+            result.source.contains("x_add__mutmut_1"),
+            "Should have mutant variant"
+        );
+        assert!(
+            result.source.contains("x_add__mutmut_mutants"),
+            "Should have lookup dict"
+        );
+        assert!(
+            !result.mutant_names.is_empty(),
+            "Should produce mutant names"
+        );
     }
 
     #[test]
     fn test_mutate_file_no_mutations() {
         let source = "# just a comment\npass\n";
         let result = mutate_file(source, "empty");
-        assert!(result.is_none(), "Should return None for files with no mutations");
+        assert!(
+            result.is_none(),
+            "Should return None for files with no mutations"
+        );
     }
 
     #[test]
@@ -121,8 +141,14 @@ mod tests {
         let source = "import os\nimport sys\n\ndef add(a, b):\n    return a + b\n";
         let result = mutate_file(source, "my_mod").unwrap();
 
-        assert!(result.source.contains("import os"), "Should preserve original imports");
-        assert!(result.source.contains("import sys"), "Should preserve original imports");
+        assert!(
+            result.source.contains("import os"),
+            "Should preserve original imports"
+        );
+        assert!(
+            result.source.contains("import sys"),
+            "Should preserve original imports"
+        );
     }
 
     #[test]
@@ -130,9 +156,18 @@ mod tests {
         let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
         let result = mutate_file(source, "math_lib").unwrap();
 
-        assert!(result.source.contains("x_add__mutmut_orig"), "Should have add original");
-        assert!(result.source.contains("x_sub__mutmut_orig"), "Should have sub original");
-        assert!(result.mutant_names.len() >= 2, "Should have mutants for both functions");
+        assert!(
+            result.source.contains("x_add__mutmut_orig"),
+            "Should have add original"
+        );
+        assert!(
+            result.source.contains("x_sub__mutmut_orig"),
+            "Should have sub original"
+        );
+        assert!(
+            result.mutant_names.len() >= 2,
+            "Should have mutants for both functions"
+        );
     }
 
     #[test]
@@ -143,9 +178,15 @@ mod tests {
         // The original function definitions should NOT appear in the output
         // (they're replaced by the trampoline arrangement)
         let add_count = result.source.matches("def add(").count();
-        assert_eq!(add_count, 1, "Should have exactly one 'def add(' (the wrapper), got {add_count}");
+        assert_eq!(
+            add_count, 1,
+            "Should have exactly one 'def add(' (the wrapper), got {add_count}"
+        );
 
         let sub_count = result.source.matches("def sub(").count();
-        assert_eq!(sub_count, 1, "Should have exactly one 'def sub(' (the wrapper), got {sub_count}");
+        assert_eq!(
+            sub_count, 1,
+            "Should have exactly one 'def sub(' (the wrapper), got {sub_count}"
+        );
     }
 }

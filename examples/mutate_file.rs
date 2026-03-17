@@ -17,7 +17,10 @@ def greet(name):
 
     match mutate_file(source, "simple_lib") {
         Some(result) => {
-            println!("=== Mutated source ({} mutants) ===\n", result.mutant_names.len());
+            println!(
+                "=== Mutated source ({} mutants) ===\n",
+                result.mutant_names.len()
+            );
             println!("{}", result.source);
             println!("=== Mutant names ===");
             for name in &result.mutant_names {

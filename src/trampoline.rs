@@ -86,7 +86,11 @@ fn generate_wrapper_function(
     let args_list = if pos_args.is_empty() {
         "()".to_string()
     } else {
-        format!("({}{})", pos_args.join(", "), if pos_args.len() == 1 { "," } else { "" })
+        format!(
+            "({}{})",
+            pos_args.join(", "),
+            if pos_args.len() == 1 { "," } else { "" }
+        )
     };
 
     let kwargs_dict = if kw_args.is_empty() {
@@ -131,7 +135,15 @@ fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<S
         if part.starts_with('*') {
             after_star = true;
             // *args — include as starred
-            let name = part.trim_start_matches('*').split(':').next().unwrap_or("").split('=').next().unwrap_or("").trim();
+            let name = part
+                .trim_start_matches('*')
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim();
             if !name.is_empty() {
                 pos_args.push(format!("*{name}"));
             }
@@ -139,7 +151,14 @@ fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<S
         }
 
         // Extract just the parameter name (before : or =)
-        let name = part.split(':').next().unwrap_or(part).split('=').next().unwrap_or(part).trim();
+        let name = part
+            .split(':')
+            .next()
+            .unwrap_or(part)
+            .split('=')
+            .next()
+            .unwrap_or(part)
+            .trim();
         if name.is_empty() {
             continue;
         }
@@ -166,13 +185,23 @@ fn rename_function(source: &str, old_name: &str, new_name: &str) -> String {
     let replacement = format!("def {new_name}(");
     // Only replace the first occurrence (the function definition line)
     if let Some(pos) = source.find(&pattern) {
-        format!("{}{}{}", &source[..pos], replacement, &source[pos + pattern.len()..])
+        format!(
+            "{}{}{}",
+            &source[..pos],
+            replacement,
+            &source[pos + pattern.len()..]
+        )
     } else {
         // Try async def
         let pattern = format!("async def {old_name}(");
         let replacement = format!("async def {new_name}(");
         if let Some(pos) = source.find(&pattern) {
-            format!("{}{}{}", &source[..pos], replacement, &source[pos + pattern.len()..])
+            format!(
+                "{}{}{}",
+                &source[..pos],
+                replacement,
+                &source[pos + pattern.len()..]
+            )
         } else {
             source.to_string()
         }
@@ -233,11 +262,23 @@ mod tests {
         assert!(!fms.is_empty());
 
         let (code, keys) = generate_trampoline(&fms[0], "my_lib");
-        assert!(code.contains("x_add__mutmut_orig"), "Should have renamed original");
-        assert!(code.contains("x_add__mutmut_1"), "Should have at least one variant");
-        assert!(code.contains("x_add__mutmut_mutants"), "Should have lookup dict");
+        assert!(
+            code.contains("x_add__mutmut_orig"),
+            "Should have renamed original"
+        );
+        assert!(
+            code.contains("x_add__mutmut_1"),
+            "Should have at least one variant"
+        );
+        assert!(
+            code.contains("x_add__mutmut_mutants"),
+            "Should have lookup dict"
+        );
         assert!(code.contains("def add("), "Should have trampoline wrapper");
         assert!(!keys.is_empty(), "Should produce mutant keys");
-        assert!(keys[0].starts_with("my_lib.x_add__mutmut_"), "Keys should be module-qualified");
+        assert!(
+            keys[0].starts_with("my_lib.x_add__mutmut_"),
+            "Keys should be module-qualified"
+        );
     }
 }

@@ -67,19 +67,27 @@ enum WorkerEvent {
 /// Run a pool of pytest workers against a list of work items.
 ///
 /// Returns the results for all mutants.
-pub async fn run_worker_pool(config: &PoolConfig, work_items: Vec<WorkItem>) -> Result<Vec<MutantResult>> {
+pub async fn run_worker_pool(
+    config: &PoolConfig,
+    work_items: Vec<WorkItem>,
+) -> Result<Vec<MutantResult>> {
     if work_items.is_empty() {
         return Ok(vec![]);
     }
 
     // Extract harness
-    let harness_dir = harness::extract_harness(&config.project_dir).context("Failed to extract harness")?;
+    let harness_dir =
+        harness::extract_harness(&config.project_dir).context("Failed to extract harness")?;
 
     // Create unix socket in /tmp to avoid macOS path length limit (104 bytes)
-    let socket_name = format!("irradiate-{}-{}.sock", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos());
+    let socket_name = format!(
+        "irradiate-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
     let socket_path = std::env::temp_dir().join(socket_name);
     let _ = std::fs::remove_file(&socket_path);
 
@@ -96,7 +104,15 @@ pub async fn run_worker_pool(config: &PoolConfig, work_items: Vec<WorkItem>) -> 
     }
 
     // Accept connections and dispatch work
-    let results = dispatch_work(listener, processes, work_items, config, &harness_dir, &socket_path).await?;
+    let results = dispatch_work(
+        listener,
+        processes,
+        work_items,
+        config,
+        &harness_dir,
+        &socket_path,
+    )
+    .await?;
 
     // Clean up socket
     let _ = std::fs::remove_file(&socket_path);
@@ -104,7 +120,12 @@ pub async fn run_worker_pool(config: &PoolConfig, work_items: Vec<WorkItem>) -> 
     Ok(results)
 }
 
-fn spawn_worker(id: usize, config: &PoolConfig, harness_dir: &Path, socket_path: &Path) -> Result<Child> {
+fn spawn_worker(
+    id: usize,
+    config: &PoolConfig,
+    harness_dir: &Path,
+    socket_path: &Path,
+) -> Result<Child> {
     let worker_script = harness::worker_script(harness_dir);
 
     let child = Command::new(&config.python)
@@ -114,11 +135,7 @@ fn spawn_worker(id: usize, config: &PoolConfig, harness_dir: &Path, socket_path:
         .env("IRRADIATE_TESTS_DIR", &config.tests_dir)
         .env(
             "PYTHONPATH",
-            format!(
-                "{}:{}",
-                harness_dir.display(),
-                config.mutants_dir.display()
-            ),
+            format!("{}:{}", harness_dir.display(), config.mutants_dir.display()),
         )
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
@@ -172,8 +189,12 @@ async fn dispatch_work(
 
         // Read the ready message
         let mut line = String::new();
-        reader.read_line(&mut line).await.context("Failed to read ready message")?;
-        let ready_msg: WorkerMessage = serde_json::from_str(line.trim()).context("Failed to parse ready message")?;
+        reader
+            .read_line(&mut line)
+            .await
+            .context("Failed to read ready message")?;
+        let ready_msg: WorkerMessage =
+            serde_json::from_str(line.trim()).context("Failed to parse ready message")?;
 
         match &ready_msg {
             WorkerMessage::Ready { pid, .. } => {

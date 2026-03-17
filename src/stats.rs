@@ -23,12 +23,18 @@ impl TestStats {
 
     /// Get the test IDs that cover a given function.
     pub fn tests_for_function(&self, func_key: &str) -> Vec<String> {
-        self.tests_by_function.get(func_key).cloned().unwrap_or_default()
+        self.tests_by_function
+            .get(func_key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Estimate the total duration for running a set of tests.
     pub fn estimated_duration(&self, test_ids: &[String]) -> f64 {
-        test_ids.iter().filter_map(|id| self.duration_by_test.get(id)).sum()
+        test_ids
+            .iter()
+            .filter_map(|id| self.duration_by_test.get(id))
+            .sum()
     }
 }
 
@@ -78,7 +84,10 @@ pub fn collect_stats(
         );
     }
 
-    info!("Stats collection complete, loading from {}", stats_output.display());
+    info!(
+        "Stats collection complete, loading from {}",
+        stats_output.display()
+    );
 
     if stats_output.exists() {
         TestStats::load(&stats_output)
@@ -95,7 +104,10 @@ mod tests {
     #[test]
     fn test_stats_serialization() {
         let stats = TestStats {
-            tests_by_function: HashMap::from([("mod.x_foo".to_string(), vec!["test_foo".to_string()])]),
+            tests_by_function: HashMap::from([(
+                "mod.x_foo".to_string(),
+                vec!["test_foo".to_string()],
+            )]),
             duration_by_test: HashMap::from([("test_foo".to_string(), 0.042)]),
         };
 
@@ -123,7 +135,10 @@ mod tests {
     #[test]
     fn test_tests_for_function() {
         let stats = TestStats {
-            tests_by_function: HashMap::from([("mod.x_foo".to_string(), vec!["test_a".to_string(), "test_b".to_string()])]),
+            tests_by_function: HashMap::from([(
+                "mod.x_foo".to_string(),
+                vec!["test_a".to_string(), "test_b".to_string()],
+            )]),
             duration_by_test: HashMap::new(),
         };
 

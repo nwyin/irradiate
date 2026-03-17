@@ -4,8 +4,8 @@
 //! This avoids needing to clone/modify CST nodes (which libcst Rust doesn't support well).
 
 use libcst_native::{
-    self as cst, parse_module, BinaryOp, BooleanOp, Codegen, CodegenState, CompOp, CompoundStatement, Expression,
-    SmallStatement, Statement, UnaryOp,
+    self as cst, parse_module, BinaryOp, BooleanOp, Codegen, CodegenState, CompOp,
+    CompoundStatement, Expression, SmallStatement, Statement, UnaryOp,
 };
 
 /// A single mutation that can be applied to source code.
@@ -59,10 +59,15 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
                 let class_name = codegen_node(&cls.name);
                 if let cst::Suite::IndentedBlock(block) = &cls.body {
                     for method_stmt in &block.body {
-                        if let Statement::Compound(CompoundStatement::FunctionDef(func)) = method_stmt {
-                            if let Some(fm) =
-                                collect_function_mutations(func, Some(&class_name), source, &ignored_lines)
-                            {
+                        if let Statement::Compound(CompoundStatement::FunctionDef(func)) =
+                            method_stmt
+                        {
+                            if let Some(fm) = collect_function_mutations(
+                                func,
+                                Some(&class_name),
+                                source,
+                                &ignored_lines,
+                            ) {
                                 results.push(fm);
                             }
                         }
@@ -104,7 +109,13 @@ fn collect_function_mutations(
     let mut mutations = Vec::new();
     let mut cursor = 0usize;
 
-    collect_suite_mutations(&func.body, &func_source, &mut cursor, &mut mutations, ignored_lines);
+    collect_suite_mutations(
+        &func.body,
+        &func_source,
+        &mut cursor,
+        &mut mutations,
+        ignored_lines,
+    );
 
     if mutations.is_empty() {
         return None;
@@ -168,7 +179,13 @@ fn collect_statement_mutations(
                             collect_suite_mutations(&elif.body, source, cursor, mutations, ignored);
                         }
                         cst::OrElse::Else(else_clause) => {
-                            collect_suite_mutations(&else_clause.body, source, cursor, mutations, ignored);
+                            collect_suite_mutations(
+                                &else_clause.body,
+                                source,
+                                cursor,
+                                mutations,
+                                ignored,
+                            );
                         }
                     }
                 }
@@ -292,21 +309,30 @@ fn collect_expr_mutations(
         }
         Expression::Tuple(t) => {
             for el in &t.elements {
-                if let cst::Element::Simple { value: ref e_val, .. } = el {
+                if let cst::Element::Simple {
+                    value: ref e_val, ..
+                } = el
+                {
                     collect_expr_mutations(e_val, source, cursor, mutations, ignored);
                 }
             }
         }
         Expression::List(l) => {
             for el in &l.elements {
-                if let cst::Element::Simple { value: ref e_val, .. } = el {
+                if let cst::Element::Simple {
+                    value: ref e_val, ..
+                } = el
+                {
                     collect_expr_mutations(e_val, source, cursor, mutations, ignored);
                 }
             }
         }
         Expression::Dict(d) => {
             for el in &d.elements {
-                if let cst::DictElement::Simple { ref key, ref value, .. } = el {
+                if let cst::DictElement::Simple {
+                    ref key, ref value, ..
+                } = el
+                {
                     collect_expr_mutations(key, source, cursor, mutations, ignored);
                     collect_expr_mutations(value, source, cursor, mutations, ignored);
                 }
@@ -372,7 +398,14 @@ fn add_binop_mutations(
     for &(from, to) in BINOP_SWAPS {
         if op_trimmed == from {
             let replacement = op_text.replace(from, to);
-            find_and_record(&op_text, &replacement, "binop_swap", source, cursor, mutations);
+            find_and_record(
+                &op_text,
+                &replacement,
+                "binop_swap",
+                source,
+                cursor,
+                mutations,
+            );
             break;
         }
     }
@@ -392,7 +425,14 @@ fn add_boolop_mutations(
         "or" => op_text.replace("or", "and"),
         _ => return,
     };
-    find_and_record(&op_text, &replacement, "boolop_swap", source, cursor, mutations);
+    find_and_record(
+        &op_text,
+        &replacement,
+        "boolop_swap",
+        source,
+        cursor,
+        mutations,
+    );
 }
 
 /// Comparison operator swaps.
@@ -421,7 +461,14 @@ fn add_compop_mutations(
     for &(from, to) in COMPOP_SWAPS {
         if op_trimmed == from.trim() {
             let replacement = op_text.replace(from.trim(), to.trim());
-            find_and_record(&op_text, &replacement, "compop_swap", source, cursor, mutations);
+            find_and_record(
+                &op_text,
+                &replacement,
+                "compop_swap",
+                source,
+                cursor,
+                mutations,
+            );
             break;
         }
     }
@@ -438,7 +485,14 @@ fn add_unaryop_mutations(
         UnaryOp::Not { .. } | UnaryOp::BitInvert { .. } => {
             let full_text = codegen_node(unop);
             let inner_text = codegen_node(&*unop.expression);
-            find_and_record(&full_text, &inner_text, "unary_removal", source, cursor, mutations);
+            find_and_record(
+                &full_text,
+                &inner_text,
+                "unary_removal",
+                source,
+                cursor,
+                mutations,
+            );
         }
         _ => {}
     }
@@ -471,7 +525,14 @@ fn add_number_mutation(
     if let Ok(n) = text.replace('_', "").parse::<i64>() {
         let replacement = (n + 1).to_string();
         if replacement != text {
-            find_and_record(text, &replacement, "number_mutation", source, cursor, mutations);
+            find_and_record(
+                text,
+                &replacement,
+                "number_mutation",
+                source,
+                cursor,
+                mutations,
+            );
         }
     }
 }
@@ -486,7 +547,14 @@ fn add_float_mutation(
     if let Ok(n) = text.parse::<f64>() {
         let replacement = format!("{}", n + 1.0);
         if replacement != text {
-            find_and_record(text, &replacement, "number_mutation", source, cursor, mutations);
+            find_and_record(
+                text,
+                &replacement,
+                "number_mutation",
+                source,
+                cursor,
+                mutations,
+            );
         }
     }
 }
@@ -512,7 +580,14 @@ fn add_string_mutation(
     let replacement = format!("{prefix}{quote_char}XX{inner}XX{quote_char}");
 
     if replacement != text {
-        find_and_record(text, &replacement, "string_mutation", source, cursor, mutations);
+        find_and_record(
+            text,
+            &replacement,
+            "string_mutation",
+            source,
+            cursor,
+            mutations,
+        );
     }
 }
 
@@ -524,9 +599,20 @@ fn add_lambda_mutation(
 ) {
     let full_text = codegen_node(lam);
     let body_text = codegen_node(&*lam.body);
-    let replacement_body = if body_text.trim() == "None" { "0" } else { "None" };
+    let replacement_body = if body_text.trim() == "None" {
+        "0"
+    } else {
+        "None"
+    };
     let replacement = full_text.replace(&body_text, replacement_body);
-    find_and_record(&full_text, &replacement, "lambda_mutation", source, cursor, mutations);
+    find_and_record(
+        &full_text,
+        &replacement,
+        "lambda_mutation",
+        source,
+        cursor,
+        mutations,
+    );
 }
 
 fn add_assignment_mutation(
@@ -548,7 +634,14 @@ fn add_assignment_mutation(
     } else {
         return;
     };
-    find_and_record(&full_text, &new_full, "assignment_mutation", source, cursor, mutations);
+    find_and_record(
+        &full_text,
+        &new_full,
+        "assignment_mutation",
+        source,
+        cursor,
+        mutations,
+    );
 }
 
 /// AugAssign operator swap: += → -=, etc., and also += → = (strip augmentation)
@@ -580,7 +673,14 @@ fn add_augassign_mutations(
     for &(from, to) in AUGOP_SWAPS {
         if op_trimmed == from {
             let replacement = op_text.replace(from, to);
-            find_and_record(&op_text, &replacement, "augop_swap", source, cursor, mutations);
+            find_and_record(
+                &op_text,
+                &replacement,
+                "augop_swap",
+                source,
+                cursor,
+                mutations,
+            );
             break;
         }
     }
@@ -590,7 +690,14 @@ fn add_augassign_mutations(
     let target_text = codegen_node(&aug.target);
     let value_text = codegen_node(&aug.value);
     let plain_assign = format!("{target_text} ={value_text}");
-    find_and_record(&full_text, &plain_assign, "augassign_to_assign", source, cursor, mutations);
+    find_and_record(
+        &full_text,
+        &plain_assign,
+        "augassign_to_assign",
+        source,
+        cursor,
+        mutations,
+    );
 }
 
 // --- Utility ---
@@ -606,7 +713,12 @@ fn pragma_no_mutate_lines(source: &str) -> std::collections::HashSet<usize> {
         .lines()
         .enumerate()
         .filter_map(|(i, line)| {
-            if line.contains("# pragma:") && line.split("# pragma:").last().is_some_and(|s| s.contains("no mutate")) {
+            if line.contains("# pragma:")
+                && line
+                    .split("# pragma:")
+                    .last()
+                    .is_some_and(|s| s.contains("no mutate"))
+            {
                 Some(i + 1) // 1-indexed
             } else {
                 None
@@ -637,9 +749,16 @@ mod tests {
         let fm = &fms[0];
         assert_eq!(fm.name, "add");
 
-        let binop_mutations: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        let binop_mutations: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
         assert!(!binop_mutations.is_empty(), "Should find + → - mutation");
-        assert!(binop_mutations[0].replacement.contains('-'), "Should swap + to -");
+        assert!(
+            binop_mutations[0].replacement.contains('-'),
+            "Should swap + to -"
+        );
     }
 
     #[test]
@@ -648,11 +767,21 @@ mod tests {
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
 
-        let compop = fms[0].mutations.iter().find(|m| m.operator == "compop_swap");
+        let compop = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "compop_swap");
         assert!(compop.is_some(), "Should find > → >= mutation");
 
-        let name_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator == "name_swap").collect();
-        assert!(name_muts.len() >= 2, "Should find True→False and False→True");
+        let name_muts: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "name_swap")
+            .collect();
+        assert!(
+            name_muts.len() >= 2,
+            "Should find True→False and False→True"
+        );
     }
 
     #[test]
@@ -661,9 +790,15 @@ mod tests {
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
 
-        let string_mut = fms[0].mutations.iter().find(|m| m.operator == "string_mutation");
+        let string_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "string_mutation");
         assert!(string_mut.is_some(), "Should find string mutation");
-        assert!(string_mut.unwrap().replacement.contains("XX"), "Should add XX prefix/suffix");
+        assert!(
+            string_mut.unwrap().replacement.contains("XX"),
+            "Should add XX prefix/suffix"
+        );
     }
 
     #[test]
@@ -678,7 +813,11 @@ mod tests {
         let source = "def foo():\n    \"\"\"docstring\"\"\"\n    return 1\n";
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
-        let string_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator == "string_mutation").collect();
+        let string_muts: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "string_mutation")
+            .collect();
         assert!(string_muts.is_empty(), "Docstrings should not be mutated");
     }
 
@@ -687,7 +826,11 @@ mod tests {
         let source = "def add(a, b):\n    return a + b\n";
         let fms = collect_file_mutations(source);
         let fm = &fms[0];
-        let binop = fm.mutations.iter().find(|m| m.operator == "binop_swap").unwrap();
+        let binop = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "binop_swap")
+            .unwrap();
 
         let mutated = apply_mutation(&fm.source, binop);
         assert!(mutated.contains(" - "), "Should have - instead of +");
@@ -699,7 +842,10 @@ mod tests {
         let source = "def foo():\n    return 42\n";
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
-        let num_mut = fms[0].mutations.iter().find(|m| m.operator == "number_mutation");
+        let num_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "number_mutation");
         assert!(num_mut.is_some());
         assert_eq!(num_mut.unwrap().replacement, "43");
     }
@@ -708,7 +854,10 @@ mod tests {
     fn test_boolean_op_mutation() {
         let source = "def foo(a, b):\n    return a and b\n";
         let fms = collect_file_mutations(source);
-        let boolop = fms[0].mutations.iter().find(|m| m.operator == "boolop_swap");
+        let boolop = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "boolop_swap");
         assert!(boolop.is_some(), "Should find and → or mutation");
     }
 
@@ -735,7 +884,10 @@ mod tests {
     fn test_lambda_mutation() {
         let source = "def foo():\n    f = lambda x: x + 1\n";
         let fms = collect_file_mutations(source);
-        let lam = fms[0].mutations.iter().find(|m| m.operator == "lambda_mutation");
+        let lam = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "lambda_mutation");
         assert!(lam.is_some(), "Should find lambda → None mutation");
     }
 }

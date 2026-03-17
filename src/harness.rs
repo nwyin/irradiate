@@ -17,8 +17,10 @@ pub fn extract_harness(base_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&pkg_dir).context("Failed to create irradiate_harness package directory")?;
 
     fs::write(pkg_dir.join("__init__.py"), HARNESS_INIT).context("Failed to write __init__.py")?;
-    fs::write(harness_dir.join("worker.py"), HARNESS_WORKER).context("Failed to write worker.py")?;
-    fs::write(pkg_dir.join("stats_plugin.py"), HARNESS_STATS_PLUGIN).context("Failed to write stats_plugin.py")?;
+    fs::write(harness_dir.join("worker.py"), HARNESS_WORKER)
+        .context("Failed to write worker.py")?;
+    fs::write(pkg_dir.join("stats_plugin.py"), HARNESS_STATS_PLUGIN)
+        .context("Failed to write stats_plugin.py")?;
 
     Ok(harness_dir)
 }
@@ -41,12 +43,19 @@ mod tests {
 
         let harness_dir = extract_harness(&tmp).unwrap();
 
-        assert!(harness_dir.join("irradiate_harness").join("__init__.py").exists());
+        assert!(harness_dir
+            .join("irradiate_harness")
+            .join("__init__.py")
+            .exists());
         assert!(harness_dir.join("worker.py").exists());
-        assert!(harness_dir.join("irradiate_harness").join("stats_plugin.py").exists());
+        assert!(harness_dir
+            .join("irradiate_harness")
+            .join("stats_plugin.py")
+            .exists());
 
         // Verify content
-        let init_content = fs::read_to_string(harness_dir.join("irradiate_harness").join("__init__.py")).unwrap();
+        let init_content =
+            fs::read_to_string(harness_dir.join("irradiate_harness").join("__init__.py")).unwrap();
         assert!(init_content.contains("active_mutant"));
         assert!(init_content.contains("ProgrammaticFailException"));
 
@@ -59,6 +68,9 @@ mod tests {
     #[test]
     fn test_worker_script_path() {
         let harness_dir = Path::new("/tmp/harness");
-        assert_eq!(worker_script(harness_dir), PathBuf::from("/tmp/harness/worker.py"));
+        assert_eq!(
+            worker_script(harness_dir),
+            PathBuf::from("/tmp/harness/worker.py")
+        );
     }
 }

@@ -5,10 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrchestratorMessage {
     Warmup,
-    Run {
-        mutant: String,
-        tests: Vec<String>,
-    },
+    Run { mutant: String, tests: Vec<String> },
     Shutdown,
 }
 
@@ -121,10 +118,19 @@ mod tests {
 
     #[test]
     fn test_mutant_status_from_exit_code() {
-        assert_eq!(MutantStatus::from_exit_code(0, false), MutantStatus::Survived);
+        assert_eq!(
+            MutantStatus::from_exit_code(0, false),
+            MutantStatus::Survived
+        );
         assert_eq!(MutantStatus::from_exit_code(1, false), MutantStatus::Killed);
-        assert_eq!(MutantStatus::from_exit_code(33, false), MutantStatus::NoTests);
-        assert_eq!(MutantStatus::from_exit_code(37, false), MutantStatus::TypeCheck);
+        assert_eq!(
+            MutantStatus::from_exit_code(33, false),
+            MutantStatus::NoTests
+        );
+        assert_eq!(
+            MutantStatus::from_exit_code(37, false),
+            MutantStatus::TypeCheck
+        );
         assert_eq!(MutantStatus::from_exit_code(0, true), MutantStatus::Timeout);
         assert_eq!(MutantStatus::from_exit_code(2, false), MutantStatus::Error);
     }
