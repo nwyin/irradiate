@@ -186,10 +186,11 @@ cargo install cargo-show-asm
 cargo asm irradiate::mutation::collect_file_mutations --rust
 ```
 
-For the Python harness, use `py2cfg`:
+For the Python harness, use [`pycfg-rs`](https://github.com/nwyin/pycfg-rs):
 
 ```bash
-uvx py2cfg harness/worker.py -o docs/artifacts/worker-cfg.svg
+cargo install --git https://github.com/nwyin/pycfg-rs
+pycfg-rs harness/worker.py -o docs/artifacts/worker-cfg.svg
 ```
 
 ### Recommended artifacts to commit
