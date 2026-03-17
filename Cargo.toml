@@ -12,3 +12,4 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 num_cpus = "1"
+libcst = { version = "1.8.6", default-features = false }
