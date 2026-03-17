@@ -440,6 +440,107 @@ The repo has a strong central idea and a good prototype architecture. The next s
 
 ---
 
+## 5.11 Design Decision: Python Import Model
+
+### Current approach
+
+All Python subprocess invocations (stats collection, validation, worker pool) set `PYTHONPATH` to include:
+
+1. **Harness directory** — so `import irradiate_harness` resolves to our runtime package
+2. **Mutants directory** — so `import mylib` resolves to the trampolined version in `mutants/`
+3. **Source parent directory** — so unmutated sibling modules can be imported
+
+This is a **path-shadowing** strategy: mutated files in `mutants/` shadow the originals because `mutants/` appears earlier on `PYTHONPATH` than the source directory.
+
+### Tradeoffs
+
+**Why this works for now:**
+- Simple to implement — just a PYTHONPATH string
+- No modifications to Python's import machinery
+- Works for flat-layout projects where all source is under one directory
+
+**Where it breaks:**
+- **Partial mutation**: if we mutate `mylib/foo.py` but not `mylib/bar.py`, the `mutants/` directory contains only `foo.py`. When `foo.py` tries `from mylib import bar`, Python finds `mylib` in `mutants/` (because it has `__init__.py`) but `bar.py` isn't there. The import fails unless the original source directory is also on the path — but then `foo.py` might resolve from the wrong location depending on import order.
+- **Namespace packages**: projects using implicit namespace packages (no `__init__.py`) break because Python can merge multiple directories into one namespace — the mutated and original directories might get merged unpredictably.
+- **Editable installs**: projects installed with `pip install -e .` have their source resolved through `.pth` files and `pkg_resources` entry points, not plain `PYTHONPATH`. Our shadowing doesn't intercept these.
+- **Relative imports**: `from . import sibling` resolves based on the package's `__path__`, which may point to the original source directory, not `mutants/`.
+
+### Future alternatives
+
+**Option A: Full source tree mirror.** Copy the entire source tree into `mutants/`, then overwrite only the mutated files. This eliminates the partial-mutation problem entirely — every import resolves within `mutants/`. Downside: disk I/O and potential for stale copies.
+
+**Option B: Import hook.** Install a custom Python import hook (via `sys.meta_path`) that intercepts imports and redirects mutated modules to `mutants/` while letting everything else resolve normally. This is what mutmut's author originally wanted but abandoned due to import system fragility. It would be the cleanest solution but requires careful handling of `importlib` internals, cached bytecode (`.pyc`), and reload semantics.
+
+**Option C: Symlink farm.** Create a directory with symlinks: mutated files point to `mutants/`, everything else points to original source. Single PYTHONPATH entry. Works well on Unix, less so on Windows. Fragile with tools that resolve symlinks.
+
+**Recommendation:** Start with Option A (full mirror) when the current approach hits real-world breakage. It's the simplest correct solution and can be implemented incrementally by modifying `generate_mutants()` to copy unmutated files alongside mutated ones. Reserve Option B for a future optimization pass if the mirror approach proves too slow for large codebases.
+
+---
+
+## 5.12 Design Decision: Worker Execution Model
+
+### Current approach
+
+Workers call `pytest.main(["-x", "--no-header", "-q"] + test_ids)` for every mutant. This re-invokes pytest's full startup sequence — argument parsing, plugin loading, test collection, fixture resolution — then runs the selected tests and exits. The pre-collected test items from the `ItemCollector` plugin are used only for reporting available tests to the orchestrator, not for execution.
+
+### Why this exists
+
+This was a pragmatic shortcut to get the vertical slice working. `pytest.main()` is the only *public* API for running tests. It's well-documented, handles all edge cases (plugin lifecycle, fixture teardown, output capture, exit codes), and is guaranteed stable across pytest versions. Going deeper into pytest's internals trades stability for performance.
+
+### The performance cost
+
+On a typical project with 200ms pytest startup and 1000 mutants:
+- **Current**: 1000 × 200ms = 200 seconds of pure startup overhead
+- **Direct execution**: 1 × 200ms + 1000 × (test time only) ≈ 200ms + test time
+- For fast tests (50ms each), this is the difference between 250s and 50s — a 5× speedup
+
+This is the core value proposition of irradiate over mutmut. Without direct execution, the worker pool is just a process pool with warm Python interpreters, saving only the Python startup time (~50ms), not the pytest startup time (~200ms).
+
+### What direct execution requires
+
+The target API is `_pytest.runner.runtestprotocol(item, nextitem=None)`, which:
+1. Calls setup hooks (fixture instantiation)
+2. Runs the test function
+3. Calls teardown hooks (fixture cleanup)
+4. Returns a list of `TestReport` objects
+
+Between mutant runs, the worker must reset:
+- **Test outcomes**: clear any cached `TestReport` objects
+- **Captured output**: reset the capture manager plugin
+- **Fixture state**: session-scoped fixtures persist (by design), function-scoped fixtures are fresh per item
+- **Plugin state**: some plugins accumulate state (warnings, coverage) that needs clearing
+
+### Tradeoffs
+
+**Gains:**
+- 5-10× speedup on real projects (the whole point of irradiate)
+- Lower memory churn (no repeated pytest Session objects)
+- More accurate timing (measures test execution, not pytest overhead)
+
+**Risks:**
+- **Pytest internal API instability**: `_pytest.runner.runtestprotocol` is private API. It could change between pytest versions. Mitigation: version-check at startup, fall back to `pytest.main()` on unrecognized versions.
+- **State leakage**: session-scoped fixtures, module-level variables, and global state survive between runs. A test that sets `os.environ["API_KEY"] = "test"` without cleanup will affect subsequent runs. Mitigation: worker recycling (respawn every N mutants).
+- **Plugin compatibility**: some pytest plugins assume one session = one run. Plugins that accumulate state (pytest-cov, pytest-xdist) may produce incorrect results. Mitigation: document incompatible plugins, offer `--isolate` fallback.
+- **Fixture teardown ordering**: running items out of collection order may trigger fixtures in unexpected sequences. Mitigation: run items in their original collection order within each mutant.
+
+### Phased approach
+
+1. **Phase 1 (current)**: `pytest.main()` per mutant. Correct but slow. Validates the pool architecture.
+2. **Phase 2 (next)**: `runtestprotocol()` on pre-collected items. The main performance win. Add version check + fallback.
+3. **Phase 3 (later)**: Worker recycling. Respawn every N mutants to bound state leakage. Configurable via `--worker-recycle-after`.
+4. **Phase 4 (optional)**: `--isolate` flag. Fresh subprocess per mutant for projects that can't tolerate any state sharing. Deliberately slow but maximally correct.
+
+### What to watch for
+
+When we ship Phase 2, the first real-world test suite that breaks will likely be due to one of:
+- A session-scoped fixture that caches state incorrectly
+- A plugin that writes to a shared file (coverage data, timing reports)
+- A test that monkeypatches a module attribute without cleanup
+
+The `--isolate` flag exists as a debugging escape hatch for these cases. If a user reports "irradiate gives different results than pytest", the first diagnostic step is `irradiate run --isolate` — if that matches pytest, the bug is state leakage in pool mode.
+
+---
+
 ## Priority Order
 
 | # | Item | Effort | Impact |
