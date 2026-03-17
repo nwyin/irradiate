@@ -1,3 +1,101 @@
-fn main() {
-    println!("irradiate: mutation testing for Python");
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "irradiate", about = "Mutation testing for Python", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run mutation testing
+    Run {
+        /// Specific mutant names to test (default: all)
+        mutant_names: Vec<String>,
+
+        /// Path(s) to source code to mutate
+        #[arg(long, default_value = "src")]
+        paths_to_mutate: String,
+
+        /// Path to test directory
+        #[arg(long, default_value = "tests")]
+        tests_dir: String,
+
+        /// Number of worker processes
+        #[arg(long)]
+        workers: Option<usize>,
+
+        /// Timeout multiplier (applied to baseline test duration)
+        #[arg(long, default_value_t = 10.0)]
+        timeout_multiplier: f64,
+
+        /// Skip stats collection, test all mutants against all tests
+        #[arg(long)]
+        no_stats: bool,
+
+        /// Skip mutants with no test coverage
+        #[arg(long)]
+        covered_only: bool,
+
+        /// Python interpreter path
+        #[arg(long, default_value = "python3")]
+        python: String,
+    },
+
+    /// Display mutation testing results
+    Results {
+        /// Show all mutants, not just survived
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show diff for a specific mutant
+    Show {
+        /// Mutant name (e.g., module.x_func__mutmut_1)
+        mutant_name: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            mutant_names,
+            paths_to_mutate,
+            tests_dir,
+            workers,
+            timeout_multiplier,
+            no_stats,
+            covered_only,
+            python,
+        } => {
+            irradiate::pipeline::run(irradiate::pipeline::RunConfig {
+                paths_to_mutate: PathBuf::from(paths_to_mutate),
+                tests_dir,
+                workers: workers.unwrap_or_else(num_cpus::get),
+                timeout_multiplier,
+                no_stats,
+                covered_only,
+                python: PathBuf::from(python),
+                mutant_filter: if mutant_names.is_empty() {
+                    None
+                } else {
+                    Some(mutant_names)
+                },
+            })
+            .await
+        }
+        Commands::Results { all } => irradiate::pipeline::results(all),
+        Commands::Show { mutant_name } => irradiate::pipeline::show(&mutant_name),
+    }
 }

@@ -133,39 +133,51 @@ cargo check && cargo clippy -- -D warnings && cargo test && bash tests/e2e.sh
 
 ## Spec 4: CLI + E2E Integration
 
-**Prerequisites:** Spec 3 (worker pool operational)
+**Prerequisites:** Specs 1-3
+
+### mutmut compatibility decisions
+
+Match mutmut's CLI surface where it makes sense, use our own where it doesn't:
+
+- **Match:** `run`, `results`, `show` subcommands. `.meta` JSON format per mutated file. `[tool.mutmut]` config section in pyproject.toml. Exit code semantics (0=survived, 1=killed, 33=no tests, 37=type check). Mutant naming (`x_func__mutmut_N`).
+- **Skip for now:** `apply`, `browse`, `export-cicd-stats`, `print-time-estimates`, `tests-for-mutant`. `setup.cfg` support. `--max-children` flag (our worker pool is different).
+- **Own style:** progress output, summary format.
 
 ### Requirements
 
 - CLI via clap with subcommands:
-  - `irradiate run [PATHS]` — full pipeline: mutate → stats → validate → test mutants → report.
-    - `--paths-to-mutate <glob>` (default: `src/` or auto-detect)
+  - `irradiate run` — full pipeline: mutate → stats → validate → test mutants → report.
+    - `--paths-to-mutate <path>` (default: auto-detect `src/` or project name dir)
     - `--tests-dir <path>` (default: `tests/`)
     - `--workers <N>` (default: CPU count)
     - `--timeout-multiplier <float>` (default: 10.0)
     - `--no-stats` (skip stats collection, test all mutants against all tests)
     - `--covered-only` (skip mutants with no test coverage)
-  - `irradiate results` — print summary table (killed/survived/timeout/no-tests counts + list of survived mutants with file:line).
-  - `irradiate show <mutant_name>` — print the diff for a specific mutant.
+    - Specific mutant names as positional args (optional — run only these)
+  - `irradiate results` — print summary table + list survived mutants.
+    - `--all` flag to show all mutants, not just survived.
+  - `irradiate show <mutant_name>` — print unified diff of mutant vs original.
 - Full pipeline orchestration in `irradiate run`:
-  1. Phase 1: Mutation generation (parallel, rayon).
-  2. Phase 2: Stats collection (single run with `active_mutant = "stats"`).
-  3. Phase 3: Validation — clean run (no mutant) passes, forced fail (`active_mutant = "fail"`) fails.
-  4. Phase 4: Mutation testing — sort by estimated time, dispatch to worker pool, collect results.
-  5. Phase 5: Results — aggregate, classify by exit code, print summary.
-- Results written to `.irradiate/results.json` (list of `{mutant_name, exit_code, duration, status}`).
-- E2e test script (`tests/e2e.sh`):
-  - Build release binary.
-  - Run `irradiate run` against each project in `tests/e2e_projects/`.
-  - Verify: exit code 0, results file exists, at least 1 killed mutant and 1 survived mutant (for projects designed to have both).
-  - Print pass/fail summary.
-- Config: read `[tool.irradiate]` section from `pyproject.toml` (paths_to_mutate, tests_dir, timeout_multiplier). CLI flags override config.
+  1. Mutation generation — parse Python files, generate trampolined mutants to `mutants/` dir.
+  2. Stats collection — run test suite with `active_mutant = "stats"` to map tests→functions.
+  3. Validation — clean run (no mutant) must pass; forced fail (`active_mutant = "fail"`) must fail.
+  4. Mutation testing — sort by estimated time, dispatch to worker pool, collect results.
+  5. Results — write `.meta` files (mutmut-compatible), print summary.
+- `.meta` file format (per mutated source file, mutmut-compatible):
+  ```json
+  {
+    "exit_code_by_key": {"module.x_func__mutmut_1": 1, ...},
+    "durations_by_key": {"module.x_func__mutmut_1": 0.042, ...}
+  }
+  ```
+- Config: read `[tool.mutmut]` section from `pyproject.toml`. Supported keys: `paths_to_mutate`, `tests_dir`, `do_not_mutate`, `also_copy`, `debug`, `pytest_add_cli_args`. CLI flags override config.
+- E2e test: build binary, run against `tests/fixtures/simple_project/`, verify correct killed/survived counts.
 
 ### Success Criteria
 
 - `cargo check && cargo clippy -- -D warnings && cargo test` passes.
-- `bash tests/e2e.sh` passes — irradiate runs end-to-end against mutmut's e2e_projects and produces correct results.
-- `irradiate run` on the simple fixture produces a results summary with correct killed/survived counts.
+- `bash tests/e2e.sh` passes end-to-end.
+- `irradiate run` on the simple fixture produces correct killed/survived results.
 - `irradiate results` prints a readable summary.
 - `irradiate show <mutant>` prints a diff.
 
