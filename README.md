@@ -1,8 +1,8 @@
 # irradiate
 
-Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).
+Mutation testing for Python, written in Rust.
 
-> **Pre-alpha software.** This project is under very active development and is not yet ready for production use. APIs, output formats, and behavior will change without notice.
+> **Pre-alpha software.** Under very active development — not ready for production use. APIs, output formats, and behavior will change without notice.
 
 ## Why
 
@@ -39,7 +39,6 @@ What works today:
 - Table-driven operators (arithmetic, comparison, logical, bitwise, boolean, keyword, unary, string method swaps)
 - Procedural operators (numbers, strings, lambdas, assignments)
 - Stats-based test selection (only run tests that cover each function)
-- mutmut-compatible output (`.meta` files, mutant naming, `[tool.mutmut]` config)
 
 What's missing:
 - Content-addressable cache
@@ -57,6 +56,10 @@ cargo build --release
 ```
 
 Requires Rust 1.70+ and a Python 3.10+ environment with pytest installed.
+
+## Acknowledgments
+
+irradiate's trampoline architecture and mutation operator design are informed by [mutmut](https://github.com/boxed/mutmut). The output format is partially compatible with mutmut to ease migration.
 
 ## License
 
