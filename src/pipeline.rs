@@ -532,7 +532,7 @@ fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(files);
     }
-    if dir.is_file() && dir.extension().is_some_and(|e| e == "py") {
+    if dir.is_file() && is_mutatable_python_file(dir) {
         files.push(dir.to_path_buf());
         return Ok(files);
     }
@@ -546,11 +546,19 @@ fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
                 continue;
             }
             files.extend(find_python_files(&path)?);
-        } else if path.extension().is_some_and(|e| e == "py") {
+        } else if is_mutatable_python_file(&path) {
             files.push(path);
         }
     }
     Ok(files)
+}
+
+fn is_mutatable_python_file(path: &Path) -> bool {
+    if path.extension().is_none_or(|e| e != "py") {
+        return false;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    name != "conftest.py"
 }
 
 fn path_to_module(rel_path: &Path) -> String {
@@ -1104,6 +1112,29 @@ mod tests {
         std::fs::write(tmp.path().join("readme.txt"), "").unwrap();
         let files = find_python_files(tmp.path()).unwrap();
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_find_python_files_skips_conftest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let module = tmp.path().join("module.py");
+        let root_conftest = tmp.path().join("conftest.py");
+        let nested_conftest = sub.join("conftest.py");
+        let lib = sub.join("lib.py");
+        std::fs::write(&module, "").unwrap();
+        std::fs::write(&root_conftest, "").unwrap();
+        std::fs::write(&nested_conftest, "").unwrap();
+        std::fs::write(&lib, "").unwrap();
+
+        let mut files = find_python_files(tmp.path()).unwrap();
+        files.sort();
+
+        assert!(files.contains(&module));
+        assert!(files.contains(&lib));
+        assert!(!files.contains(&root_conftest));
+        assert!(!files.contains(&nested_conftest));
     }
 
     // --- write_meta_files + load_all_meta round-trip ---
