@@ -866,4 +866,279 @@ mod tests {
         let b = build_pythonpath(harness, mutants, src);
         assert_eq!(a, b, "build_pythonpath must be deterministic");
     }
+
+    // --- path_to_module tests ---
+
+    #[test]
+    fn test_path_to_module_simple() {
+        assert_eq!(path_to_module(Path::new("foo.py")), "foo");
+    }
+
+    #[test]
+    fn test_path_to_module_init() {
+        // __init__.py should collapse to the package name
+        assert_eq!(path_to_module(Path::new("foo/__init__.py")), "foo");
+    }
+
+    #[test]
+    fn test_path_to_module_nested() {
+        assert_eq!(path_to_module(Path::new("a/b/c.py")), "a.b.c");
+    }
+
+    #[test]
+    fn test_path_to_module_nested_init() {
+        assert_eq!(path_to_module(Path::new("a/b/__init__.py")), "a.b");
+    }
+
+    #[test]
+    fn test_path_to_module_bare_init() {
+        // A bare __init__.py with no parent dir: strip_suffix(".__init__") does not match
+        // because the string is just "__init__" (no leading dot), so the raw stem is returned.
+        assert_eq!(path_to_module(Path::new("__init__.py")), "__init__");
+    }
+
+    // --- extract_function tests ---
+
+    #[test]
+    fn test_extract_function_single() {
+        let src = "def foo():\n    return 1\n";
+        let result = extract_function(src, "def foo():");
+        assert_eq!(result, Some("def foo():\n    return 1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_function_stops_at_top_level() {
+        let src = "def foo():\n    return 1\n\ndef bar():\n    return 2\n";
+        let result = extract_function(src, "def foo():");
+        // Should include foo's body but stop before bar
+        let s = result.unwrap();
+        assert!(s.contains("def foo():"));
+        assert!(s.contains("return 1"));
+        assert!(!s.contains("def bar():"));
+    }
+
+    #[test]
+    fn test_extract_function_first_match_only() {
+        // When two functions have the same marker prefix, only the first is returned
+        let src = "def foo():\n    return 1\n\ndef foo_extra():\n    return 2\n";
+        let result = extract_function(src, "def foo():");
+        let s = result.unwrap();
+        assert!(!s.contains("foo_extra"));
+    }
+
+    #[test]
+    fn test_extract_function_no_match() {
+        let src = "def bar():\n    return 42\n";
+        assert_eq!(extract_function(src, "def foo():"), None);
+    }
+
+    #[test]
+    fn test_extract_function_nested_blocks() {
+        let src = "def foo():\n    if True:\n        for i in range(3):\n            pass\n    return 0\n\nx = 1\n";
+        let result = extract_function(src, "def foo():");
+        let s = result.unwrap();
+        assert!(s.contains("if True:"));
+        assert!(s.contains("for i in range(3):"));
+        assert!(s.contains("return 0"));
+        assert!(!s.contains("x = 1"));
+    }
+
+    #[test]
+    fn test_extract_function_empty_source() {
+        assert_eq!(extract_function("", "def foo():"), None);
+    }
+
+    // --- diff_lines tests ---
+
+    #[test]
+    fn test_diff_lines_identical() {
+        let lines = diff_lines("a\nb\nc", "a\nb\nc");
+        assert_eq!(lines, vec![" a", " b", " c"]);
+    }
+
+    #[test]
+    fn test_diff_lines_single_change() {
+        let lines = diff_lines("a\nb\nc", "a\nX\nc");
+        assert!(lines.contains(&"-b".to_string()));
+        assert!(lines.contains(&"+X".to_string()));
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&" c".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_added_lines() {
+        // mutant has more lines than original
+        let lines = diff_lines("a", "a\nb");
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&"+b".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_removed_lines() {
+        // original has more lines than mutant
+        let lines = diff_lines("a\nb", "a");
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&"-b".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_both_empty() {
+        assert_eq!(diff_lines("", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_diff_lines_one_empty() {
+        // original empty, mutant has a line
+        let lines = diff_lines("", "hello");
+        assert!(lines.contains(&"+hello".to_string()));
+    }
+
+    // --- find_python_files tests ---
+
+    #[test]
+    fn test_find_python_files_flat_only_py() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.py"), "").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "").unwrap();
+        let mut files = find_python_files(tmp.path()).unwrap();
+        files.sort();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("a.py"));
+    }
+
+    #[test]
+    fn test_find_python_files_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(tmp.path().join("a.py"), "").unwrap();
+        std::fs::write(sub.join("b.py"), "").unwrap();
+        let mut files = find_python_files(tmp.path()).unwrap();
+        files.sort();
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_find_python_files_skips_pycache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("__pycache__");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("cached.py"), "").unwrap();
+        std::fs::write(tmp.path().join("real.py"), "").unwrap();
+        let files = find_python_files(tmp.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("real.py"));
+    }
+
+    #[test]
+    fn test_find_python_files_skips_hidden_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden = tmp.path().join(".hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("secret.py"), "").unwrap();
+        std::fs::write(tmp.path().join("visible.py"), "").unwrap();
+        let files = find_python_files(tmp.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("visible.py"));
+    }
+
+    #[test]
+    fn test_find_python_files_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py = tmp.path().join("single.py");
+        std::fs::write(&py, "").unwrap();
+        let files = find_python_files(&py).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], py);
+    }
+
+    #[test]
+    fn test_find_python_files_nonexistent_path() {
+        let files = find_python_files(Path::new("/nonexistent/path/xyz")).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_find_python_files_no_py_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), "").unwrap();
+        let files = find_python_files(tmp.path()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    // --- write_meta_files + load_all_meta round-trip ---
+
+    #[test]
+    fn test_meta_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        // Set up: module "mymod" with two mutant names
+        let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+        all_names.insert(
+            "mymod".to_string(),
+            vec!["mymod.x_foo__mutmut_1".to_string(), "mymod.x_foo__mutmut_2".to_string()],
+        );
+
+        // Create the alt meta path stub so write_meta_files picks the right path
+        // write_meta_files checks `mutants_dir/mymod/__init__.py.meta` first;
+        // if absent it falls back to `mutants_dir/mymod.py.meta`.
+        // We rely on the fallback (alt path) — no stub needed.
+
+        let results = vec![
+            MutantResult {
+                mutant_name: "mymod.x_foo__mutmut_1".to_string(),
+                exit_code: 1,
+                duration: 0.5,
+                status: MutantStatus::Killed,
+            },
+            MutantResult {
+                mutant_name: "mymod.x_foo__mutmut_2".to_string(),
+                exit_code: 0,
+                duration: 0.3,
+                status: MutantStatus::Survived,
+            },
+        ];
+
+        write_meta_files(mutants_dir, &all_names, &results).unwrap();
+
+        let loaded = load_all_meta(mutants_dir).unwrap();
+        // load_all_meta returns (name, exit_code) sorted by name
+        assert_eq!(loaded.len(), 2);
+        let map: HashMap<&str, i32> = loaded.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+        assert_eq!(map["mymod.x_foo__mutmut_1"], 1);
+        assert_eq!(map["mymod.x_foo__mutmut_2"], 0);
+    }
+
+    #[test]
+    fn test_meta_round_trip_package() {
+        // Test the __init__ path: create the stub so write_meta_files uses the init variant
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+        all_names.insert(
+            "mypkg".to_string(),
+            vec!["mypkg.x_bar__mutmut_1".to_string()],
+        );
+
+        // Create the __init__.py.meta stub so write_meta_files takes the init branch
+        let init_meta_dir = mutants_dir.join("mypkg");
+        std::fs::create_dir_all(&init_meta_dir).unwrap();
+        std::fs::write(init_meta_dir.join("__init__.py.meta"), "{}").unwrap();
+
+        let results = vec![MutantResult {
+            mutant_name: "mypkg.x_bar__mutmut_1".to_string(),
+            exit_code: 1,
+            duration: 0.1,
+            status: MutantStatus::Killed,
+        }];
+
+        write_meta_files(mutants_dir, &all_names, &results).unwrap();
+
+        let loaded = load_all_meta(mutants_dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "mypkg.x_bar__mutmut_1");
+        assert_eq!(loaded[0].1, 1);
+    }
 }
