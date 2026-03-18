@@ -82,17 +82,17 @@ mod tests {
     #[test]
     fn test_orchestrator_message_serialization() {
         let msg = OrchestratorMessage::Run {
-            mutant: "my_lib.x_hello__mutmut_1".to_string(),
+            mutant: "my_lib.x_hello__irradiate_1".to_string(),
             tests: vec!["tests/test.py::test_hello".to_string()],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"run\""));
-        assert!(json.contains("my_lib.x_hello__mutmut_1"));
+        assert!(json.contains("my_lib.x_hello__irradiate_1"));
 
         let parsed: OrchestratorMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             OrchestratorMessage::Run { mutant, tests } => {
-                assert_eq!(mutant, "my_lib.x_hello__mutmut_1");
+                assert_eq!(mutant, "my_lib.x_hello__irradiate_1");
                 assert_eq!(tests.len(), 1);
             }
             _ => panic!("expected Run"),

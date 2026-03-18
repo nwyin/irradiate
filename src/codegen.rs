@@ -9,7 +9,7 @@ use crate::trampoline::{generate_trampoline, trampoline_impl, TrampolineOutput};
 pub struct MutatedFile {
     /// The fully mutated source code.
     pub source: String,
-    /// List of mutant keys (e.g., "module.x_func__mutmut_1").
+    /// List of mutant keys (e.g., "module.x_func__irradiate_1").
     pub mutant_names: Vec<String>,
 }
 
@@ -263,15 +263,15 @@ mod tests {
             "Should have harness import"
         );
         assert!(
-            result.source.contains("x_add__mutmut_orig"),
+            result.source.contains("x_add__irradiate_orig"),
             "Should have original renamed"
         );
         assert!(
-            result.source.contains("x_add__mutmut_1"),
+            result.source.contains("x_add__irradiate_1"),
             "Should have mutant variant"
         );
         assert!(
-            result.source.contains("x_add__mutmut_mutants"),
+            result.source.contains("x_add__irradiate_mutants"),
             "Should have lookup dict"
         );
         assert!(
@@ -311,11 +311,11 @@ mod tests {
         let result = mutate_file(source, "math_lib").unwrap();
 
         assert!(
-            result.source.contains("x_add__mutmut_orig"),
+            result.source.contains("x_add__irradiate_orig"),
             "Should have add original"
         );
         assert!(
-            result.source.contains("x_sub__mutmut_orig"),
+            result.source.contains("x_sub__irradiate_orig"),
             "Should have sub original"
         );
         assert!(
@@ -465,7 +465,7 @@ class Calc:
         let orig_line = result
             .source
             .lines()
-            .find(|l| l.starts_with("def xǁCalcǁadd__mutmut_orig("))
+            .find(|l| l.starts_with("def xǁCalcǁadd__irradiate_orig("))
             .expect("mangled orig def should exist at module level");
         let indent = orig_line.len() - orig_line.trim_start().len();
         assert_eq!(indent, 0, "mangled orig must be at module level, got: {orig_line:?}");

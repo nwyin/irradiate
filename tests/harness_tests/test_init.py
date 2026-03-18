@@ -32,13 +32,13 @@ def test_active_mutant_default_none(clean_harness):
 
 
 def test_record_hit_adds_to_set(clean_harness):
-    clean_harness.record_hit("module.x_foo__mutmut_1")
-    assert "module.x_foo__mutmut_1" in clean_harness._hits
+    clean_harness.record_hit("module.x_foo__irradiate_1")
+    assert "module.x_foo__irradiate_1" in clean_harness._hits
 
 
 def test_record_hit_deduplicates(clean_harness):
-    clean_harness.record_hit("module.x_foo__mutmut_1")
-    clean_harness.record_hit("module.x_foo__mutmut_1")
+    clean_harness.record_hit("module.x_foo__irradiate_1")
+    clean_harness.record_hit("module.x_foo__irradiate_1")
     assert len(clean_harness._hits) == 1
 
 

@@ -130,9 +130,9 @@ pub async fn run(config: RunConfig) -> Result<()> {
         .iter()
         .filter_map(|(mutant_name, _file)| {
             let test_ids = if let Some(ref stats) = test_stats {
-                // Extract the function key from mutant name: "module.x_func__mutmut_N" → "module.x_func"
+                // Extract the function key from mutant name: "module.x_func__irradiate_N" → "module.x_func"
                 let func_key = mutant_name
-                    .rsplit_once("__mutmut_")
+                    .rsplit_once("__irradiate_")
                     .map(|(prefix, _)| prefix)
                     .unwrap_or(mutant_name);
                 let tests = stats.tests_for_function(func_key);
@@ -295,13 +295,13 @@ pub fn show(mutant_name: &str) -> Result<()> {
         );
     }
 
-    // mutant_name = "module.x_func__mutmut_N"
+    // mutant_name = "module.x_func__irradiate_N"
     // We need the module (for file lookup) and the local variant name (for function lookup)
     let (module, local_variant) = mutant_name.split_once('.').unwrap_or(("", mutant_name));
     let (local_func_mangled, _) = local_variant
-        .rsplit_once("__mutmut_")
+        .rsplit_once("__irradiate_")
         .unwrap_or((local_variant, ""));
-    let orig_name = format!("{local_func_mangled}__mutmut_orig");
+    let orig_name = format!("{local_func_mangled}__irradiate_orig");
 
     // Find the mutated source file
     let candidates = [
@@ -1179,8 +1179,8 @@ mod tests {
         all_names.insert(
             "mymod".to_string(),
             vec![
-                "mymod.x_foo__mutmut_1".to_string(),
-                "mymod.x_foo__mutmut_2".to_string(),
+                "mymod.x_foo__irradiate_1".to_string(),
+                "mymod.x_foo__irradiate_2".to_string(),
             ],
         );
 
@@ -1191,13 +1191,13 @@ mod tests {
 
         let results = vec![
             MutantResult {
-                mutant_name: "mymod.x_foo__mutmut_1".to_string(),
+                mutant_name: "mymod.x_foo__irradiate_1".to_string(),
                 exit_code: 1,
                 duration: 0.5,
                 status: MutantStatus::Killed,
             },
             MutantResult {
-                mutant_name: "mymod.x_foo__mutmut_2".to_string(),
+                mutant_name: "mymod.x_foo__irradiate_2".to_string(),
                 exit_code: 0,
                 duration: 0.3,
                 status: MutantStatus::Survived,
@@ -1210,8 +1210,8 @@ mod tests {
         // load_all_meta returns (name, exit_code) sorted by name
         assert_eq!(loaded.len(), 2);
         let map: HashMap<&str, i32> = loaded.iter().map(|(n, c)| (n.as_str(), *c)).collect();
-        assert_eq!(map["mymod.x_foo__mutmut_1"], 1);
-        assert_eq!(map["mymod.x_foo__mutmut_2"], 0);
+        assert_eq!(map["mymod.x_foo__irradiate_1"], 1);
+        assert_eq!(map["mymod.x_foo__irradiate_2"], 0);
     }
 
     #[test]
@@ -1223,7 +1223,7 @@ mod tests {
         let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
         all_names.insert(
             "mypkg".to_string(),
-            vec!["mypkg.x_bar__mutmut_1".to_string()],
+            vec!["mypkg.x_bar__irradiate_1".to_string()],
         );
 
         // Create the __init__.py.meta stub so write_meta_files takes the init branch
@@ -1232,7 +1232,7 @@ mod tests {
         std::fs::write(init_meta_dir.join("__init__.py.meta"), "{}").unwrap();
 
         let results = vec![MutantResult {
-            mutant_name: "mypkg.x_bar__mutmut_1".to_string(),
+            mutant_name: "mypkg.x_bar__irradiate_1".to_string(),
             exit_code: 1,
             duration: 0.1,
             status: MutantStatus::Killed,
@@ -1242,7 +1242,7 @@ mod tests {
 
         let loaded = load_all_meta(mutants_dir).unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, "mypkg.x_bar__mutmut_1");
+        assert_eq!(loaded[0].0, "mypkg.x_bar__irradiate_1");
         assert_eq!(loaded[0].1, 1);
     }
 

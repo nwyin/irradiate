@@ -24,7 +24,7 @@ pub struct TrampolineOutput {
     /// For class methods, must be indented and placed inside the class body.
     /// For top-level functions, goes at module level.
     pub wrapper_code: String,
-    /// Mutant keys like "module.x_func__mutmut_1".
+    /// Mutant keys like "module.x_func__irradiate_1".
     pub mutant_keys: Vec<String>,
 }
 
@@ -35,14 +35,14 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     let mut mutant_keys = Vec::new();
 
     // Original function, renamed
-    let orig_name = format!("{mangled}__mutmut_orig");
+    let orig_name = format!("{mangled}__irradiate_orig");
     let renamed_orig = rename_function(&fm.source, &fm.name, &orig_name);
     module_lines.push(renamed_orig);
     module_lines.push(String::new());
 
     // Mutant variants
     for (i, mutation) in fm.mutations.iter().enumerate() {
-        let variant_name = format!("{mangled}__mutmut_{}", i + 1);
+        let variant_name = format!("{mangled}__irradiate_{}", i + 1);
         let mutated_source = apply_mutation(&fm.source, mutation);
         let renamed_variant = rename_function(&mutated_source, &fm.name, &variant_name);
         module_lines.push(renamed_variant);
@@ -52,9 +52,9 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     }
 
     // Lookup dict
-    module_lines.push(format!("{mangled}__mutmut_mutants = {{"));
+    module_lines.push(format!("{mangled}__irradiate_mutants = {{"));
     for (i, _) in fm.mutations.iter().enumerate() {
-        let variant_name = format!("{mangled}__mutmut_{}", i + 1);
+        let variant_name = format!("{mangled}__irradiate_{}", i + 1);
         module_lines.push(format!("    '{variant_name}': {variant_name},"));
     }
     module_lines.push("}".to_string());
@@ -112,7 +112,7 @@ fn generate_wrapper_function(
     };
 
     let trampoline_call = format!(
-        "_irradiate_trampoline({mangled_name}__mutmut_orig, {mangled_name}__mutmut_mutants, {args_list}, {kwargs_dict}, {self_arg})"
+        "_irradiate_trampoline({mangled_name}__irradiate_orig, {mangled_name}__irradiate_mutants, {args_list}, {kwargs_dict}, {self_arg})"
     );
 
     // Choose the correct dispatch based on function kind:
@@ -316,7 +316,7 @@ def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None, 
         if self_arg is not None:
             return orig(self_arg, *call_args, **call_kwargs)
         return orig(*call_args, **call_kwargs) if call_args is not None else None
-    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_'
+    prefix = orig.__module__ + '.' + orig.__name__ + '__irradiate_'
     if not active.startswith(prefix):
         if self_arg is not None:
             return orig(self_arg, *call_args, **call_kwargs)
@@ -346,8 +346,8 @@ mod tests {
     #[test]
     fn test_rename_function() {
         let source = "def add(a, b):\n    return a + b\n";
-        let renamed = rename_function(source, "add", "x_add__mutmut_orig");
-        assert!(renamed.starts_with("def x_add__mutmut_orig("));
+        let renamed = rename_function(source, "add", "x_add__irradiate_orig");
+        assert!(renamed.starts_with("def x_add__irradiate_orig("));
         assert!(renamed.contains("return a + b"));
     }
 
@@ -359,21 +359,21 @@ mod tests {
 
         let output = generate_trampoline(&fms[0], "my_lib");
         assert!(
-            output.module_code.contains("x_add__mutmut_orig"),
+            output.module_code.contains("x_add__irradiate_orig"),
             "Should have renamed original"
         );
         assert!(
-            output.module_code.contains("x_add__mutmut_1"),
+            output.module_code.contains("x_add__irradiate_1"),
             "Should have at least one variant"
         );
         assert!(
-            output.module_code.contains("x_add__mutmut_mutants"),
+            output.module_code.contains("x_add__irradiate_mutants"),
             "Should have lookup dict"
         );
         assert!(output.wrapper_code.contains("def add("), "Should have trampoline wrapper");
         assert!(!output.mutant_keys.is_empty(), "Should produce mutant keys");
         assert!(
-            output.mutant_keys[0].starts_with("my_lib.x_add__mutmut_"),
+            output.mutant_keys[0].starts_with("my_lib.x_add__irradiate_"),
             "Keys should be module-qualified"
         );
     }

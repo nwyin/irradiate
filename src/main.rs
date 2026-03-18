@@ -62,7 +62,7 @@ enum Commands {
 
     /// Show diff for a specific mutant
     Show {
-        /// Mutant name (e.g., module.x_func__mutmut_1)
+        /// Mutant name (e.g., module.x_func__irradiate_1)
         mutant_name: String,
     },
 }

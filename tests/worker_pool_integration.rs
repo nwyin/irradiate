@@ -63,19 +63,19 @@ async fn test_worker_pool_dispatches_mutants() {
     // Pick one add mutant (should be killed by test_add)
     let add_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_add__mutmut_"))
+        .find(|n| n.contains("x_add__irradiate_"))
         .expect("Should have an add mutant");
 
     // Pick an is_positive mutant (should be killed by test_is_positive)
     let is_pos_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_is_positive__mutmut_"))
+        .find(|n| n.contains("x_is_positive__irradiate_"))
         .expect("Should have an is_positive mutant");
 
     // Pick a greet mutant (should be killed by test_greet)
     let greet_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_greet__mutmut_"))
+        .find(|n| n.contains("x_greet__irradiate_"))
         .expect("Should have a greet mutant");
 
     let work_items = vec![
@@ -153,7 +153,7 @@ async fn test_worker_pool_surviving_mutant() {
     // Use a mutant name that doesn't match any function — the trampoline
     // will call the original, so tests pass -> survived.
     let work_items = vec![WorkItem {
-        mutant_name: "simple_lib.x_nonexistent__mutmut_1".to_string(),
+        mutant_name: "simple_lib.x_nonexistent__irradiate_1".to_string(),
         test_ids: vec![
             "tests/test_simple.py::test_add".to_string(),
             "tests/test_simple.py::test_is_positive".to_string(),
@@ -188,17 +188,17 @@ async fn test_worker_pool_with_recycling() {
 
     let add_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_add__mutmut_"))
+        .find(|n| n.contains("x_add__irradiate_"))
         .expect("Should have an add mutant");
 
     let is_pos_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_is_positive__mutmut_"))
+        .find(|n| n.contains("x_is_positive__irradiate_"))
         .expect("Should have an is_positive mutant");
 
     let greet_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_greet__mutmut_"))
+        .find(|n| n.contains("x_greet__irradiate_"))
         .expect("Should have a greet mutant");
 
     let work_items = vec![
@@ -258,7 +258,7 @@ async fn test_worker_pool_recycle_disabled() {
 
     let add_mutant = mutant_names
         .iter()
-        .find(|n| n.contains("x_add__mutmut_"))
+        .find(|n| n.contains("x_add__irradiate_"))
         .expect("Should have an add mutant");
 
     let work_items = vec![WorkItem {

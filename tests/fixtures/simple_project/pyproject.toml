@@ -2,6 +2,6 @@
 testpaths = ["tests"]
 pythonpath = ["src"]
 
-[tool.mutmut]
+[tool.irradiate]
 paths_to_mutate = "src/"
 tests_dir = "tests/"
