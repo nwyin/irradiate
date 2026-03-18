@@ -593,11 +593,30 @@ fn add_string_mutation_at(s: &cst::SimpleString, start: usize, mutations: &mut V
         return;
     }
 
-    // XX prefix+suffix mutation
-    let quote_char = if text.contains('"') { '"' } else { '\'' };
-    let prefix_end = text.find(quote_char).unwrap();
+    // Find the actual delimiter: the first quote character in the literal text.
+    // Strings may have prefixes (r, b, f, rb, etc.) before the opening quote.
+    // The old code used `text.contains('"')` which would incorrectly pick '"'
+    // as the delimiter for '"' (a single-quoted string containing a double-quote),
+    // producing invalid Python like '"XXXX" (unterminated single-quoted string).
+    let prefix_end = match text.find(['"', '\'']) {
+        Some(idx) => idx,
+        None => return, // malformed, skip
+    };
+    let quote_char = text.as_bytes()[prefix_end] as char;
+
     let prefix = &text[..prefix_end];
     let inner = &text[prefix_end + 1..text.len() - 1];
+
+    // INV-2: If the inner content contains the actual delimiter character, skip.
+    // This can happen with escaped content like "it\"s" where inner = r#"it\"s"#.
+    // The mutation would still be valid Python (the backslash stays), but more
+    // importantly: if inner is exactly the delimiter char (e.g. '"' → inner = '"'),
+    // after the quote_char fix above the generated replacement is 'XX"XX' which IS
+    // valid Python. This guard is belt-and-suspenders for any other edge cases.
+    if inner.contains(quote_char) {
+        return;
+    }
+
     let replacement = format!("{prefix}{quote_char}XX{inner}XX{quote_char}");
 
     if replacement != text {
@@ -1037,6 +1056,70 @@ mod tests {
             .filter(|m| m.operator == "method_swap")
             .collect();
         assert!(method_muts.is_empty(), ".strip() is not in METHOD_SWAPS");
+    }
+
+    // INV-2: string content = delimiter char must not produce syntactically invalid Python
+    #[test]
+    fn test_string_mutation_double_quote_in_single_quoted() {
+        // '"' is a single-quoted string whose content is a double-quote.
+        // Before the fix, quote_char was incorrectly detected as '"', producing
+        // the invalid replacement '"XXXX" (unterminated single-quoted string).
+        // After the fix, quote_char = '\'', producing 'XX"XX' (valid Python).
+        let source = "def foo(s):\n    return s.replace('\"', 'x')\n";
+        let fms = collect_file_mutations(source);
+        if let Some(fm) = fms.first() {
+            for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+                // The replacement must be a valid Python string literal.
+                // For '"', it must be delimited by single-quotes: starts with ' ends with '
+                if m.original == "'\"'" {
+                    assert!(
+                        m.replacement.starts_with('\'') && m.replacement.ends_with('\''),
+                        "Replacement for '\"' must stay single-quoted, got: {}",
+                        m.replacement
+                    );
+                    // Must not start with '"' (which would produce an unterminated string)
+                    assert!(
+                        !m.replacement.starts_with("'\""),
+                        "Replacement must not produce unterminated string, got: {}",
+                        m.replacement
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-2: single-quote inside double-quoted string must also produce valid Python
+    #[test]
+    fn test_string_mutation_single_quote_in_double_quoted() {
+        // "'" is a double-quoted string whose content is a single-quote.
+        let source = "def foo(s):\n    return s.replace(\"'\", 'x')\n";
+        let fms = collect_file_mutations(source);
+        if let Some(fm) = fms.first() {
+            for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+                if m.original == "\"'\"" {
+                    // Must be delimited by double-quotes
+                    assert!(
+                        m.replacement.starts_with('"') && m.replacement.ends_with('"'),
+                        "Replacement for \"'\" must stay double-quoted, got: {}",
+                        m.replacement
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-3: Normal string mutations must still work after the delimiter-char fix.
+    #[test]
+    fn test_string_mutation_normal_strings_unaffected() {
+        let source = "def greet():\n    return \"hello\"\n";
+        let fms = collect_file_mutations(source);
+        let string_mut = fms[0].mutations.iter().find(|m| m.operator == "string_mutation");
+        assert!(string_mut.is_some(), "Normal string must still be mutated");
+        assert_eq!(
+            string_mut.unwrap().replacement,
+            "\"XXhelloXX\"",
+            "Normal string mutation should produce XXhelloXX"
+        );
     }
 }
 
