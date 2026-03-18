@@ -44,14 +44,39 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
     let lines: Vec<&str> = source.lines().collect();
 
     // Python requires `from __future__` imports to be the very first statement.
-    // Scan the leading lines and collect any blank lines, comments, and
-    // `from __future__` imports so they can be emitted BEFORE the trampoline
-    // preamble. We stop at the first line that is none of those things.
+    // Scan the leading lines and collect any blank lines, comments, module
+    // docstrings, and `from __future__` imports so they can be emitted BEFORE
+    // the trampoline preamble. We stop at the first line that is none of those.
     let mut skip_until = 0;
-    for (idx, line) in lines.iter().enumerate() {
-        let t = line.trim();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let t = lines[idx].trim();
         if t.is_empty() || t.starts_with('#') || t.starts_with("from __future__") {
             skip_until = idx + 1;
+            idx += 1;
+            continue;
+        }
+        // Handle module-level docstrings (single-line or multi-line).
+        if t.starts_with("\"\"\"") || t.starts_with("'''") {
+            let quote = if t.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+            let rest = &t[quote.len()..];
+            if rest.contains(quote) {
+                // Single-line docstring: opens and closes on the same line.
+                skip_until = idx + 1;
+                idx += 1;
+            } else {
+                // Multi-line docstring: scan forward until the closing delimiter.
+                skip_until = idx + 1;
+                idx += 1;
+                while idx < lines.len() {
+                    skip_until = idx + 1;
+                    let close = lines[idx].trim();
+                    idx += 1;
+                    if close.contains(quote) {
+                        break;
+                    }
+                }
+            }
             continue;
         }
         break;
@@ -528,7 +553,82 @@ class Beta:
         }
     }
 
-    // --- __future__ import ordering tests ---
+    // --- __future__ import ordering tests (including docstring hoisting) ---
+
+    #[test]
+    fn test_single_line_docstring_before_future_import() {
+        // INV-1: single-line docstring then from __future__ → both before preamble.
+        let source =
+            "\"\"\"Module docstring.\"\"\"\n\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let doc_pos = lines
+            .iter()
+            .position(|l| l.starts_with("\"\"\"Module"))
+            .expect("docstring must be present in output");
+        let future_pos = lines
+            .iter()
+            .position(|l| l.starts_with("from __future__"))
+            .expect("__future__ import must be present in output");
+        let preamble_pos = lines
+            .iter()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+
+        assert!(doc_pos < future_pos, "docstring (line {doc_pos}) must come before __future__ (line {future_pos})");
+        assert!(
+            future_pos < preamble_pos,
+            "from __future__ (line {future_pos}) must come before trampoline preamble (line {preamble_pos})"
+        );
+    }
+
+    #[test]
+    fn test_multiline_docstring_before_future_import() {
+        // INV-2: multi-line docstring before from __future__ → both before preamble.
+        let source = "\"\"\"Multi-line\ndocstring here.\n\"\"\"\n\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let future_pos = lines
+            .iter()
+            .position(|l| l.starts_with("from __future__"))
+            .expect("__future__ import must be present in output");
+        let preamble_pos = lines
+            .iter()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+        // Docstring opener must appear somewhere before the preamble
+        let doc_pos = lines
+            .iter()
+            .position(|l| l.starts_with("\"\"\"Multi"))
+            .expect("docstring opener must be present in output");
+
+        assert!(doc_pos < preamble_pos, "docstring opener (line {doc_pos}) must come before preamble (line {preamble_pos})");
+        assert!(
+            future_pos < preamble_pos,
+            "from __future__ (line {future_pos}) must come before trampoline preamble (line {preamble_pos})"
+        );
+    }
+
+    #[test]
+    fn test_docstring_only_no_future_import() {
+        // Docstring without __future__ import — docstring should stay before preamble.
+        let source = "\"\"\"Just a docstring.\"\"\"\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let doc_pos = lines
+            .iter()
+            .position(|l| l.starts_with("\"\"\"Just"))
+            .expect("docstring must be present in output");
+        let preamble_pos = lines
+            .iter()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+
+        assert!(doc_pos < preamble_pos, "docstring (line {doc_pos}) must come before preamble (line {preamble_pos})");
+    }
 
     #[test]
     fn test_future_import_before_preamble() {
