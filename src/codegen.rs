@@ -37,16 +37,36 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
     // Keep insertion order stable for deterministic output.
     all_mutant_names.dedup();
 
-    // Prepend trampoline implementation
-    output.push_str(trampoline_impl());
-    output.push('\n');
-
     // Walk through source lines, stripping out functions that will be replaced
     // by trampoline arrangements. For class methods, emit the wrapper inline
     // (indented inside the class body). For top-level functions, the wrapper
     // is appended after the walk.
     let lines: Vec<&str> = source.lines().collect();
-    let mut i = 0;
+
+    // Python requires `from __future__` imports to be the very first statement.
+    // Scan the leading lines and collect any blank lines, comments, and
+    // `from __future__` imports so they can be emitted BEFORE the trampoline
+    // preamble. We stop at the first line that is none of those things.
+    let mut skip_until = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with("from __future__") {
+            skip_until = idx + 1;
+            continue;
+        }
+        break;
+    }
+    // Emit __future__ preamble lines before the trampoline runtime.
+    for line in &lines[..skip_until] {
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    // Now emit the trampoline implementation.
+    output.push_str(trampoline_impl());
+    output.push('\n');
+
+    let mut i = skip_until;
     // Track which class we're currently inside: (class_name, class_indent_level).
     let mut current_class: Option<(String, usize)> = None;
 
@@ -506,6 +526,66 @@ class Beta:
             let ind = text.len() - text.trim_start().len();
             assert!(ind > 0, "process wrapper at line {pos} should be indented, got: {text:?}");
         }
+    }
+
+    // --- __future__ import ordering tests ---
+
+    #[test]
+    fn test_future_import_before_preamble() {
+        // INV-1: from __future__ import annotations must appear before the trampoline preamble.
+        let source = "from __future__ import annotations\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let future_pos = result
+            .source
+            .lines()
+            .position(|l| l.starts_with("from __future__"))
+            .expect("__future__ import must be present in output");
+        let preamble_pos = result
+            .source
+            .lines()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+        assert!(
+            future_pos < preamble_pos,
+            "from __future__ (line {future_pos}) must come before trampoline preamble (line {preamble_pos})"
+        );
+    }
+
+    #[test]
+    fn test_leading_comment_and_future_import_before_preamble() {
+        // INV-2: leading comments and blank lines before __future__ are preserved in their original position.
+        let source = "# comment\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let comment_pos = lines.iter().position(|l| *l == "# comment").expect("comment must be present");
+        let future_pos = lines
+            .iter()
+            .position(|l| l.starts_with("from __future__"))
+            .expect("__future__ import must be present");
+        let preamble_pos = lines
+            .iter()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+
+        assert!(comment_pos < future_pos, "comment must appear before __future__");
+        assert!(future_pos < preamble_pos, "from __future__ must appear before trampoline preamble");
+    }
+
+    #[test]
+    fn test_no_future_import_preamble_first() {
+        // INV-3: files without __future__ imports still have preamble first (existing behavior).
+        let source = "import os\n\ndef foo():\n    return 1\n";
+        let result = mutate_file(source, "mod").unwrap();
+        let preamble_pos = result
+            .source
+            .lines()
+            .position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must be present");
+        // The very first non-empty line should be the preamble (or part of it),
+        // and there must be no `from __future__` anywhere (none in source).
+        assert!(!result.source.contains("from __future__"), "no __future__ in output when not in source");
+        assert_eq!(preamble_pos, 0, "preamble must start at line 0 when no __future__ present");
     }
 
     #[test]
