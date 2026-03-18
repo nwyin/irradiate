@@ -38,6 +38,7 @@ tests/vendor_repos/
 # Fuzzing
 fuzz/corpus/
 fuzz/artifacts/
+fuzz/target/
 
 # Benchmarks
 bench/results/
