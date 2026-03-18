@@ -40,6 +40,8 @@ pub struct FunctionMutations {
     pub source: String,
     /// The function's parameter list source text (for trampoline wrapper).
     pub params_source: String,
+    /// Return type annotation text, e.g. " -> int | None". Empty if none.
+    pub return_annotation: String,
     /// Whether the function is async.
     pub is_async: bool,
     /// Mutations found within this function body.
@@ -114,6 +116,15 @@ fn collect_function_mutations(
     let params_source = codegen_node(&func.params);
     let is_async = func.asynchronous.is_some();
 
+    // Extract return type annotation, e.g. " -> int | None"
+    let return_annotation = if let Some(ann) = &func.returns {
+        let mut state = CodegenState::default();
+        ann.codegen(&mut state, "->");
+        state.tokens
+    } else {
+        String::new()
+    };
+
     // Start the cursor past the function header (def name(params):) to avoid
     // accidentally matching parameter names or default values when searching
     // for body expressions.
@@ -161,6 +172,7 @@ fn collect_function_mutations(
         class_name: class_name.map(String::from),
         source: func_source,
         params_source,
+        return_annotation,
         is_async,
         mutations,
     })

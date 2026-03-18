@@ -765,15 +765,19 @@ class Markup:
             result.source
         );
 
-        // The original `    ) -> str:` line (4-space indent, inside class) must NOT appear
-        // as orphan code. Note: `) -> str:` at 0-indent in mangled orig is legitimate.
-        for line in result.source.lines() {
+        // With return annotation support the wrapper legitimately produces `) -> str:` at
+        // class-body indent (4 spaces) as its closing paren line.  Verify it belongs to the
+        // wrapper (immediately followed by the trampoline return), not an orphan from the
+        // original source.
+        let lines: Vec<&str> = result.source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             let indent = line.len() - trimmed.len();
-            // Orphan: `) -> str:` at class-body indent (4 spaces) — from original signature
             if indent == 4 && trimmed.starts_with(") ->") {
-                panic!(
-                    "Orphan ') ->' at class-body indent found in output:\n{}",
+                let next_non_empty = lines[i + 1..].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
+                assert!(
+                    next_non_empty.contains("_irradiate_trampoline"),
+                    "Orphan ') ->' at class-body indent (not wrapper closing paren) in output:\n{}",
                     result.source
                 );
             }

@@ -65,7 +65,7 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     // Trampoline wrapper with original name and signature
     let self_arg = if fm.class_name.is_some() { "self" } else { "None" };
     let params_text = &fm.params_source;
-    let wrapper_code = generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async);
+    let wrapper_code = generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async, &fm.return_annotation);
 
     TrampolineOutput {
         module_code: module_lines.join("\n"),
@@ -80,13 +80,14 @@ fn generate_wrapper_function(
     params_source: &str,
     self_arg: &str,
     is_async: bool,
+    return_annotation: &str,
 ) -> String {
     let async_prefix = if is_async { "async " } else { "" };
     let await_prefix = if is_async { "await " } else { "" };
 
     // Parse parameter names from the params source to build forwarding args.
     // We need to collect positional args into a tuple and kwargs into a dict.
-    let (pos_args, kw_args) = parse_param_names(params_source, self_arg != "None");
+    let (pos_args, kw_args, kwargs_name) = parse_param_names(params_source, self_arg != "None");
 
     let args_list = if pos_args.is_empty() {
         "()".to_string()
@@ -98,15 +99,19 @@ fn generate_wrapper_function(
         )
     };
 
-    let kwargs_dict = if kw_args.is_empty() {
+    // Build call_kwargs dict, merging **kwargs if present.
+    let kwargs_dict = if kw_args.is_empty() && kwargs_name.is_none() {
         "{}".to_string()
     } else {
-        let entries: Vec<String> = kw_args.iter().map(|k| format!("'{k}': {k}")).collect();
+        let mut entries: Vec<String> = kw_args.iter().map(|k| format!("'{k}': {k}")).collect();
+        if let Some(ref kn) = kwargs_name {
+            entries.push(format!("**{kn}"));
+        }
         format!("{{{}}}", entries.join(", "))
     };
 
     format!(
-        "{async_prefix}def {original_name}({params_source}):\n    \
+        "{async_prefix}def {original_name}({params_source}){return_annotation}:\n    \
          return {await_prefix}_irradiate_trampoline({mangled_name}__mutmut_orig, {mangled_name}__mutmut_mutants, {args_list}, {kwargs_dict}, {self_arg})",
     )
 }
@@ -164,10 +169,11 @@ fn split_params(s: &str) -> Vec<String> {
 }
 
 /// Parse parameter names from a params source string.
-/// Returns (positional_args, keyword_only_args).
-fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>) {
+/// Returns (positional_args, keyword_only_args, kwargs_name).
+fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>, Option<String>) {
     let mut pos_args = Vec::new();
     let mut kw_args = Vec::new();
+    let mut kwargs_name: Option<String> = None;
     let mut after_star = false;
 
     // Strip inline comments before splitting, then do bracket-aware split.
@@ -187,11 +193,21 @@ fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<S
             continue;
         }
 
-        // Handle *args
+        // Handle **kwargs
         if part.starts_with("**") {
-            // **kwargs — skip, handled separately
+            let name = part
+                .trim_start_matches('*')
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                kwargs_name = Some(name.to_string());
+            }
             continue;
         }
+
+        // Handle *args
         if part.starts_with('*') {
             after_star = true;
             // *args — include as starred
@@ -235,7 +251,7 @@ fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<S
         pos_args.remove(0);
     }
 
-    (pos_args, kw_args)
+    (pos_args, kw_args, kwargs_name)
 }
 
 /// Rename a function definition by replacing the function name.
@@ -351,60 +367,113 @@ mod tests {
     // INV-1: Parameters with generic type annotations parse to the correct name only.
     #[test]
     fn test_parse_param_names_generic_annotation() {
-        let (pos_args, kw_args) = parse_param_names("self, mapping: cabc.Mapping[str, t.Any], /", true);
+        let (pos_args, kw_args, kwargs) = parse_param_names("self, mapping: cabc.Mapping[str, t.Any], /", true);
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
     }
 
     // INV-2: Inline comments do not affect parameter extraction.
     #[test]
     fn test_parse_param_names_inline_comment() {
-        let (pos_args, kw_args) = parse_param_names(
+        let (pos_args, kw_args, kwargs) = parse_param_names(
             "self,\n    mapping: cabc.Mapping[str, t.Any],  # type: ignore[override]\n    /,",
             true,
         );
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
     }
 
     // INV-3: Nested brackets parse correctly.
     #[test]
     fn test_parse_param_names_nested_brackets() {
-        let (pos_args, kw_args) = parse_param_names("self, x: Dict[str, List[int]], y: int", true);
+        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Dict[str, List[int]], y: int", true);
         assert_eq!(pos_args, vec!["x", "y"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
     }
 
     // INV-4: Existing simple-param behavior unchanged.
     #[test]
     fn test_parse_param_names_simple() {
-        let (pos_args, kw_args) = parse_param_names("a, b, c", false);
+        let (pos_args, kw_args, kwargs) = parse_param_names("a, b, c", false);
         assert_eq!(pos_args, vec!["a", "b", "c"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
     }
 
     // Tuple with ellipsis and keyword-only args after *.
     #[test]
     fn test_parse_param_names_tuple_kwonly() {
-        let (pos_args, kw_args) = parse_param_names("self, x: Tuple[int, ...], *, key: str", true);
+        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Tuple[int, ...], *, key: str", true);
         assert_eq!(pos_args, vec!["x"]);
         assert_eq!(kw_args, vec!["key"]);
+        assert_eq!(kwargs, None);
     }
 
     // Multiple bracket types: Dict[str, Tuple[int, ...]].
     #[test]
     fn test_parse_param_names_deeply_nested() {
-        let (pos_args, kw_args) = parse_param_names("self, x: Dict[str, Tuple[int, ...]], y: int", true);
+        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Dict[str, Tuple[int, ...]], y: int", true);
         assert_eq!(pos_args, vec!["x", "y"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
     }
 
     // Positional-only separator after bracketed annotation.
     #[test]
     fn test_parse_param_names_pos_only_after_bracket() {
-        let (pos_args, kw_args) = parse_param_names("self, mapping: Mapping[str, Any], /", true);
+        let (pos_args, kw_args, kwargs) = parse_param_names("self, mapping: Mapping[str, Any], /", true);
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
+        assert_eq!(kwargs, None);
+    }
+
+    // INV: **kwargs is captured and excluded from kw_args.
+    #[test]
+    fn test_parse_param_names_kwargs() {
+        let (pos_args, kw_args, kwargs) = parse_param_names("a, /, b, *, c, **kwargs", false);
+        assert_eq!(pos_args, vec!["a", "b"]);
+        assert_eq!(kw_args, vec!["c"]);
+        assert_eq!(kwargs, Some("kwargs".to_string()));
+    }
+
+    // INV: **kwargs is merged into call_kwargs in the wrapper.
+    #[test]
+    fn test_wrapper_kwargs_forwarding() {
+        let wrapper = generate_wrapper_function("func_with_star", "x_func_with_star", "a, /, b, *, c, **kwargs", "None", false, "");
+        // kwargs must be spread into the call_kwargs dict
+        assert!(wrapper.contains("**kwargs"), "wrapper must forward **kwargs: {wrapper}");
+        assert!(wrapper.contains("'c': c"), "wrapper must include c in call_kwargs: {wrapper}");
+    }
+
+    // INV-1: Return type annotation is included in wrapper def line.
+    #[test]
+    fn test_wrapper_return_annotation_preserved() {
+        let wrapper = generate_wrapper_function("some_func", "x_some_func", "a, b: str = \"111\"", "None", false, " -> int | None");
+        assert!(wrapper.starts_with("def some_func(a, b: str = \"111\") -> int | None:"), "wrapper must include return annotation: {wrapper}");
+    }
+
+    // INV-3: Wrapper without return annotation or kwargs still correct.
+    #[test]
+    fn test_wrapper_no_annotation_no_kwargs() {
+        let wrapper = generate_wrapper_function("add", "x_add", "a, b", "None", false, "");
+        assert!(wrapper.starts_with("def add(a, b):"), "wrapper def line must be clean: {wrapper}");
+    }
+
+    // INV: generate_trampoline produces a wrapper with return annotation from function source.
+    #[test]
+    fn test_generate_trampoline_return_annotation() {
+        let source = "def some_func(a, b: str = \"111\", c: int = 0) -> int | None:\n    return a + c\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "should find mutations in some_func");
+        let output = generate_trampoline(&fms[0], "my_lib");
+        assert!(
+            output.wrapper_code.contains("-> int | None"),
+            "trampoline wrapper must preserve return annotation: {}",
+            output.wrapper_code
+        );
     }
 
     // INV-1/INV-2: All three passthrough paths in trampoline_impl must forward self_arg.
