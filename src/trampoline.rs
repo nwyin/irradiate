@@ -65,7 +65,8 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     // Trampoline wrapper with original name and signature
     let self_arg = if fm.class_name.is_some() { "self" } else { "None" };
     let params_text = &fm.params_source;
-    let wrapper_code = generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async, &fm.return_annotation);
+    let wrapper_code =
+        generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async, fm.is_generator, &fm.return_annotation);
 
     TrampolineOutput {
         module_code: module_lines.join("\n"),
@@ -80,10 +81,10 @@ fn generate_wrapper_function(
     params_source: &str,
     self_arg: &str,
     is_async: bool,
+    is_generator: bool,
     return_annotation: &str,
 ) -> String {
     let async_prefix = if is_async { "async " } else { "" };
-    let await_prefix = if is_async { "await " } else { "" };
 
     // Parse parameter names from the params source to build forwarding args.
     // We need to collect positional args into a tuple and kwargs into a dict.
@@ -110,10 +111,23 @@ fn generate_wrapper_function(
         format!("{{{}}}", entries.join(", "))
     };
 
-    format!(
-        "{async_prefix}def {original_name}({params_source}){return_annotation}:\n    \
-         return {await_prefix}_irradiate_trampoline({mangled_name}__mutmut_orig, {mangled_name}__mutmut_mutants, {args_list}, {kwargs_dict}, {self_arg})",
-    )
+    let trampoline_call = format!(
+        "_irradiate_trampoline({mangled_name}__mutmut_orig, {mangled_name}__mutmut_mutants, {args_list}, {kwargs_dict}, {self_arg})"
+    );
+
+    // Choose the correct dispatch based on function kind:
+    //   async generator  → async for _item in trampoline(...): yield _item
+    //   sync generator   → yield from trampoline(...)
+    //   async regular    → return await trampoline(...)
+    //   sync regular     → return trampoline(...)
+    let body = match (is_async, is_generator) {
+        (true, true) => format!("    async for _item in {trampoline_call}:\n        yield _item"),
+        (false, true) => format!("    yield from {trampoline_call}"),
+        (true, false) => format!("    return await {trampoline_call}"),
+        (false, false) => format!("    return {trampoline_call}"),
+    };
+
+    format!("{async_prefix}def {original_name}({params_source}){return_annotation}:\n{body}")
 }
 
 /// Strip inline comments from a params source string (line by line).
@@ -442,7 +456,7 @@ mod tests {
     // INV: **kwargs is merged into call_kwargs in the wrapper.
     #[test]
     fn test_wrapper_kwargs_forwarding() {
-        let wrapper = generate_wrapper_function("func_with_star", "x_func_with_star", "a, /, b, *, c, **kwargs", "None", false, "");
+        let wrapper = generate_wrapper_function("func_with_star", "x_func_with_star", "a, /, b, *, c, **kwargs", "None", false, false, "");
         // kwargs must be spread into the call_kwargs dict
         assert!(wrapper.contains("**kwargs"), "wrapper must forward **kwargs: {wrapper}");
         assert!(wrapper.contains("'c': c"), "wrapper must include c in call_kwargs: {wrapper}");
@@ -451,14 +465,14 @@ mod tests {
     // INV-1: Return type annotation is included in wrapper def line.
     #[test]
     fn test_wrapper_return_annotation_preserved() {
-        let wrapper = generate_wrapper_function("some_func", "x_some_func", "a, b: str = \"111\"", "None", false, " -> int | None");
+        let wrapper = generate_wrapper_function("some_func", "x_some_func", "a, b: str = \"111\"", "None", false, false, " -> int | None");
         assert!(wrapper.starts_with("def some_func(a, b: str = \"111\") -> int | None:"), "wrapper must include return annotation: {wrapper}");
     }
 
     // INV-3: Wrapper without return annotation or kwargs still correct.
     #[test]
     fn test_wrapper_no_annotation_no_kwargs() {
-        let wrapper = generate_wrapper_function("add", "x_add", "a, b", "None", false, "");
+        let wrapper = generate_wrapper_function("add", "x_add", "a, b", "None", false, false, "");
         assert!(wrapper.starts_with("def add(a, b):"), "wrapper def line must be clean: {wrapper}");
     }
 
@@ -519,6 +533,88 @@ mod tests {
         assert!(
             output.wrapper_code.contains(", self)"),
             "Class method wrapper should pass self as self_arg; got: {}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-2: Generator wrapper uses `yield from` instead of `return`.
+    // Uses `if n > 0: yield n` to guarantee a compop mutation (so the function is collected).
+    #[test]
+    fn test_generator_wrapper_uses_yield_from() {
+        let source = "def gen(n):\n    if n > 0:\n        yield n\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "generator with compop must produce mutations");
+        let output = generate_trampoline(&fms[0], "gen_mod");
+        assert!(
+            output.wrapper_code.contains("yield from _irradiate_trampoline("),
+            "Generator wrapper must use 'yield from', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("return "),
+            "Generator wrapper must NOT use 'return', got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-3: Async generator wrapper uses `async for ... yield` instead of `return await`.
+    #[test]
+    fn test_async_generator_wrapper_uses_async_for_yield() {
+        let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "async generator with compop must produce mutations");
+        let output = generate_trampoline(&fms[0], "agen_mod");
+        assert!(
+            output.wrapper_code.contains("async for _item in _irradiate_trampoline("),
+            "Async generator wrapper must use 'async for _item in', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains("yield _item"),
+            "Async generator wrapper must yield _item, got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("return "),
+            "Async generator wrapper must NOT use 'return', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.starts_with("async def "),
+            "Async generator wrapper must be an async def, got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-4: Regular async function still uses `return await` (no regression).
+    #[test]
+    fn test_async_regular_wrapper_uses_return_await() {
+        let source = "async def fetch(url):\n    return url + 'x'\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let output = generate_trampoline(&fms[0], "fetch_mod");
+        assert!(
+            output.wrapper_code.contains("return await _irradiate_trampoline("),
+            "Async regular wrapper must use 'return await', got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-5: Regular sync function still uses `return` (no regression).
+    #[test]
+    fn test_sync_regular_wrapper_uses_return() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let output = generate_trampoline(&fms[0], "math_mod");
+        assert!(
+            output.wrapper_code.contains("return _irradiate_trampoline("),
+            "Sync regular wrapper must use 'return', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("yield"),
+            "Sync regular wrapper must NOT use 'yield', got:\n{}",
             output.wrapper_code
         );
     }

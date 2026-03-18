@@ -44,6 +44,9 @@ pub struct FunctionMutations {
     pub return_annotation: String,
     /// Whether the function is async.
     pub is_async: bool,
+    /// Whether the function is a generator (contains `yield` at the function body level,
+    /// not inside nested functions). An async generator has both `is_async` and `is_generator`.
+    pub is_generator: bool,
     /// Mutations found within this function body.
     pub mutations: Vec<Mutation>,
 }
@@ -115,6 +118,7 @@ fn collect_function_mutations(
     let func_source = codegen_node(func);
     let params_source = codegen_node(&func.params);
     let is_async = func.asynchronous.is_some();
+    let is_generator = suite_contains_yield(&func.body);
 
     // Extract return type annotation, e.g. " -> int | None"
     let return_annotation = if let Some(ann) = &func.returns {
@@ -174,8 +178,102 @@ fn collect_function_mutations(
         params_source,
         return_annotation,
         is_async,
+        is_generator,
         mutations,
     })
+}
+
+// --- Generator detection ---
+//
+// A function is a generator if its body contains `yield` at the function's own
+// scope level (not inside nested function definitions).
+
+fn suite_contains_yield(suite: &cst::Suite) -> bool {
+    match suite {
+        cst::Suite::IndentedBlock(block) => block.body.iter().any(stmt_contains_yield),
+        cst::Suite::SimpleStatementSuite(s) => s.body.iter().any(small_stmt_contains_yield),
+    }
+}
+
+fn stmt_contains_yield(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Simple(simple) => simple.body.iter().any(small_stmt_contains_yield),
+        Statement::Compound(compound) => match compound {
+            // Do NOT recurse into nested functions — yield there does not make the
+            // outer function a generator.
+            CompoundStatement::FunctionDef(_) => false,
+            CompoundStatement::If(if_stmt) => {
+                expr_contains_yield(&if_stmt.test)
+                    || suite_contains_yield(&if_stmt.body)
+                    || if_stmt.orelse.as_ref().is_some_and(|orelse| match orelse.as_ref() {
+                        cst::OrElse::Elif(elif) => {
+                            expr_contains_yield(&elif.test) || suite_contains_yield(&elif.body)
+                        }
+                        cst::OrElse::Else(else_clause) => suite_contains_yield(&else_clause.body),
+                    })
+            }
+            CompoundStatement::While(w) => {
+                expr_contains_yield(&w.test) || suite_contains_yield(&w.body)
+            }
+            CompoundStatement::For(f) => {
+                expr_contains_yield(&f.iter) || suite_contains_yield(&f.body)
+            }
+            CompoundStatement::With(w) => {
+                w.items.iter().any(|item| expr_contains_yield(&item.item))
+                    || suite_contains_yield(&w.body)
+            }
+            CompoundStatement::Try(t) => {
+                suite_contains_yield(&t.body)
+                    || t.handlers.iter().any(|h| suite_contains_yield(&h.body))
+                    || t.finalbody.as_ref().is_some_and(|fin| suite_contains_yield(&fin.body))
+            }
+            _ => false,
+        },
+    }
+}
+
+fn small_stmt_contains_yield(stmt: &SmallStatement) -> bool {
+    match stmt {
+        SmallStatement::Return(ret) => ret.value.as_ref().is_some_and(|v| expr_contains_yield(v)),
+        SmallStatement::Expr(e) => expr_contains_yield(&e.value),
+        SmallStatement::Assign(a) => expr_contains_yield(&a.value),
+        SmallStatement::AugAssign(aug) => expr_contains_yield(&aug.value),
+        SmallStatement::Assert(a) => expr_contains_yield(&a.test),
+        _ => false,
+    }
+}
+
+fn expr_contains_yield(expr: &Expression) -> bool {
+    match expr {
+        Expression::Yield(_) => true,
+        Expression::BinaryOperation(binop) => {
+            expr_contains_yield(&binop.left) || expr_contains_yield(&binop.right)
+        }
+        Expression::BooleanOperation(boolop) => {
+            expr_contains_yield(&boolop.left) || expr_contains_yield(&boolop.right)
+        }
+        Expression::UnaryOperation(unop) => expr_contains_yield(&unop.expression),
+        Expression::Comparison(cmp) => {
+            expr_contains_yield(&cmp.left)
+                || cmp.comparisons.iter().any(|c| expr_contains_yield(&c.comparator))
+        }
+        Expression::Call(call) => {
+            expr_contains_yield(&call.func) || call.args.iter().any(|a| expr_contains_yield(&a.value))
+        }
+        Expression::IfExp(ifexp) => {
+            expr_contains_yield(&ifexp.body)
+                || expr_contains_yield(&ifexp.test)
+                || expr_contains_yield(&ifexp.orelse)
+        }
+        Expression::Tuple(t) => t.elements.iter().any(|el| {
+            if let cst::Element::Simple { value: ref e_val, .. } = el {
+                expr_contains_yield(e_val)
+            } else {
+                false
+            }
+        }),
+        _ => false,
+    }
 }
 
 // --- CST walking ---
@@ -1154,6 +1252,56 @@ mod tests {
                 mutated_func
             );
         }
+    }
+
+    // --- Generator detection tests ---
+    //
+    // Note: the mutation engine only collects mutations for specific operators
+    // (comparison, binop, boolop, number, string, etc.). Generator functions must
+    // contain at least one such mutation to be collected. We use `if n > 0:` for
+    // comparisons, which guarantees a compop mutation.
+
+    // INV-1: A function with `yield` at the top level is a generator.
+    #[test]
+    fn test_generator_function_is_detected() {
+        // `n > 0` produces a compop mutation, so the function is collected.
+        let source = "def gen(n):\n    if n > 0:\n        yield n\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "should find mutations (compop on n > 0)");
+        assert!(fms[0].is_generator, "function with yield should be is_generator=true");
+        assert!(!fms[0].is_async, "plain generator is not async");
+    }
+
+    // INV-2: An async function with `yield` is an async generator.
+    #[test]
+    fn test_async_generator_function_is_detected() {
+        let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "should find mutations (compop on n > 0)");
+        assert!(fms[0].is_generator, "async function with yield should be is_generator=true");
+        assert!(fms[0].is_async, "should also be is_async=true");
+    }
+
+    // INV-3: A regular function (no yield) is NOT a generator.
+    #[test]
+    fn test_regular_function_not_generator() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        assert!(!fms[0].is_generator, "regular function must not be is_generator");
+    }
+
+    // INV-4: yield in a separate function does NOT affect `is_generator` of a different function.
+    #[test]
+    fn test_non_generator_function_is_not_generator() {
+        // outer has only a binop mutation; inner (separate top-level) has yield + compop.
+        let source =
+            "def outer(x):\n    return x + 1\n\ndef inner(n):\n    if n > 0:\n        yield n\n";
+        let fms = collect_file_mutations(source);
+        let outer = fms.iter().find(|fm| fm.name == "outer").expect("outer must exist");
+        let inner = fms.iter().find(|fm| fm.name == "inner").expect("inner must exist");
+        assert!(!outer.is_generator, "outer has no yield, must not be is_generator");
+        assert!(inner.is_generator, "inner has yield, must be is_generator");
     }
 }
 
