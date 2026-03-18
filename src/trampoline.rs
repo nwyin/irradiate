@@ -618,4 +618,141 @@ mod tests {
             output.wrapper_code
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Property-based tests (proptest)
+    // ─────────────────────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // Target 2, P1: parse_param_names never panics on arbitrary input.
+        #[test]
+        fn prop_parse_param_names_no_panic(s in ".*") {
+            let _ = parse_param_names(&s, false);
+            let _ = parse_param_names(&s, true);
+        }
+
+        // Target 2, P2: extracted names are valid Python identifiers.
+        // Uses simple regex-generated names to avoid bracket/annotation complexity.
+        #[test]
+        fn prop_parse_param_names_valid_identifiers(
+            names in proptest::collection::vec("[a-z][a-z0-9_]{0,5}", 0..6usize),
+        ) {
+            let params = names.join(", ");
+            let (pos_args, kw_args, kwargs_name) = parse_param_names(&params, false);
+            let is_valid_ident = |s: &str| {
+                !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+            };
+            for arg in pos_args.iter().chain(kw_args.iter()) {
+                // *args entries have a leading '*'
+                let name = arg.trim_start_matches('*');
+                prop_assert!(is_valid_ident(name), "invalid identifier: {arg:?}");
+            }
+            if let Some(kn) = &kwargs_name {
+                prop_assert!(is_valid_ident(kn), "invalid kwargs name: {kn:?}");
+            }
+        }
+
+        // Target 2, P3: total extracted param count <= (number of commas in input) + 1.
+        // Every structural comma produces at most one parameter; skipped tokens (*, /)
+        // only reduce the count, never exceed it.
+        #[test]
+        fn prop_parse_param_names_count_bound(
+            names in proptest::collection::vec("[a-z][a-z0-9_]{0,5}", 0..8usize),
+        ) {
+            let params = names.join(", ");
+            let (pos_args, kw_args, kwargs_name) = parse_param_names(&params, false);
+            let total = pos_args.len() + kw_args.len() + usize::from(kwargs_name.is_some());
+            let commas = params.chars().filter(|&c| c == ',').count();
+            prop_assert!(
+                total <= commas + 1,
+                "params={params:?}, total={total}, commas={commas}"
+            );
+        }
+
+        // Target 3, P1: generate_trampoline never panics on valid function mutations.
+        #[test]
+        fn prop_generate_trampoline_no_panic(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute"), Just("check_val")],
+            a    in prop_oneof![Just("a"),   Just("x"),   Just("lhs"),     Just("value")],
+            b    in prop_oneof![Just("b"),   Just("y"),   Just("rhs"),     Just("other")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),       Just("//")],
+        ) {
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            for fm in &collect_file_mutations(&source) {
+                let _ = generate_trampoline(fm, "test_mod");
+            }
+        }
+
+        // Target 3, P2: wrapper_code contains `def <original_name>(`.
+        #[test]
+        fn prop_generate_trampoline_wrapper_has_def(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute"), Just("check_val")],
+            a    in prop_oneof![Just("a"),   Just("x"),   Just("lhs")],
+            b    in prop_oneof![Just("b"),   Just("y"),   Just("rhs")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            for fm in &collect_file_mutations(&source) {
+                let output = generate_trampoline(fm, "test_mod");
+                prop_assert!(
+                    output.wrapper_code.contains(&format!("def {}(", fm.name)),
+                    "wrapper must contain 'def {}(': {}", fm.name, output.wrapper_code
+                );
+            }
+        }
+
+        // Target 3, P3: module_code contains the mangled orig and at least one variant.
+        #[test]
+        fn prop_generate_trampoline_module_has_orig_and_variant(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute")],
+            a    in prop_oneof![Just("a"),   Just("x")],
+            b    in prop_oneof![Just("b"),   Just("y")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            for fm in &collect_file_mutations(&source) {
+                let mangled = mangle_name(&fm.name, fm.class_name.as_deref());
+                let output = generate_trampoline(fm, "test_mod");
+                prop_assert!(
+                    output.module_code.contains(&format!("{mangled}__irradiate_orig")),
+                    "module_code must contain orig: {}", output.module_code
+                );
+                prop_assert!(
+                    output.module_code.contains(&format!("{mangled}__irradiate_1")),
+                    "module_code must contain variant _1: {}", output.module_code
+                );
+            }
+        }
+
+        // Target 3, P4: mutant_keys are well-formed "module.mangled__irradiate_N".
+        #[test]
+        fn prop_generate_trampoline_keys_wellformed(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute")],
+            a    in prop_oneof![Just("a"),   Just("x")],
+            b    in prop_oneof![Just("b"),   Just("y")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            for fm in &collect_file_mutations(&source) {
+                let output = generate_trampoline(fm, "test_mod");
+                for key in &output.mutant_keys {
+                    prop_assert!(
+                        key.starts_with("test_mod."),
+                        "key must be module-qualified: {key}"
+                    );
+                    prop_assert!(
+                        key.contains("__irradiate_"),
+                        "key must contain __irradiate_: {key}"
+                    );
+                    let num = key.rsplit("__irradiate_").next().unwrap_or("");
+                    prop_assert!(
+                        !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
+                        "variant number must be all digits: {key}"
+                    );
+                }
+            }
+        }
+    }
 }

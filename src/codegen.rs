@@ -938,4 +938,161 @@ class Single:
             "First line of class body after stripping should be the wrapper, got: {first_body_line:?}"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Property-based tests (proptest)
+    // ─────────────────────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Check whether python3 is available on this machine.
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Feed `source` to `python3 -c "compile(stdin, ...)"` and return true if
+    /// the source is syntactically valid Python.
+    fn is_valid_python(source: &str) -> bool {
+        use std::io::Write;
+        let mut child = match std::process::Command::new("python3")
+            .args(["-c", "import sys; compile(sys.stdin.read(), 'test.py', 'exec')"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(source.as_bytes());
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    proptest! {
+        // Target 1, P1: mutate_file never panics on arbitrary string input.
+        #[test]
+        fn prop_mutate_file_no_panic(source in ".*") {
+            let _ = mutate_file(&source, "test_mod");
+        }
+
+        // Target 1, P3: `from __future__` appears before the trampoline preamble.
+        #[test]
+        fn prop_mutate_file_future_before_preamble(
+            has_future in any::<bool>(),
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute")],
+            a    in prop_oneof![Just("a"),   Just("x")],
+            b    in prop_oneof![Just("b"),   Just("y")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            let body = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            let source = if has_future {
+                format!("from __future__ import annotations\n\n{body}")
+            } else {
+                body
+            };
+            if let Some(result) = mutate_file(&source, "test_mod") {
+                if result.source.contains("from __future__") {
+                    let lines: Vec<&str> = result.source.lines().collect();
+                    let future_pos = lines
+                        .iter()
+                        .position(|l| l.starts_with("from __future__"))
+                        .unwrap();
+                    let preamble_pos = lines
+                        .iter()
+                        .position(|l| l.contains("import irradiate_harness"))
+                        .unwrap();
+                    prop_assert!(
+                        future_pos < preamble_pos,
+                        "from __future__ (line {future_pos}) must precede preamble (line {preamble_pos})"
+                    );
+                }
+            }
+        }
+
+        // Target 1, P4: all mutant_names follow "module.mangled__irradiate_N" format.
+        #[test]
+        fn prop_mutate_file_mutant_names_wellformed(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute"), Just("process")],
+            a    in prop_oneof![Just("a"),   Just("x"),   Just("lhs")],
+            b    in prop_oneof![Just("b"),   Just("y"),   Just("rhs")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            if let Some(result) = mutate_file(&source, "test_mod") {
+                for name in &result.mutant_names {
+                    prop_assert!(name.starts_with("test_mod."), "must be module-qualified: {name}");
+                    prop_assert!(name.contains("__irradiate_"), "must have __irradiate_: {name}");
+                    let num = name.rsplit("__irradiate_").next().unwrap_or("");
+                    prop_assert!(
+                        !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
+                        "variant number must be all digits: {name}"
+                    );
+                }
+            }
+        }
+
+        // Target 1, P5: every mutated function has a trampoline wrapper `def name(` in the output.
+        #[test]
+        fn prop_mutate_file_mutated_functions_have_wrappers(
+            func in prop_oneof![Just("foo"), Just("bar"), Just("compute")],
+            a    in prop_oneof![Just("a"),   Just("x")],
+            b    in prop_oneof![Just("b"),   Just("y")],
+            op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
+        ) {
+            use crate::mutation::collect_file_mutations;
+            let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            let fms = collect_file_mutations(&source);
+            if let Some(result) = mutate_file(&source, "test_mod") {
+                for fm in &fms {
+                    let def_pattern = format!("def {}(", fm.name);
+                    prop_assert!(
+                        result.source.contains(&def_pattern),
+                        "output must contain wrapper 'def {0}(' but got:\n{1}",
+                        fm.name,
+                        result.source
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        // Target 1, P2: mutate_file output is parseable Python (skipped if python3 unavailable).
+        #[test]
+        fn prop_mutate_file_output_parseable_python(
+            func in prop_oneof![
+                Just("foo"), Just("bar"), Just("compute"), Just("process"), Just("eval_val")
+            ],
+            a   in prop_oneof![Just("a"), Just("x"), Just("lhs"), Just("val")],
+            b   in prop_oneof![Just("b"), Just("y"), Just("rhs"), Just("other")],
+            op  in prop_oneof![Just("+"), Just("-"), Just("*"), Just("//")],
+            has_future in any::<bool>(),
+        ) {
+            if !python3_available() {
+                return Ok(());
+            }
+            let body = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
+            let source = if has_future {
+                format!("from __future__ import annotations\n\n{body}")
+            } else {
+                body
+            };
+            if let Some(result) = mutate_file(&source, "test_mod") {
+                prop_assert!(
+                    is_valid_python(&result.source),
+                    "output not parseable Python for input:\n{source}\noutput:\n{}",
+                    result.source
+                );
+            }
+        }
+    }
 }
