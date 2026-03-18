@@ -59,7 +59,7 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
     for stmt in &module.body {
         match stmt {
             Statement::Compound(CompoundStatement::FunctionDef(func)) => {
-                if let Some(fm) = collect_function_mutations(func, None, &ignored_lines) {
+                if let Some(fm) = collect_function_mutations(func, None, source, &ignored_lines) {
                     results.push(fm);
                 }
             }
@@ -70,9 +70,12 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
                         if let Statement::Compound(CompoundStatement::FunctionDef(func)) =
                             method_stmt
                         {
-                            if let Some(fm) =
-                                collect_function_mutations(func, Some(&class_name), &ignored_lines)
-                            {
+                            if let Some(fm) = collect_function_mutations(
+                                func,
+                                Some(&class_name),
+                                source,
+                                &ignored_lines,
+                            ) {
                                 results.push(fm);
                             }
                         }
@@ -92,6 +95,7 @@ const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__
 fn collect_function_mutations(
     func: &cst::FunctionDef,
     class_name: Option<&str>,
+    full_source: &str,
     ignored_lines: &std::collections::HashSet<usize>,
 ) -> Option<FunctionMutations> {
     let name = codegen_node(&func.name);
@@ -126,6 +130,27 @@ fn collect_function_mutations(
         &mut mutations,
         ignored_lines,
     );
+
+    // Post-collection pragma filtering: map each mutation's byte offset within
+    // func_source to an absolute line number in the full file, then drop any
+    // mutation whose line is annotated with `# pragma: no mutate`.
+    if !ignored_lines.is_empty() {
+        // Find where this function starts in the full source so we can translate
+        // func-local line numbers to file-level line numbers.
+        let func_start_line = full_source
+            .find(&func_source)
+            .map(|byte_off| offset_to_line(full_source, byte_off))
+            .unwrap_or(1);
+
+        mutations.retain(|m| {
+            let line_in_func = offset_to_line(&func_source, m.start);
+            // func_start_line is the line of `def …:` (1-indexed); add the
+            // within-function line offset (also 1-indexed), subtract 1 to avoid
+            // double-counting the base.
+            let line_in_file = func_start_line + line_in_func - 1;
+            !ignored_lines.contains(&line_in_file)
+        });
+    }
 
     if mutations.is_empty() {
         return None;
@@ -706,6 +731,11 @@ fn codegen_node<'a>(node: &impl Codegen<'a>) -> String {
     state.tokens
 }
 
+/// Return the 1-indexed line number of `offset` within `text`.
+fn offset_to_line(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())].matches('\n').count() + 1
+}
+
 fn pragma_no_mutate_lines(source: &str) -> std::collections::HashSet<usize> {
     source
         .lines()
@@ -861,12 +891,59 @@ mod tests {
 
     #[test]
     fn test_pragma_no_mutate() {
+        // Entire body is on a pragma line — all mutations suppressed, function omitted.
         let source = "def foo():\n    return 1 + 2  # pragma: no mutate\n";
         let fms = collect_file_mutations(source);
-        // The function should still be found, but the pragma line is in ignored_lines
-        // Currently our walker doesn't check line numbers for individual expressions
-        // This is a known limitation - we'd need position tracking for full pragma support
-        assert_eq!(fms.len(), 1);
+        assert!(fms.is_empty(), "All mutations suppressed → function should be omitted");
+    }
+
+    #[test]
+    fn test_pragma_blocks_binop() {
+        let source = "def foo(a, b):\n    return a + b  # pragma: no mutate\n";
+        let fms = collect_file_mutations(source);
+        let binops: Vec<_> = fms
+            .first()
+            .map(|f| f.mutations.iter().filter(|m| m.operator == "binop_swap").collect())
+            .unwrap_or_default();
+        assert!(binops.is_empty(), "Pragma should block + → - mutation");
+    }
+
+    #[test]
+    fn test_pragma_selective() {
+        // Line 3 uses `*` (unique token on pragma line) to avoid cursor-offset ambiguity.
+        // Lines 2 and 4 have `+` and should each produce one binop mutation.
+        let source =
+            "def foo(a, b, c):\n    x = a + b\n    y = b * c  # pragma: no mutate\n    return x + y\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "Function should still be collected");
+        let binops: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
+        // Lines 2 (+) and 4 (+) produce mutations; line 3 (*) is suppressed entirely.
+        assert_eq!(
+            binops.len(),
+            2,
+            "Should have mutations for lines 2 and 4, but not the pragma line 3"
+        );
+    }
+
+    #[test]
+    fn test_pragma_whole_line_all_operators() {
+        // A line with both a binop and a comparison — pragma suppresses all of them.
+        let source = "def foo(a, b):\n    x = 1 + 2  # pragma: no mutate\n    return a > b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "Non-pragma line still produces mutations");
+        // Number/binop mutations from line 2 should be gone; compop from line 3 remains.
+        let line2_muts: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "number_mutation" || m.operator == "binop_swap")
+            .collect();
+        assert!(line2_muts.is_empty(), "Pragma suppresses all operators on that line");
+        let compop = fms[0].mutations.iter().find(|m| m.operator == "compop_swap");
+        assert!(compop.is_some(), "Non-pragma lines are unaffected");
     }
 
     #[test]
