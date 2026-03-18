@@ -526,12 +526,7 @@ static COMPOP_SWAPS: &[(&str, &str)] = &[
     (" in ", " not in "),
 ];
 
-fn add_compop_mutation_at(
-    op: &CompOp,
-    op_text: &str,
-    start: usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_compop_mutation_at(op: &CompOp, op_text: &str, start: usize, mutations: &mut Vec<Mutation>) {
     let op_trimmed = op_text.trim();
     for &(from, to) in COMPOP_SWAPS {
         if op_trimmed == from.trim() {
@@ -644,7 +639,13 @@ fn add_assignment_mutation_at(
     } else {
         return;
     };
-    record_mutation(assign_text, &new_full, "assignment_mutation", start, mutations);
+    record_mutation(
+        assign_text,
+        &new_full,
+        "assignment_mutation",
+        start,
+        mutations,
+    );
 }
 
 /// AugAssign operator swap: += → -=, etc.
@@ -689,7 +690,13 @@ fn add_augassign_to_assign_at(
     let target_text = codegen_node(&aug.target);
     let value_text = codegen_node(&aug.value);
     let plain_assign = format!("{target_text} ={value_text}");
-    record_mutation(full_text, &plain_assign, "augassign_to_assign", start, mutations);
+    record_mutation(
+        full_text,
+        &plain_assign,
+        "augassign_to_assign",
+        start,
+        mutations,
+    );
 }
 
 /// String method swaps: .lower() ↔ .upper(), .lstrip() ↔ .rstrip(), etc.
@@ -702,11 +709,7 @@ static METHOD_SWAPS: &[(&str, &str)] = &[
     ("rfind", "find"),
 ];
 
-fn add_method_mutations(
-    call: &cst::Call,
-    expr_start: usize,
-    mutations: &mut Vec<Mutation>,
-) {
+fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec<Mutation>) {
     if let Expression::Attribute(attr) = &*call.func {
         let method_text = codegen_node(&attr.attr);
         let method_trimmed = method_text.trim();
@@ -894,7 +897,10 @@ mod tests {
         // Entire body is on a pragma line — all mutations suppressed, function omitted.
         let source = "def foo():\n    return 1 + 2  # pragma: no mutate\n";
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty(), "All mutations suppressed → function should be omitted");
+        assert!(
+            fms.is_empty(),
+            "All mutations suppressed → function should be omitted"
+        );
     }
 
     #[test]
@@ -903,7 +909,12 @@ mod tests {
         let fms = collect_file_mutations(source);
         let binops: Vec<_> = fms
             .first()
-            .map(|f| f.mutations.iter().filter(|m| m.operator == "binop_swap").collect())
+            .map(|f| {
+                f.mutations
+                    .iter()
+                    .filter(|m| m.operator == "binop_swap")
+                    .collect()
+            })
             .unwrap_or_default();
         assert!(binops.is_empty(), "Pragma should block + → - mutation");
     }
@@ -941,8 +952,14 @@ mod tests {
             .iter()
             .filter(|m| m.operator == "number_mutation" || m.operator == "binop_swap")
             .collect();
-        assert!(line2_muts.is_empty(), "Pragma suppresses all operators on that line");
-        let compop = fms[0].mutations.iter().find(|m| m.operator == "compop_swap");
+        assert!(
+            line2_muts.is_empty(),
+            "Pragma suppresses all operators on that line"
+        );
+        let compop = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "compop_swap");
         assert!(compop.is_some(), "Non-pragma lines are unaffected");
     }
 
@@ -970,8 +987,14 @@ mod tests {
     fn test_method_swap_lower_upper() {
         let source = "def foo(s):\n    return s.lower()\n";
         let fms = collect_file_mutations(source);
-        let method_mut = fms[0].mutations.iter().find(|m| m.operator == "method_swap");
-        assert!(method_mut.is_some(), "Should find .lower() → .upper() mutation");
+        let method_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap");
+        assert!(
+            method_mut.is_some(),
+            "Should find .lower() → .upper() mutation"
+        );
         let m = method_mut.unwrap();
         assert_eq!(m.original, "lower");
         assert_eq!(m.replacement, "upper");
@@ -981,7 +1004,10 @@ mod tests {
     fn test_method_swap_lstrip_rstrip() {
         let source = "def foo(s):\n    return s.lstrip()\n";
         let fms = collect_file_mutations(source);
-        let method_mut = fms[0].mutations.iter().find(|m| m.operator == "method_swap");
+        let method_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap");
         assert!(method_mut.is_some());
         let m = method_mut.unwrap();
         assert_eq!(m.original, "lstrip");
@@ -1046,8 +1072,14 @@ mod offset_correctness_tests {
         // One mutation: a - b + c, Other: a + b - c
         let has_a_minus = mutated0.contains("a - b + c") || mutated1.contains("a - b + c");
         let has_b_minus = mutated0.contains("a + b - c") || mutated1.contains("a + b - c");
-        assert!(has_a_minus, "One mutant should be 'a - b + c', got: {mutated0} and {mutated1}");
-        assert!(has_b_minus, "One mutant should be 'a + b - c', got: {mutated0} and {mutated1}");
+        assert!(
+            has_a_minus,
+            "One mutant should be 'a - b + c', got: {mutated0} and {mutated1}"
+        );
+        assert!(
+            has_b_minus,
+            "One mutant should be 'a + b - c', got: {mutated0} and {mutated1}"
+        );
     }
 
     // INV-2: Applying mutation N produces exactly the expected output (no off-by-one)
@@ -1066,7 +1098,10 @@ mod offset_correctness_tests {
         // original should be exactly "+"
         assert_eq!(binop.original, "+", "Operator without spaces");
         let mutated = apply_mutation(&fm.source, binop);
-        assert!(mutated.contains("a-b"), "Should produce a-b, got: {mutated}");
+        assert!(
+            mutated.contains("a-b"),
+            "Should produce a-b, got: {mutated}"
+        );
         assert!(!mutated.contains("a+b"), "Original + should be gone");
     }
 
@@ -1087,16 +1122,25 @@ mod offset_correctness_tests {
         assert_eq!(binops.len(), 3, "Should find 3 operators: +, *, +");
 
         // All at different positions
-        let positions: std::collections::HashSet<usize> =
-            binops.iter().map(|m| m.start).collect();
-        assert_eq!(positions.len(), 3, "All operators must be at distinct positions");
+        let positions: std::collections::HashSet<usize> = binops.iter().map(|m| m.start).collect();
+        assert_eq!(
+            positions.len(),
+            3,
+            "All operators must be at distinct positions"
+        );
 
         // Each mutation should produce syntactically reasonable output
         for m in &binops {
             let mutated = apply_mutation(&fm.source, m);
             // The mutated source should still contain def and return
-            assert!(mutated.contains("def foo"), "Mutated source should still have def");
-            assert!(mutated.contains("return"), "Mutated source should still have return");
+            assert!(
+                mutated.contains("def foo"),
+                "Mutated source should still have def"
+            );
+            assert!(
+                mutated.contains("return"),
+                "Mutated source should still have return"
+            );
         }
     }
 
@@ -1115,7 +1159,10 @@ mod offset_correctness_tests {
         assert_eq!(binops.len(), 1, "Should find exactly 1 + operator");
 
         let mutated = apply_mutation(&fm.source, binops[0]);
-        assert!(mutated.contains("a - a"), "Should produce a - a, got: {mutated}");
+        assert!(
+            mutated.contains("a - a"),
+            "Should produce a - a, got: {mutated}"
+        );
     }
 
     // Byte-span correctness: start and end span exactly the original text

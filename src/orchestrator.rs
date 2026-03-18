@@ -324,7 +324,10 @@ async fn dispatch_work(
         if results.len() >= total_items {
             break;
         }
-        if results.len() + active_mutants.len() == 0 && work_queue.is_empty() && pending_accepts == 0 {
+        if results.len() + active_mutants.len() == 0
+            && work_queue.is_empty()
+            && pending_accepts == 0
+        {
             break;
         }
 

@@ -90,8 +90,7 @@ async fn main() -> Result<()> {
             isolate,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
-            let file_config =
-                irradiate::config::load_config(&std::env::current_dir()?)?;
+            let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
 
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
                 paths_to_mutate: PathBuf::from(

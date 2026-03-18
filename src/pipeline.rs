@@ -92,13 +92,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
     } else {
         eprintln!("Running stats...");
         let start = Instant::now();
-        let s = stats::collect_stats(
-            &config.python,
-            &project_dir,
-            &pythonpath,
-            &config.tests_dir,
-        )
-        .context("Stats collection failed")?;
+        let s = stats::collect_stats(&config.python, &project_dir, &pythonpath, &config.tests_dir)
+            .context("Stats collection failed")?;
         eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
         Some(s)
     };
@@ -157,7 +152,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // For no-stats mode, we need all test IDs — collect them from a dummy pytest run
     let work_items = if config.no_stats {
         // Use all tests discovered by the worker
-        let all_tests = discover_tests(&config.python, &project_dir, &pythonpath, &config.tests_dir)?;
+        let all_tests =
+            discover_tests(&config.python, &project_dir, &pythonpath, &config.tests_dir)?;
         work_items
             .into_iter()
             .map(|mut item| {
@@ -437,11 +433,7 @@ async fn run_isolated(
 /// All five subprocess invocations (validate_clean_run, validate_fail_run,
 /// discover_tests, collect_stats, spawn_worker) must use this function so
 /// that PYTHONPATH is constructed identically everywhere.
-pub fn build_pythonpath(
-    harness_dir: &Path,
-    mutants_dir: &Path,
-    paths_to_mutate: &Path,
-) -> String {
+pub fn build_pythonpath(harness_dir: &Path, mutants_dir: &Path, paths_to_mutate: &Path) -> String {
     let source_parent = paths_to_mutate.parent().unwrap_or(paths_to_mutate);
     format!(
         "{}:{}:{}",
@@ -831,11 +823,23 @@ mod tests {
 
         let result = build_pythonpath(harness, mutants, paths_to_mutate);
 
-        assert!(result.contains("/tmp/harness"), "harness dir must be in PYTHONPATH");
-        assert!(result.contains("/tmp/mutants"), "mutants dir must be in PYTHONPATH");
-        assert!(result.contains("src"), "source parent must be in PYTHONPATH");
+        assert!(
+            result.contains("/tmp/harness"),
+            "harness dir must be in PYTHONPATH"
+        );
+        assert!(
+            result.contains("/tmp/mutants"),
+            "mutants dir must be in PYTHONPATH"
+        );
+        assert!(
+            result.contains("src"),
+            "source parent must be in PYTHONPATH"
+        );
         // "src/mylib" itself must NOT appear — only its parent
-        assert!(!result.contains("src/mylib"), "paths_to_mutate itself must not appear — only its parent");
+        assert!(
+            !result.contains("src/mylib"),
+            "paths_to_mutate itself must not appear — only its parent"
+        );
     }
 
     #[test]
@@ -1095,7 +1099,10 @@ mod tests {
         let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
         all_names.insert(
             "mymod".to_string(),
-            vec!["mymod.x_foo__mutmut_1".to_string(), "mymod.x_foo__mutmut_2".to_string()],
+            vec![
+                "mymod.x_foo__mutmut_1".to_string(),
+                "mymod.x_foo__mutmut_2".to_string(),
+            ],
         );
 
         // Create the alt meta path stub so write_meta_files picks the right path
@@ -1170,15 +1177,25 @@ mod tests {
         let mutants_tmp = tempfile::tempdir().unwrap();
 
         // File that WILL produce mutations (has a function with arithmetic)
-        std::fs::write(src_tmp.path().join("math_ops.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        std::fs::write(
+            src_tmp.path().join("math_ops.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
         generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
 
         // Both files must be present in mutants/
-        assert!(mutants_tmp.path().join("math_ops.py").exists(), "mutated file must be in mutants/");
-        assert!(mutants_tmp.path().join("constants.py").exists(), "unmutated file must be copied to mutants/");
+        assert!(
+            mutants_tmp.path().join("math_ops.py").exists(),
+            "mutated file must be in mutants/"
+        );
+        assert!(
+            mutants_tmp.path().join("constants.py").exists(),
+            "unmutated file must be copied to mutants/"
+        );
 
         // The unmutated file content must match the original exactly
         let original = std::fs::read_to_string(src_tmp.path().join("constants.py")).unwrap();
@@ -1206,13 +1223,25 @@ mod tests {
         generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
-        assert!(mutants_pkg.join("__init__.py").exists(), "pkg/__init__.py must be in mutants/");
-        assert!(mutants_pkg.join("core.py").exists(), "pkg/core.py must be in mutants/");
-        assert!(mutants_pkg.join("utils.py").exists(), "pkg/utils.py must be in mutants/");
+        assert!(
+            mutants_pkg.join("__init__.py").exists(),
+            "pkg/__init__.py must be in mutants/"
+        );
+        assert!(
+            mutants_pkg.join("core.py").exists(),
+            "pkg/core.py must be in mutants/"
+        );
+        assert!(
+            mutants_pkg.join("utils.py").exists(),
+            "pkg/utils.py must be in mutants/"
+        );
 
         // utils.py content must be verbatim
         let original = std::fs::read_to_string(pkg.join("utils.py")).unwrap();
         let mirrored = std::fs::read_to_string(mutants_pkg.join("utils.py")).unwrap();
-        assert_eq!(original, mirrored, "unmutated utils.py must be copied verbatim");
+        assert_eq!(
+            original, mirrored,
+            "unmutated utils.py must be copied verbatim"
+        );
     }
 }

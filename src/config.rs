@@ -113,7 +113,10 @@ future_unknown_key = "something"
         let result = load_config(tmp.path());
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("pyproject.toml"), "error message should mention pyproject.toml: {msg}");
+        assert!(
+            msg.contains("pyproject.toml"),
+            "error message should mention pyproject.toml: {msg}"
+        );
     }
 
     #[test]
