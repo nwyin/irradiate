@@ -124,9 +124,34 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
 
         if !func_name.is_empty() {
             if let Some(idx) = find_trampoline_idx(&function_mutations, class_key, func_name) {
-                // Strip the entire function body.
+                // Strip the entire function signature + body.
                 let func_indent = indent;
+
+                // Count open parens on the `def` line to detect multi-line signatures.
+                let mut paren_depth: i32 = 0;
+                for ch in line.chars() {
+                    match ch {
+                        '(' => paren_depth += 1,
+                        ')' => paren_depth -= 1,
+                        _ => {}
+                    }
+                }
+
+                // If paren_depth > 0, the signature continues on the following lines.
+                // Advance past all continuation lines until the signature is closed.
                 i += 1;
+                while i < lines.len() && paren_depth > 0 {
+                    for ch in lines[i].chars() {
+                        match ch {
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+
+                // Now strip the body: any lines at a deeper indent than func_indent.
                 while i < lines.len() {
                     let next = lines[i];
                     let next_trimmed = next.trim_start();
@@ -629,6 +654,164 @@ class Beta:
 
         assert!(doc_pos < preamble_pos, "docstring (line {doc_pos}) must come before preamble (line {preamble_pos})");
     }
+
+    // --- multi-line signature tests ---
+
+    #[test]
+    fn test_multiline_signature_class_method_no_orphan_lines() {
+        // INV-1: multi-line class method signature is fully stripped — no orphan `)` or `-> ...` lines.
+        let source = "\
+class Markup:
+    def format_map(
+        self,
+        mapping,
+    ):
+        return 1 + 2
+";
+        let result = mutate_file(source, "markup").unwrap();
+
+        // The body `return 1 + 2` must appear exactly once (in the mangled orig).
+        // If the body leaked as orphan code in the class, it would appear twice.
+        let body_count = result.source.matches("return 1 + 2").count();
+        assert_eq!(
+            body_count, 1,
+            "Body should appear exactly once (in mangled orig), got {body_count}. Orphan body leaked:\n{}",
+            result.source
+        );
+
+        // The wrapper def format_map( should appear exactly once (the trampolined version)
+        let wrapper_count = result.source.matches("def format_map(").count();
+        assert_eq!(
+            wrapper_count, 1,
+            "Should have exactly one 'def format_map(' (the wrapper), got {wrapper_count}\n{}",
+            result.source
+        );
+
+        // The wrapper should be indented inside the class
+        let wrapper_line = result
+            .source
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("def format_map(") && !t.contains("mutmut")
+            })
+            .expect("wrapper def format_map( should exist");
+        let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
+        assert!(indent_len > 0, "wrapper must be indented inside class body");
+    }
+
+    #[test]
+    fn test_multiline_signature_top_level_function_no_orphan_lines() {
+        // INV-2: multi-line top-level function signature is fully stripped.
+        let source = "\
+def build(
+    x,
+    y,
+):
+    return x + y
+";
+        let result = mutate_file(source, "top").unwrap();
+
+        // No orphan standalone `)` lines
+        for line in result.source.lines() {
+            let trimmed = line.trim();
+            assert!(
+                trimmed != ")",
+                "Orphan ')' found in output:\n{}",
+                result.source
+            );
+        }
+
+        // Exactly one `def build(` — the wrapper
+        let count = result.source.matches("def build(").count();
+        assert_eq!(
+            count, 1,
+            "Should have exactly one 'def build(' (the wrapper), got {count}\n{}",
+            result.source
+        );
+
+        // Wrapper must be at module level (indent 0)
+        let wrapper_line = result
+            .source
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("def build(") && !t.contains("mutmut")
+            })
+            .expect("wrapper def build( should exist");
+        let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
+        assert_eq!(indent_len, 0, "top-level wrapper must be at module level");
+    }
+
+    #[test]
+    fn test_multiline_signature_with_return_type_annotation() {
+        // Multi-line signature with `-> ReturnType:` on the closing line (real-world pattern).
+        // This is the markupsafe Markup.format_map() pattern.
+        let source = "\
+class Markup:
+    def format_map(
+        self,
+        mapping,
+    ) -> str:
+        return 1 + 2
+";
+        let result = mutate_file(source, "markup").unwrap();
+
+        // The body must appear exactly once (only in the mangled orig, not as orphan).
+        let body_count = result.source.matches("return 1 + 2").count();
+        assert_eq!(
+            body_count, 1,
+            "Body should appear exactly once (in mangled orig), got {body_count}. Orphan leaked:\n{}",
+            result.source
+        );
+
+        // The original `    ) -> str:` line (4-space indent, inside class) must NOT appear
+        // as orphan code. Note: `) -> str:` at 0-indent in mangled orig is legitimate.
+        for line in result.source.lines() {
+            let trimmed = line.trim();
+            let indent = line.len() - trimmed.len();
+            // Orphan: `) -> str:` at class-body indent (4 spaces) — from original signature
+            if indent == 4 && trimmed.starts_with(") ->") {
+                panic!(
+                    "Orphan ') ->' at class-body indent found in output:\n{}",
+                    result.source
+                );
+            }
+        }
+
+        // wrapper should exist, exactly once
+        let count = result.source.matches("def format_map(").count();
+        assert_eq!(count, 1, "Should have exactly one format_map wrapper\n{}", result.source);
+    }
+
+    #[test]
+    fn test_single_line_signature_regression() {
+        // INV-3: Single-line signatures still work correctly after the fix.
+        let source = "\
+class Calc:
+    def add(self, a, b):
+        return a + b
+";
+        let result = mutate_file(source, "calc").unwrap();
+
+        // Wrapper must be inside class (indented)
+        let wrapper_line = result
+            .source
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("def add(") && !t.contains("mutmut")
+            })
+            .expect("wrapper def add( should exist");
+        let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
+        assert!(indent_len > 0, "wrapper must be indented inside class body");
+
+        // Exactly one `def add(`
+        let count = result.source.matches("def add(").count();
+        assert_eq!(count, 1, "Exactly one def add( wrapper\n{}", result.source);
+    }
+
+    // --- __future__ import ordering tests ---
 
     #[test]
     fn test_future_import_before_preamble() {
