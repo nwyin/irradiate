@@ -38,3 +38,7 @@ tests/vendor_repos/
 # Fuzzing
 fuzz/corpus/
 fuzz/artifacts/
+
+# Benchmarks
+bench/results/
+bench/.venv/
