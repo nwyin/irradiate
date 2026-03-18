@@ -47,6 +47,10 @@ enum Commands {
         /// Respawn workers after N mutants to prevent pytest state accumulation (0 to disable)
         #[arg(long, default_value_t = 100)]
         worker_recycle_after: usize,
+
+        /// Run each mutant in a fresh subprocess (slower, better isolation)
+        #[arg(long)]
+        isolate: bool,
     },
 
     /// Display mutation testing results
@@ -83,6 +87,7 @@ async fn main() -> Result<()> {
             covered_only,
             python,
             worker_recycle_after,
+            isolate,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config =
@@ -108,6 +113,7 @@ async fn main() -> Result<()> {
                     Some(mutant_names)
                 },
                 worker_recycle_after,
+                isolate,
             })
             .await
         }

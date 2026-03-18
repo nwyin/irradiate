@@ -5,6 +5,7 @@ use crate::harness;
 use crate::orchestrator::{run_worker_pool, PoolConfig};
 use crate::protocol::{MutantResult, MutantStatus, WorkItem};
 use crate::stats;
+use crate::stats::TestStats;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,9 @@ pub struct RunConfig {
     pub mutant_filter: Option<Vec<String>>,
     /// Respawn workers after this many mutants (0 = disabled).
     pub worker_recycle_after: usize,
+    /// Run each mutant in a fresh subprocess instead of the worker pool.
+    /// Slower but provides perfect isolation — no pytest state can leak between mutants.
+    pub isolate: bool,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -109,10 +113,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
     eprintln!("  done");
 
     // Phase 4: Mutation testing
-    eprintln!(
-        "Running mutation testing ({total_mutants} mutants, {} workers)...",
-        config.workers
-    );
+    if config.isolate {
+        eprintln!("Running mutation testing ({total_mutants} mutants, isolated mode)...");
+    } else {
+        eprintln!(
+            "Running mutation testing ({total_mutants} mutants, {} workers)...",
+            config.workers
+        );
+    }
     let start = Instant::now();
 
     // Build work items
@@ -183,20 +191,30 @@ pub async fn run(config: RunConfig) -> Result<()> {
         .collect();
 
     if !covered_work.is_empty() {
-        let pool_config = PoolConfig {
-            num_workers: config.workers,
-            python: config.python.clone(),
-            project_dir: project_dir.clone(),
-            mutants_dir: mutants_dir.clone(),
-            tests_dir: PathBuf::from(&config.tests_dir),
-            timeout_multiplier: config.timeout_multiplier,
-            pythonpath: pythonpath.clone(),
-            worker_recycle_after: config.worker_recycle_after,
-            ..Default::default()
+        let run_results = if config.isolate {
+            run_isolated(
+                &config,
+                covered_work,
+                &harness_dir,
+                &mutants_dir,
+                test_stats.as_ref(),
+            )
+            .await?
+        } else {
+            let pool_config = PoolConfig {
+                num_workers: config.workers,
+                python: config.python.clone(),
+                project_dir: project_dir.clone(),
+                mutants_dir: mutants_dir.clone(),
+                tests_dir: PathBuf::from(&config.tests_dir),
+                timeout_multiplier: config.timeout_multiplier,
+                pythonpath: pythonpath.clone(),
+                worker_recycle_after: config.worker_recycle_after,
+                ..Default::default()
+            };
+            run_worker_pool(&pool_config, covered_work).await?
         };
-
-        let pool_results = run_worker_pool(&pool_config, covered_work).await?;
-        results.extend(pool_results);
+        results.extend(run_results);
     }
 
     let test_time = start.elapsed();
@@ -314,6 +332,93 @@ pub fn show(mutant_name: &str) -> Result<()> {
 }
 
 // --- Internal helpers ---
+
+/// Default timeout (seconds) when no per-test baseline is available.
+const DEFAULT_SUBPROCESS_TIMEOUT_SECS: f64 = 30.0;
+
+/// Minimum absolute timeout for an isolated subprocess (seconds).
+///
+/// Each isolated run spawns a fresh `python -m pytest` process. Even for trivially
+/// fast tests the subprocess startup + pytest collection overhead is ~1-3 seconds.
+/// If the estimated test duration is sub-second we must not let the multiplied timeout
+/// drop below this floor, or every mutant will time out before pytest even collects.
+const MIN_ISOLATED_TIMEOUT_SECS: f64 = 10.0;
+
+/// Run each mutant in a fresh subprocess, sequentially.
+///
+/// This bypasses the worker pool entirely. Each mutant gets its own `python -m pytest`
+/// invocation with `IRRADIATE_ACTIVE_MUTANT` set in the environment. There is no shared
+/// pytest session state — each process starts clean.
+///
+/// Slower than the worker pool but provides perfect isolation and is useful for debugging.
+async fn run_isolated(
+    config: &RunConfig,
+    work_items: Vec<WorkItem>,
+    harness_dir: &Path,
+    mutants_dir: &Path,
+    test_stats: Option<&TestStats>,
+) -> Result<Vec<MutantResult>> {
+    let mut results = Vec::new();
+    let project_dir = std::env::current_dir()?;
+    let pythonpath = build_pythonpath(harness_dir, mutants_dir, &config.paths_to_mutate);
+
+    for item in work_items {
+        let start = Instant::now();
+
+        // Per-item timeout: multiply estimated test duration by the multiplier, then
+        // apply MIN_ISOLATED_TIMEOUT_SECS as an absolute floor.
+        //
+        // The floor is essential: each isolated run spawns a fresh subprocess and pytest
+        // must start, import, collect, and then run — even for microsecond-fast tests
+        // that overhead is ~1-3 s. Without the floor, `multiplier × tiny_duration`
+        // could be < 1ms and every mutant would time out before pytest even starts.
+        let estimated_secs = test_stats
+            .map(|s| s.estimated_duration(&item.test_ids))
+            .unwrap_or(0.0);
+        let timeout_secs = (config.timeout_multiplier * estimated_secs)
+            .max(config.timeout_multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
+            .max(MIN_ISOLATED_TIMEOUT_SECS);
+        let timeout_duration = std::time::Duration::from_secs_f64(timeout_secs);
+
+        let mut child = tokio::process::Command::new(&config.python)
+            .arg("-m")
+            .arg("pytest")
+            .arg("-x")
+            .arg("-q")
+            .arg("--no-header")
+            .args(&item.test_ids)
+            .env("PYTHONPATH", &pythonpath)
+            .env("IRRADIATE_ACTIVE_MUTANT", &item.mutant_name)
+            .current_dir(&project_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("Failed to spawn subprocess for {}", item.mutant_name))?;
+
+        let (exit_code, timed_out) =
+            match tokio::time::timeout(timeout_duration, child.wait()).await {
+                Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_elapsed) => {
+                    // Timeout: kill the child process
+                    let _ = child.kill().await;
+                    (-1, true)
+                }
+            };
+
+        let duration = start.elapsed().as_secs_f64();
+        results.push(MutantResult {
+            mutant_name: item.mutant_name,
+            exit_code,
+            duration,
+            status: MutantStatus::from_exit_code(exit_code, timed_out),
+        });
+    }
+
+    Ok(results)
+}
 
 /// Construct the PYTHONPATH for all Python subprocesses in the pipeline.
 ///

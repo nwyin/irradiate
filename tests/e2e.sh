@@ -77,4 +77,46 @@ echo "  show command: OK"
 rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 
 echo ""
+echo "=== E2E: --isolate flag ==="
+
+# Capture reference killed/survived counts from the standard (worker pool) run
+rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
+POOL_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+POOL_RESULTS=$( cd "$FIXTURE" && "$BINARY" results --all 2>&1 )
+POOL_KILLED=$(echo "$POOL_RESULTS" | grep -c "🎉" || true)
+POOL_SURVIVED=$(echo "$POOL_RESULTS" | grep -c "🙁" || true)
+echo "  Worker pool: Killed=$POOL_KILLED, Survived=$POOL_SURVIVED"
+
+# Now run with --isolate and compare
+rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
+ISOLATE_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 --isolate 2>&1 )
+echo "$ISOLATE_OUTPUT"
+
+# Verify isolated mode message
+if ! echo "$ISOLATE_OUTPUT" | grep -q "isolated mode"; then
+    echo "FAIL: Expected 'isolated mode' in --isolate output"
+    exit 1
+fi
+echo "  isolated mode message: OK"
+
+ISOLATE_RESULTS=$( cd "$FIXTURE" && "$BINARY" results --all 2>&1 )
+ISOLATE_KILLED=$(echo "$ISOLATE_RESULTS" | grep -c "🎉" || true)
+ISOLATE_SURVIVED=$(echo "$ISOLATE_RESULTS" | grep -c "🙁" || true)
+echo "  Isolated: Killed=$ISOLATE_KILLED, Survived=$ISOLATE_SURVIVED"
+
+# INV-1: --isolate must produce identical killed/survived counts
+if [ "$ISOLATE_KILLED" -ne "$POOL_KILLED" ]; then
+    echo "FAIL: --isolate killed count ($ISOLATE_KILLED) differs from worker pool ($POOL_KILLED)"
+    exit 1
+fi
+if [ "$ISOLATE_SURVIVED" -ne "$POOL_SURVIVED" ]; then
+    echo "FAIL: --isolate survived count ($ISOLATE_SURVIVED) differs from worker pool ($POOL_SURVIVED)"
+    exit 1
+fi
+echo "  --isolate matches worker pool results: OK"
+
+# Clean up
+rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
+
+echo ""
 echo "=== E2E tests: PASS ==="
