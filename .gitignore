@@ -36,8 +36,9 @@ tests/vendor_repos/
 .vscode/
 *.iml
 
-# Fuzzing
-fuzz/corpus/
+# Fuzzing — ignore runtime-generated corpus (hex-named) and artifacts; keep seed_* files
+fuzz/corpus/*/[0-9a-f]*
+fuzz/corpus/*/*.options
 fuzz/artifacts/
 fuzz/target/
 

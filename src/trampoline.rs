@@ -184,7 +184,7 @@ fn split_params(s: &str) -> Vec<String> {
 
 /// Parse parameter names from a params source string.
 /// Returns (positional_args, keyword_only_args, kwargs_name).
-fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>, Option<String>) {
+pub fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>, Option<String>) {
     let mut pos_args = Vec::new();
     let mut kw_args = Vec::new();
     let mut kwargs_name: Option<String> = None;

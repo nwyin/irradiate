@@ -1,0 +1,2 @@
+self, x: int,  # inline comment
+    y: str

@@ -1,0 +1,72 @@
+name: Nightly Fuzz
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 4am UTC daily
+  workflow_dispatch: {}  # manual trigger
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [fuzz_mutate_file, fuzz_parse_param_names, fuzz_generate_trampoline]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - name: Seed corpus
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          # corpus seeds are committed in fuzz/corpus/<target>/
+      - name: Run fuzzer (5 minutes)
+        id: fuzz
+        continue-on-error: true
+        run: |
+          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} -- -max_total_time=300 2>&1 | tee fuzz_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+      - name: Check for crash
+        if: steps.fuzz.outcome == 'failure'
+        run: |
+          CRASH_FILE=$(find fuzz/artifacts/${{ matrix.target }} -name "crash-*" -o -name "oom-*" 2>/dev/null | head -1)
+          if [ -n "$CRASH_FILE" ]; then
+            echo "CRASH_INPUT=$(base64 < "$CRASH_FILE")" >> $GITHUB_ENV
+            echo "CRASH_FILE=$CRASH_FILE" >> $GITHUB_ENV
+          fi
+      - name: File GH issue for crash
+        if: steps.fuzz.outcome == 'failure' && env.CRASH_FILE != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('fuzz_output.txt', 'utf8').slice(-3000);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Fuzz crash: ${{ matrix.target }}`,
+              body: [
+                '## Nightly fuzz found a crash',
+                '',
+                `**Target:** \`${{ matrix.target }}\``,
+                `**Date:** ${new Date().toISOString()}`,
+                `**Crash input (base64):** \`${process.env.CRASH_INPUT}\``,
+                '',
+                '### Output (last 3000 chars)',
+                '```',
+                output,
+                '```',
+                '',
+                '### Reproducing',
+                '```bash',
+                `echo "${process.env.CRASH_INPUT}" | base64 -d > crash_input`,
+                `cargo +nightly fuzz run ${{ matrix.target }} crash_input`,
+                '```',
+              ].join('\n'),
+              labels: ['fuzz', 'bug'],
+            });
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 7
