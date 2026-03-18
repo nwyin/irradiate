@@ -163,15 +163,19 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
                     i += 1;
                 }
 
-                // For class methods: emit the wrapper inline, indented to the method's level.
-                // The original name is preserved so instance.method() keeps working.
+                // For class methods: emit the wrapper inline, indented to the method's level,
+                // then also emit module_code (orig, variants, dict) inside the class body.
+                // This keeps the __class__ cell intact so super() works correctly.
                 if class_key.is_some() {
                     let wrapper = &trampolines[idx].wrapper_code;
                     let indented = indent_code(wrapper, func_indent);
                     output.push_str(&indented);
                     output.push('\n');
+                    let indented_module = indent_code(&trampolines[idx].module_code, func_indent);
+                    output.push_str(&indented_module);
+                    output.push('\n');
                 }
-                // For top-level functions: wrapper is emitted after the walk (module level).
+                // For top-level functions: wrapper and module_code are emitted after the walk.
                 continue;
             }
         }
@@ -181,16 +185,18 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         i += 1;
     }
 
-    // Append module-level code for ALL functions (mangled orig, variants, lookup dict).
-    // These have globally-unique mangled names and are safe at module level.
+    // Append module-level code and wrappers for TOP-LEVEL functions only.
+    // For class methods, both module_code and wrapper_code were already emitted
+    // inside the class body during the walk above (to preserve the __class__ cell
+    // so that super() works correctly).
     output.push('\n');
-    for tp in &trampolines {
-        output.push_str(&tp.module_code);
-        output.push_str("\n\n");
+    for (idx, fm) in function_mutations.iter().enumerate() {
+        if fm.class_name.is_none() {
+            output.push_str(&trampolines[idx].module_code);
+            output.push_str("\n\n");
+        }
     }
 
-    // Append wrappers for TOP-LEVEL functions only.
-    // Class method wrappers were already emitted inline during the walk.
     for (idx, fm) in function_mutations.iter().enumerate() {
         if fm.class_name.is_none() {
             output.push_str(&trampolines[idx].wrapper_code);
@@ -432,7 +438,8 @@ class Finder:
 
     // INV-1: class method wrapper is indented inside class body
     // INV-2: top-level function wrapper is at module level (indent 0)
-    // INV-3: mangled orig/variants/dict always at module level
+    // INV-3: top-level mangled orig/variants/dict at module level
+    // INV-4: class method mangled orig/variants/dict inside class body (super() fix)
 
     #[test]
     fn test_top_level_wrapper_at_module_level() {
@@ -453,7 +460,9 @@ class Finder:
     }
 
     #[test]
-    fn test_mangled_code_at_module_level() {
+    fn test_class_method_mangled_code_inside_class_body() {
+        // INV-4: for class methods, mangled orig/variants/dict must be inside the class body.
+        // Keeping them inside the class body preserves the __class__ cell so super() works.
         let source = "\
 class Calc:
     def add(self, a, b):
@@ -461,14 +470,39 @@ class Calc:
 ";
         let result = mutate_file(source, "m").unwrap();
 
-        // The mangled orig function definition must appear at indent 0 (module level)
+        // The mangled orig function definition must be indented (inside the class body),
+        // NOT at module level (indent 0).
         let orig_line = result
             .source
             .lines()
-            .find(|l| l.starts_with("def xǁCalcǁadd__irradiate_orig("))
+            .find(|l| l.trim_start().starts_with("def xǁCalcǁadd__irradiate_orig("))
+            .expect("mangled orig def should exist");
+        let indent = orig_line.len() - orig_line.trim_start().len();
+        assert!(indent > 0, "mangled orig must be indented (inside class body), got: {orig_line:?}");
+
+        // Also verify the lookup dict is indented inside the class body
+        let dict_line = result
+            .source
+            .lines()
+            .find(|l| l.trim_start().starts_with("xǁCalcǁadd__irradiate_mutants"))
+            .expect("mangled mutants dict should exist");
+        let dict_indent = dict_line.len() - dict_line.trim_start().len();
+        assert!(dict_indent > 0, "mangled mutants dict must be indented (inside class body), got: {dict_line:?}");
+    }
+
+    #[test]
+    fn test_top_level_mangled_code_at_module_level() {
+        // INV-3: for top-level functions, mangled orig/variants/dict stay at module level.
+        let source = "def add(a, b):\n    return a + b\n";
+        let result = mutate_file(source, "m").unwrap();
+
+        let orig_line = result
+            .source
+            .lines()
+            .find(|l| l.starts_with("def x_add__irradiate_orig("))
             .expect("mangled orig def should exist at module level");
         let indent = orig_line.len() - orig_line.trim_start().len();
-        assert_eq!(indent, 0, "mangled orig must be at module level, got: {orig_line:?}");
+        assert_eq!(indent, 0, "top-level mangled orig must be at module level, got: {orig_line:?}");
     }
 
     #[test]
@@ -765,27 +799,30 @@ class Markup:
             result.source
         );
 
-        // With return annotation support the wrapper legitimately produces `) -> str:` at
-        // class-body indent (4 spaces) as its closing paren line.  Verify it belongs to the
-        // wrapper (immediately followed by the trampoline return), not an orphan from the
-        // original source.
-        let lines: Vec<&str> = result.source.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            let indent = line.len() - trimmed.len();
-            if indent == 4 && trimmed.starts_with(") ->") {
-                let next_non_empty = lines[i + 1..].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("");
-                assert!(
-                    next_non_empty.contains("_irradiate_trampoline"),
-                    "Orphan ') ->' at class-body indent (not wrapper closing paren) in output:\n{}",
-                    result.source
-                );
-            }
-        }
-
         // wrapper should exist, exactly once
         let count = result.source.matches("def format_map(").count();
         assert_eq!(count, 1, "Should have exactly one format_map wrapper\n{}", result.source);
+
+        // The wrapper should be indented inside the class
+        let wrapper_line = result
+            .source
+            .lines()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("def format_map(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def format_map( should exist");
+        let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
+        assert!(indent_len > 0, "wrapper must be indented inside class body\n{}", result.source);
+
+        // Mangled orig should also be inside the class body (indented) — INV-4 (super() fix)
+        let orig_line = result
+            .source
+            .lines()
+            .find(|l| l.trim_start().starts_with("def xǁMarkupǁformat_map__irradiate_orig("))
+            .expect("mangled orig should exist");
+        let orig_indent = orig_line.len() - orig_line.trim_start().len();
+        assert!(orig_indent > 0, "mangled orig must be inside class body (super() fix)\n{}", result.source);
     }
 
     #[test]
