@@ -22,8 +22,10 @@ tests/vendor_repos/
 # Vendor (reference only, cloned separately)
 /vendor/
 
-# Hive worktrees
+# Hive
 .worktrees/
+.hive/queen-context.md
+.hive/queen-state.md
 
 # OS
 .DS_Store
