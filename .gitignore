@@ -15,6 +15,7 @@ venv/
 # Generated mutants in test fixtures
 tests/fixtures/simple_project/mutants/
 tests/fixtures/simple_project/.irradiate/
+mutants/
 
 # Vendor smoke test repos and results (downloaded at runtime)
 tests/vendor_repos/
