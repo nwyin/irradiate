@@ -45,3 +45,6 @@ fuzz/target/
 bench/results/
 bench/.venv/
 bench/corpora/
+
+# Generated report
+/report/
