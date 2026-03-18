@@ -455,6 +455,23 @@ fn generate_mutants(
     // Walk the source directory for .py files
     let py_files = find_python_files(paths_to_mutate)?;
 
+    // Determine the strip base for computing relative paths.
+    //
+    // When paths_to_mutate IS a package directory (contains __init__.py), we
+    // strip its parent so the package name is preserved in mutants/.
+    //   e.g. paths_to_mutate="src/click", file="src/click/types.py"
+    //        strip "src/" → rel_path="click/types.py" → mutants/click/types.py  ✓
+    //
+    // When paths_to_mutate is a source root (no __init__.py), we strip it
+    // directly — current behaviour preserved.
+    //   e.g. paths_to_mutate="src", file="src/simple_lib/__init__.py"
+    //        strip "src/" → rel_path="simple_lib/__init__.py"  ✓
+    let strip_base = if paths_to_mutate.join("__init__.py").exists() {
+        paths_to_mutate.parent().unwrap_or(paths_to_mutate)
+    } else {
+        paths_to_mutate
+    };
+
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
     type MutantEntry = Option<(String, Vec<String>)>;
@@ -463,9 +480,10 @@ fn generate_mutants(
         .map(|py_file| -> Result<MutantEntry> {
             let source = std::fs::read_to_string(py_file)?;
 
-            // Compute module name from file path relative to paths_to_mutate
-            // e.g., src/simple_lib/__init__.py with paths_to_mutate=src → simple_lib/__init__.py → simple_lib
-            let rel_path = py_file.strip_prefix(paths_to_mutate)?;
+            // Compute module name from file path relative to strip_base.
+            // e.g., src/simple_lib/__init__.py with strip_base=src → simple_lib/__init__.py → simple_lib
+            // e.g., src/click/types.py with strip_base=src → click/types.py → click.types
+            let rel_path = py_file.strip_prefix(strip_base)?;
             let module_name = path_to_module(rel_path);
 
             if let Some(mutated) = mutate_file(&source, &module_name) {
@@ -1243,5 +1261,89 @@ mod tests {
             original, mirrored,
             "unmutated utils.py must be copied verbatim"
         );
+    }
+
+    // --- generate_mutants: strip_base / path-flattening regression tests ---
+
+    #[test]
+    fn test_generate_mutants_package_dir_preserves_package_name() {
+        // INV-1: When paths_to_mutate IS a package directory (has __init__.py),
+        // mutant files must be placed under mutants/<package_name>/, not directly
+        // under mutants/.  This is the regression case for the original bug where
+        // strip_prefix(paths_to_mutate) would yield "types.py" instead of
+        // "click/types.py" when paths_to_mutate="src/click".
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // Build src/mypkg/__init__.py  and  src/mypkg/types.py
+        let src = tmp.path().join("src");
+        let pkg = src.join("mypkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
+
+        // paths_to_mutate points directly at the package directory "src/mypkg"
+        generate_mutants(&pkg, mutants_tmp.path()).unwrap();
+
+        // Files must land under mutants/mypkg/, not directly in mutants/
+        let mutants_pkg = mutants_tmp.path().join("mypkg");
+        assert!(
+            mutants_pkg.join("__init__.py").exists(),
+            "mypkg/__init__.py must be in mutants/mypkg/, not mutants/"
+        );
+        assert!(
+            mutants_pkg.join("types.py").exists(),
+            "mypkg/types.py must be in mutants/mypkg/, not mutants/types.py"
+        );
+
+        // Verify that the incorrectly flattened paths do NOT exist
+        assert!(
+            !mutants_tmp.path().join("types.py").exists(),
+            "mutants/types.py must NOT exist — it would shadow stdlib types module"
+        );
+        assert!(
+            !mutants_tmp.path().join("__init__.py").exists(),
+            "mutants/__init__.py must NOT exist — package name must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_generate_mutants_source_root_preserves_package_name() {
+        // INV-2: When paths_to_mutate is a source root (no __init__.py), current
+        // behavior must be preserved — package name appears in mutants/.
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // Build src/simple_lib/__init__.py
+        let src = tmp.path().join("src");
+        let pkg = src.join("simple_lib");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
+
+        // paths_to_mutate points at the source root "src" (no __init__.py there)
+        generate_mutants(&src, mutants_tmp.path()).unwrap();
+
+        // Files must land under mutants/simple_lib/
+        assert!(
+            mutants_tmp.path().join("simple_lib").join("__init__.py").exists(),
+            "simple_lib/__init__.py must be in mutants/simple_lib/"
+        );
+    }
+
+    #[test]
+    fn test_generate_mutants_bare_package_dir_no_parent() {
+        // Edge case: paths_to_mutate is a bare package dir with no path prefix (e.g. "mylib").
+        // parent() returns "" — strip_prefix("") keeps the full path, which means
+        // the package name is preserved.
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // Simulate by using tmp path directly as the package (it IS a package — has __init__.py)
+        std::fs::write(tmp.path().join("__init__.py"), "").unwrap();
+        std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
+
+        // Should not panic even when parent() returns an empty component
+        let result = generate_mutants(tmp.path(), mutants_tmp.path());
+        assert!(result.is_ok(), "should not fail for package dirs with no parent prefix");
     }
 }
