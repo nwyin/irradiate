@@ -173,7 +173,7 @@ class MutationWorkerPlugin:
                     if self.use_legacy:
                         # Legacy path: re-invokes full pytest machinery each time.
                         # Enable with IRRADIATE_WORKER_LEGACY=1 to aid debugging.
-                        test_args = ["-x", "--no-header", "-q"] + test_ids
+                        test_args = ["-x", "--no-header", "-q", "-o", "pythonpath="] + test_ids
                         run_exit_code = pytest.main(test_args)
                     else:
                         # Fast path: run pre-collected items directly within this session.
@@ -234,7 +234,7 @@ def main():  # pragma: no mutate
 
     # Run pytest: collection happens, then our plugin intercepts the run loop
     # to process mutant assignments via IPC.
-    pytest.main([tests_dir], plugins=[plugin])
+    pytest.main([tests_dir, "-o", "pythonpath="], plugins=[plugin])
 
     sock.close()
 

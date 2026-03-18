@@ -63,6 +63,8 @@ pub fn collect_stats(
         .arg("-p")
         .arg("irradiate_harness.stats_plugin")
         .arg("-q")
+        .arg("-o")
+        .arg("pythonpath=")
         .arg(tests_dir)
         .env("PYTHONPATH", pythonpath)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)
