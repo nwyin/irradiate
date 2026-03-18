@@ -111,8 +111,12 @@ fn generate_wrapper_function(
         format!("{{{}}}", entries.join(", "))
     };
 
+    // Class method wrappers must look up the mangled orig/mutants via `type(self)` because
+    // class body names are NOT in scope for methods — they are class attributes, not locals/globals.
+    // Top-level functions use bare module-level names (no prefix needed).
+    let lookup_prefix = if self_arg == "self" { "type(self)." } else { "" };
     let trampoline_call = format!(
-        "_irradiate_trampoline({mangled_name}__irradiate_orig, {mangled_name}__irradiate_mutants, {args_list}, {kwargs_dict}, {self_arg})"
+        "_irradiate_trampoline({lookup_prefix}{mangled_name}__irradiate_orig, {lookup_prefix}{mangled_name}__irradiate_mutants, {args_list}, {kwargs_dict}, {self_arg})"
     );
 
     // Choose the correct dispatch based on function kind:
@@ -533,6 +537,66 @@ mod tests {
         assert!(
             output.wrapper_code.contains(", self)"),
             "Class method wrapper should pass self as self_arg; got: {}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-1: Class method wrapper must use `type(self).` prefix for mangled name lookups.
+    // Without this, Python raises NameError because class body names are NOT in scope
+    // for methods — they are class attributes, not locals or globals.
+    #[test]
+    fn test_class_method_wrapper_uses_type_self_lookup() {
+        let source = "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
+        let fms = collect_file_mutations(source);
+        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let output = generate_trampoline(class_fm, "point_module");
+        assert!(
+            output.wrapper_code.contains("type(self)."),
+            "Class method wrapper must use type(self). prefix for mangled lookups; got:\n{}",
+            output.wrapper_code
+        );
+        // Should NOT use bare mangled name (would NameError at runtime)
+        let mangled = mangle_name("__init__", Some("Point"));
+        let bare_orig = format!("{mangled}__irradiate_orig");
+        assert!(
+            !output.wrapper_code.contains(&format!("({bare_orig},")),
+            "Class method wrapper must NOT use bare mangled orig (would NameError); got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-2: Inheritance works — type(self) uses MRO so Child inheriting from Point
+    // uses Child's class dict first (which inherits Point's mangled attrs).
+    // This is verified by checking `type(self).` is used rather than `Point.` (hardcoded).
+    #[test]
+    fn test_class_method_wrapper_not_hardcoded_class_name() {
+        let source = "class MyClass:\n    def method(self, v):\n        return v + 1\n";
+        let fms = collect_file_mutations(source);
+        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let output = generate_trampoline(class_fm, "mod");
+        // type(self). is used — not the literal class name
+        assert!(
+            output.wrapper_code.contains("type(self)."),
+            "Class method wrapper must use type(self). not hardcoded class name; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("MyClass.x"),
+            "Class method wrapper must use type(self). not 'MyClass.x'; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-3: Top-level function wrapper still uses bare names (no type(self). prefix).
+    #[test]
+    fn test_top_level_wrapper_no_type_self_prefix() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let output = generate_trampoline(&fms[0], "my_lib");
+        assert!(
+            !output.wrapper_code.contains("type(self)."),
+            "Top-level wrapper must NOT use type(self). prefix; got:\n{}",
             output.wrapper_code
         );
     }
