@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench/compare.sh — Run irradiate vs mutmut benchmarks for a given target.
+# bench/compare.sh — Run irradiate benchmarks for a given target.
 #
 # Usage:
 #   bash bench/compare.sh <target_name> [--runs N]
@@ -11,6 +11,9 @@
 # Environment overrides:
 #   BENCH_RUNS=N    number of timed runs (default: 3)
 #
+# TODO: re-add mutmut comparison when upstream fixes v3 bugs
+#   (set_start_method crash #466, fork+setproctitle segfaults #446,
+#    trampoline codegen bugs #387/#480/#477)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,14 +60,9 @@ echo
 
 # ── Sanity checks ─────────────────────────────────────────────────────────
 IRRADIATE_BIN="$ROOT/target/release/irradiate"
-MUTMUT_BIN="$BENCH_DIR/.venv/bin/mutmut"
 
 if [ ! -x "$IRRADIATE_BIN" ]; then
     echo "Error: $IRRADIATE_BIN not found. Run: bash bench/setup.sh" >&2
-    exit 1
-fi
-if [ ! -x "$MUTMUT_BIN" ]; then
-    echo "Error: $MUTMUT_BIN not found. Run: bash bench/setup.sh" >&2
     exit 1
 fi
 
@@ -186,41 +184,12 @@ for i in $(seq 1 "$RUNS"); do
 done
 echo
 
-# ── Run mutmut (N children) ───────────────────────────────────────────────
-CONFIG="mutmut_${NCPU}c"
-echo "--- $CONFIG ---"
-warmup_run "$CONFIG" \
-    "$MUTMUT_BIN" run --max-children "$NCPU"
-
-for i in $(seq 1 "$RUNS"); do
-    (
-        cd "$PROJECT_DIR"
-        run_config "$CONFIG" "$i" \
-            "$BENCH_DIR/.venv/bin/python" -m mutmut run \
-                --max-children "$NCPU"
-    )
-done
-echo
-
-# ── Run mutmut (1 child) ──────────────────────────────────────────────────
-CONFIG="mutmut_1c"
-echo "--- $CONFIG ---"
-warmup_run "$CONFIG" \
-    "$MUTMUT_BIN" run --max-children 1
-
-for i in $(seq 1 "$RUNS"); do
-    (
-        cd "$PROJECT_DIR"
-        run_config "$CONFIG" "$i" \
-            "$BENCH_DIR/.venv/bin/python" -m mutmut run \
-                --max-children 1
-    )
-done
-echo
+# TODO: re-add mutmut comparison when upstream fixes v3 bugs
+# (mutmut_Nc and mutmut_1c configs removed — broken on macOS across all v3 releases)
 
 # ── Generate summary ──────────────────────────────────────────────────────
 echo "=== Generating summary ==="
-"$BENCH_DIR/.venv/bin/python" "$BENCH_DIR/summarize.py" \
+uv run --python 3.12 "$BENCH_DIR/summarize.py" \
     "$RESULT_DIR" \
     --target "$TARGET" \
     --ncpu "$NCPU" \

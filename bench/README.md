@@ -1,6 +1,10 @@
-# irradiate vs mutmut benchmarks
+# irradiate benchmarks
 
-Scripts to compare irradiate and mutmut on shared Python test targets.
+Scripts to benchmark irradiate on shared Python test targets.
+
+<!-- TODO: re-add mutmut comparison when upstream fixes v3 bugs
+     (set_start_method crash #466, fork+setproctitle segfaults #446,
+      trampoline codegen bugs #387/#480/#477) -->
 
 ## Setup
 
@@ -12,9 +16,9 @@ bash bench/setup.sh
 
 This will:
 1. Build `target/release/irradiate` (release mode)
-2. Create `bench/.venv` with mutmut and pytest installed
-3. Create `tests/fixtures/simple_project/.venv`
-4. Create `vendor/mutmut/e2e_projects/my_lib/.venv`
+2. Create `tests/fixtures/simple_project/.venv`
+3. Create `vendor/mutmut/e2e_projects/my_lib/.venv`
+4. Create `bench/targets/synth/.venv`
 
 ## Running benchmarks
 
@@ -49,22 +53,17 @@ Results are written to `bench/results/<timestamp>/<target>/`:
 | `irradiate pool (Nw)` | irradiate pool mode, all CPU cores |
 | `irradiate pool (1w)` | irradiate pool mode, single worker |
 | `irradiate isolate` | irradiate isolated subprocess mode |
-| `mutmut (Nc)` | mutmut, all CPU cores (`--max-children N`) |
-| `mutmut (1c)` | mutmut, single child process |
+
+<!-- TODO: re-add mutmut configs when upstream fixes v3 bugs -->
+<!-- | `mutmut (Nc)` | mutmut, all CPU cores (`--max-children N`) | -->
+<!-- | `mutmut (1c)` | mutmut, single child process | -->
 
 ## Methodology
 
-### Fairness considerations
+### Measurement considerations
 
-**Clean slate**: `mutants/` and `.irradiate/` are deleted before every run.
-mutmut skips mutants with existing results, so stale state would skew timings.
-
-**Same Python interpreter**: Both tools use the same venv Python for running tests.
-irradiate passes `--python $PYTHON`; mutmut uses the Python in `$PROJECT_DIR/.venv`
-(the working directory's venv).
-
-**Matched parallelism**: `--workers N` (irradiate) matches `--max-children N` (mutmut).
-Default `N` is `$(sysctl -n hw.ncpu)` (all logical cores).
+**Clean slate**: `mutants/` and `.irradiate/` are deleted before every run to avoid
+result-caching effects.
 
 **Warmup discarded**: One warmup run is performed before timed runs to warm OS disk
 caches and JIT state. It is not included in the reported metrics.
@@ -77,29 +76,19 @@ spread exceeds 50ms.
 
 ### What to compare
 
-**Per-mutant time** is the fairest comparison metric. Mutant counts differ between tools
-because irradiate and mutmut implement different mutation operators. A tool that generates
-more mutants will naturally take longer in absolute terms.
+**Per-mutant time** is the primary metric. irradiate's pool mode keeps worker processes
+alive across mutants, paying the startup cost once per worker rather than once per mutant.
+irradiate `--isolate` spawns fresh subprocesses per mutant (comparable to many other
+mutation testing tools).
 
-**Mutation score** (killed / (killed + survived)) should be similar if both tools have
-reasonable operator coverage, but may differ for the same reason.
-
-### Fork model difference
-
-mutmut uses `os.fork()` from a warmed Python process (copy-on-write). irradiate `--isolate`
-spawns fresh `python -m pytest` subprocesses. irradiate's pool mode is the real
-differentiator: it keeps worker processes alive across mutants, paying the startup cost
-once per worker rather than once per mutant.
-
-`irradiate --isolate` is the most apples-to-apples comparison with mutmut's single-child
-mode, since both spawn a fresh process per mutant.
+**Mutation score** (killed / (killed + survived)) reflects operator coverage.
 
 ## Re-running summarize.py
 
 If you want to regenerate the table from existing results without re-running the tools:
 
 ```bash
-bench/.venv/bin/python bench/summarize.py \
+uv run --python 3.12 bench/summarize.py \
     bench/results/<timestamp>/simple_project \
     --target simple_project \
     --ncpu 8 \
