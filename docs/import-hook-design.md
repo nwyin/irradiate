@@ -371,12 +371,46 @@ At this point, both the hook AND PYTHONPATH work. The hook takes priority. If an
 | Fragility | Adds another flag to track | Self-contained in one module |
 | Future path simplification | None | Can eventually drop PYTHONPATH entirely |
 
-## Open questions
+## Design decisions
 
-1. **Should the hook be opt-in or always-on?** Currently proposed: always-on when `IRRADIATE_MUTANTS_DIR` is set. Could add `IRRADIATE_USE_IMPORT_HOOK=0` escape hatch.
+1. **Always-on, no escape hatch.** The hook is always active when `IRRADIATE_MUTANTS_DIR` is set. No opt-out flag. If the hook has bugs, we fix them — shipping a broken fallback path just hides problems. Users who hit issues file bug reports and we fix the hook.
 
-2. **How to handle `conftest.py` files?** pytest discovers conftest.py by walking the filesystem. If a conftest.py exists in `mutants/`, pytest might find it there. Should the hook handle conftest.py, or should conftest.py be excluded from mutation?
+2. **Exclude `conftest.py` from the hook.** pytest discovers `conftest.py` by walking the filesystem, not through the import system. The hook should never intercept conftest imports. Additionally, the mutation pipeline should skip `conftest.py` files entirely — they contain test configuration and fixtures, not application logic worth mutating. The hook's exclusion list should include `conftest` as a module name.
 
-3. **What about `__pycache__` in `mutants/`?** Should we disable bytecode caching for mutated modules to avoid stale cache issues? `spec.cached = None` would do this per-module.
+3. **Disable bytecode caching for mutated modules.** Set `spec.cached = None` for all modules loaded by the hook. This avoids stale `.pyc` issues when `mutants/` is regenerated between runs. The performance impact is likely negligible (compilation is fast for the small files irradiate generates), but this should be benchmarked — see [GitHub issue #5](https://github.com/nwyin/irradiate/issues/5).
 
-4. **Should we support namespace packages from day one?** Current mutation pipeline skips packages without `__init__.py`. If we defer namespace package support, the hook can be simpler.
+4. **Support namespace packages from day one.** Implicit namespace packages (no `__init__.py`) are common in modern Python. The hook handles them by returning a spec with `submodule_search_locations=[]` (empty list) when a directory exists in `mutants/` but has no `__init__.py`. The mutation pipeline should also be updated to discover and process files in namespace packages.
+
+### Namespace package handling in the hook
+
+```python
+def _resolve(self, fullname):
+    parts = fullname.split(".")
+
+    # Try as module: mutants/foo/bar.py
+    module_path = self.mutants_dir.joinpath(*parts[:-1], parts[-1] + ".py")
+    if module_path.is_file():
+        return ("module", module_path)
+
+    # Try as package: mutants/foo/bar/__init__.py
+    package_dir = self.mutants_dir.joinpath(*parts)
+    init_path = package_dir / "__init__.py"
+    if init_path.is_file():
+        return ("package", init_path)
+
+    # Try as namespace package: mutants/foo/bar/ (directory, no __init__.py)
+    if package_dir.is_dir():
+        return ("namespace", package_dir)
+
+    return None
+```
+
+For namespace packages, the spec is:
+```python
+spec = ModuleSpec(
+    fullname,
+    loader=None,  # namespace packages have no loader
+    is_package=True,
+)
+spec.submodule_search_locations = [str(package_dir)]
+```
