@@ -6,6 +6,7 @@ use crate::orchestrator::{run_worker_pool, PoolConfig};
 use crate::protocol::{MutantResult, MutantStatus, WorkItem};
 use crate::stats;
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -347,8 +348,6 @@ fn generate_mutants(
     paths_to_mutate: &Path,
     mutants_dir: &Path,
 ) -> Result<HashMap<String, Vec<String>>> {
-    let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
-
     // Clean mutants dir
     if mutants_dir.exists() {
         std::fs::remove_dir_all(mutants_dir)?;
@@ -357,28 +356,44 @@ fn generate_mutants(
     // Walk the source directory for .py files
     let py_files = find_python_files(paths_to_mutate)?;
 
-    for py_file in &py_files {
-        let source = std::fs::read_to_string(py_file)?;
+    // Process files in parallel — each writes to a unique path, no conflicts.
+    // create_dir_all is safe to call concurrently (handles races internally).
+    type MutantEntry = Option<(String, Vec<String>)>;
+    let results: Vec<Result<MutantEntry>> = py_files
+        .par_iter()
+        .map(|py_file| -> Result<MutantEntry> {
+            let source = std::fs::read_to_string(py_file)?;
 
-        // Compute module name from file path relative to paths_to_mutate
-        // e.g., src/simple_lib/__init__.py with paths_to_mutate=src → simple_lib/__init__.py → simple_lib
-        let rel_path = py_file.strip_prefix(paths_to_mutate)?;
-        let module_name = path_to_module(rel_path);
+            // Compute module name from file path relative to paths_to_mutate
+            // e.g., src/simple_lib/__init__.py with paths_to_mutate=src → simple_lib/__init__.py → simple_lib
+            let rel_path = py_file.strip_prefix(paths_to_mutate)?;
+            let module_name = path_to_module(rel_path);
 
-        if let Some(mutated) = mutate_file(&source, &module_name) {
-            // Write mutated file
-            let dest = mutants_dir.join(rel_path);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(mutated) = mutate_file(&source, &module_name) {
+                // Write mutated file
+                let dest = mutants_dir.join(rel_path);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, &mutated.source)?;
+
+                // Write .meta stub
+                let meta_path = PathBuf::from(format!("{}.meta", dest.display()));
+                let meta = FileMeta::default();
+                std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
+                Ok(Some((module_name, mutated.mutant_names)))
+            } else {
+                Ok(None)
             }
-            std::fs::write(&dest, &mutated.source)?;
+        })
+        .collect();
 
-            // Write .meta stub
-            let meta_path = PathBuf::from(format!("{}.meta", dest.display()));
-            let meta = FileMeta::default();
-            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-
-            all_names.insert(module_name, mutated.mutant_names);
+    // Merge results into HashMap (sequential — avoids mutex on hot path)
+    let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+    for result in results {
+        if let Some((module, names)) = result? {
+            all_names.insert(module, names);
         }
     }
 
