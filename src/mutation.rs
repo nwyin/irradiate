@@ -1133,6 +1133,28 @@ mod tests {
             "Normal string mutation should produce XXhelloXX"
         );
     }
+
+    // INV-1: Applying string mutation to a delimiter-char string must produce parseable Python.
+    // Regression test for the markupsafe case: replace('"', "&#34;") where '"' is a
+    // single-quoted string whose content IS the double-quote delimiter character.
+    // Before the fix, the generated mutant '"XXXX" was an unterminated string → SyntaxError.
+    #[test]
+    fn test_string_mutation_delimiter_char_produces_parseable_python() {
+        // Mirrors markupsafe's _native.py: .replace('"', "&#34;")
+        let source = "def escape(s):\n    return s.replace('\"', '&#34;')\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.first().expect("should collect mutations from escape()");
+        for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+            let mutated_func = apply_mutation(&fm.source, m);
+            assert!(
+                parse_module(&mutated_func, None).is_ok(),
+                "Mutating '{}' → '{}' produced unparseable Python:\n{}",
+                m.original,
+                m.replacement,
+                mutated_func
+            );
+        }
+    }
 }
 
 #[cfg(test)]
