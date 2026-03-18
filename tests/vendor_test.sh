@@ -14,9 +14,20 @@ BINARY="$ROOT_DIR/target/debug/irradiate"
 VENDOR_DIR="$SCRIPT_DIR/vendor_repos"
 RESULTS_DIR="$VENDOR_DIR/_results"
 
-# Track results per repo
-declare -A REPO_STATUS
-declare -A REPO_DETAIL
+# Track results per repo (parallel arrays — bash 3 compatible)
+REPOS=(click more-itertools httpx)
+STATUS_click="SKIP"
+STATUS_more_itertools="SKIP"
+STATUS_httpx="SKIP"
+DETAIL_click=""
+DETAIL_more_itertools=""
+DETAIL_httpx=""
+
+# Helpers to set/get status using indirect variable references (bash 3 safe)
+set_status() { local key="STATUS_${1//-/_}"; eval "$key=\$2"; }
+get_status() { local key="STATUS_${1//-/_}"; echo "${!key}"; }
+set_detail() { local key="DETAIL_${1//-/_}"; eval "$key=\$2"; }
+get_detail() { local key="DETAIL_${1//-/_}"; echo "${!key}"; }
 
 mkdir -p "$RESULTS_DIR"
 
@@ -60,6 +71,21 @@ setup_venv() {
     fi
 }
 
+# run_with_timeout <seconds> <command...>
+# Portable timeout: uses gtimeout (Homebrew) or timeout (Linux), falls back to no timeout.
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v gtimeout &>/dev/null; then
+        gtimeout "$secs" "$@"
+    elif command -v timeout &>/dev/null; then
+        timeout "$secs" "$@"
+    else
+        # No timeout available — run directly
+        "$@"
+    fi
+}
+
 # run_irradiate <name> <paths_to_mutate> <tests_dir>
 # Runs irradiate with a 10-minute timeout.
 # Returns 0 if irradiate ran without crashing/hanging, 1 otherwise.
@@ -77,13 +103,13 @@ run_irradiate() {
     log "$name: log -> $log_file"
 
     local exit_code=0
-    timeout 600 "$BINARY" run \
+    (cd "$repo_dir" && run_with_timeout 600 "$BINARY" run \
         --paths-to-mutate "$paths_to_mutate" \
         --tests-dir "$tests_dir" \
         --python "$repo_dir/.venv/bin/python3" \
         --workers 2 \
         --timeout-multiplier 5 \
-        --no-stats \
+        --no-stats) \
         2>&1 | tee "$log_file" || exit_code=$?
 
     return $exit_code
@@ -154,110 +180,56 @@ fi
 log "Build OK"
 
 # ---------------------------------------------------------------------------
-# Repo: click
+# Run each repo
 # ---------------------------------------------------------------------------
 
-REPO="click"
-log "=== $REPO ==="
-{
-    clone_repo "$REPO" "https://github.com/pallets/click.git"
-    setup_venv "$REPO" 'uv pip install -e ".[testing]" 2>&1'
+test_repo() {
+    local repo="$1"
+    local url="$2"
+    local install_cmd="$3"
+    local paths_to_mutate="$4"
+    local tests_dir="$5"
 
-    if run_irradiate "$REPO" "src/click" "tests"; then
-        REPO_STATUS["$REPO"]="PASS"
+    log "=== $repo ==="
+
+    clone_repo "$repo" "$url"
+    setup_venv "$repo" "$install_cmd"
+
+    local exit_code=0
+    run_irradiate "$repo" "$paths_to_mutate" "$tests_dir" || exit_code=$?
+
+    if [ "$exit_code" -eq 0 ]; then
+        set_status "$repo" "PASS"
+        set_detail "$repo" "$(parse_summary "$repo")"
+    elif [ "$exit_code" -eq 124 ]; then
+        set_status "$repo" "FAIL"
+        set_detail "$repo" "timeout after 600s — see log"
     else
-        local_exit=$?
-        if [ "$local_exit" -eq 124 ]; then
-            REPO_STATUS["$REPO"]="FAIL"
-            REPO_DETAIL["$REPO"]="timeout after 600s — see log"
+        local log_file="$RESULTS_DIR/${repo}.log"
+        if grep -q -i "panic\|thread '.*' panicked" "$log_file" 2>/dev/null; then
+            set_status "$repo" "FAIL"
+            set_detail "$repo" "PANIC — see log"
         else
-            # Non-zero exit from irradiate is not necessarily a crash —
-            # check for panics in log to distinguish crash from "no tests" etc.
-            log_file="$RESULTS_DIR/${REPO}.log"
-            if grep -q -i "panic\|thread '.*' panicked" "$log_file" 2>/dev/null; then
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="PANIC — see log"
-            else
-                # Non-zero but no panic: treat as informational failure
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="irradiate exited $local_exit — see log"
-            fi
+            set_status "$repo" "FAIL"
+            set_detail "$repo" "irradiate exited $exit_code — see log"
         fi
     fi
-} 2>&1 | tee -a "$RESULTS_DIR/${REPO}.log" || true
+}
 
-# If PASS, enrich with parsed detail
-if [ "${REPO_STATUS[$REPO]:-}" = "PASS" ]; then
-    REPO_DETAIL["$REPO"]="$(parse_summary "$REPO")"
-fi
+test_repo "click" \
+    "https://github.com/pallets/click.git" \
+    'uv pip install -e ".[testing]" 2>&1' \
+    "src/click" "tests"
 
-# ---------------------------------------------------------------------------
-# Repo: more-itertools
-# ---------------------------------------------------------------------------
+test_repo "more-itertools" \
+    "https://github.com/more-itertools/more-itertools.git" \
+    'uv pip install -e "." pytest 2>&1' \
+    "more_itertools" "tests"
 
-REPO="more-itertools"
-log "=== $REPO ==="
-{
-    clone_repo "$REPO" "https://github.com/more-itertools/more-itertools.git"
-    setup_venv "$REPO" 'uv pip install -e "." pytest 2>&1'
-
-    if run_irradiate "$REPO" "more_itertools" "tests"; then
-        REPO_STATUS["$REPO"]="PASS"
-    else
-        local_exit=$?
-        if [ "$local_exit" -eq 124 ]; then
-            REPO_STATUS["$REPO"]="FAIL"
-            REPO_DETAIL["$REPO"]="timeout after 600s — see log"
-        else
-            log_file="$RESULTS_DIR/${REPO}.log"
-            if grep -q -i "panic\|thread '.*' panicked" "$log_file" 2>/dev/null; then
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="PANIC — see log"
-            else
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="irradiate exited $local_exit — see log"
-            fi
-        fi
-    fi
-} 2>&1 | tee -a "$RESULTS_DIR/${REPO}.log" || true
-
-if [ "${REPO_STATUS[$REPO]:-}" = "PASS" ]; then
-    REPO_DETAIL["$REPO"]="$(parse_summary "$REPO")"
-fi
-
-# ---------------------------------------------------------------------------
-# Repo: httpx
-# ---------------------------------------------------------------------------
-
-REPO="httpx"
-log "=== $REPO ==="
-{
-    clone_repo "$REPO" "https://github.com/encode/httpx.git"
-    setup_venv "$REPO" 'uv pip install -e "." pytest respx trustme anyio trio 2>&1'
-
-    if run_irradiate "$REPO" "httpx" "tests"; then
-        REPO_STATUS["$REPO"]="PASS"
-    else
-        local_exit=$?
-        if [ "$local_exit" -eq 124 ]; then
-            REPO_STATUS["$REPO"]="FAIL"
-            REPO_DETAIL["$REPO"]="timeout after 600s — see log"
-        else
-            log_file="$RESULTS_DIR/${REPO}.log"
-            if grep -q -i "panic\|thread '.*' panicked" "$log_file" 2>/dev/null; then
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="PANIC — see log"
-            else
-                REPO_STATUS["$REPO"]="FAIL"
-                REPO_DETAIL["$REPO"]="irradiate exited $local_exit — see log"
-            fi
-        fi
-    fi
-} 2>&1 | tee -a "$RESULTS_DIR/${REPO}.log" || true
-
-if [ "${REPO_STATUS[$REPO]:-}" = "PASS" ]; then
-    REPO_DETAIL["$REPO"]="$(parse_summary "$REPO")"
-fi
+test_repo "httpx" \
+    "https://github.com/encode/httpx.git" \
+    'uv pip install -e "." pytest respx trustme anyio trio 2>&1' \
+    "httpx" "tests"
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -265,9 +237,9 @@ fi
 
 echo ""
 echo "=== Vendor Test Summary ==="
-for repo in click more-itertools httpx; do
-    status="${REPO_STATUS[$repo]:-SKIP}"
-    detail="${REPO_DETAIL[$repo]:-}"
+for repo in "${REPOS[@]}"; do
+    status="$(get_status "$repo")"
+    detail="$(get_detail "$repo")"
     if [ -n "$detail" ]; then
         printf "%-20s %s (%s)\n" "${repo}:" "$status" "$detail"
     else
