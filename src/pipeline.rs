@@ -84,7 +84,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Build PYTHONPATH once — all subprocess invocations use this same string
     // so that import resolution is identical everywhere (INV-1, INV-2).
-    let pythonpath = build_pythonpath(&harness_dir, &mutants_dir, &config.paths_to_mutate);
+    // mutants_dir is handled by the MutantFinder import hook, not PYTHONPATH.
+    let pythonpath = build_pythonpath(&harness_dir, &config.paths_to_mutate);
 
     // Phase 2: Stats collection
     let test_stats = if config.no_stats {
@@ -92,19 +93,25 @@ pub async fn run(config: RunConfig) -> Result<()> {
     } else {
         eprintln!("Running stats...");
         let start = Instant::now();
-        let s = stats::collect_stats(&config.python, &project_dir, &pythonpath, &config.tests_dir)
-            .context("Stats collection failed")?;
+        let s = stats::collect_stats(
+            &config.python,
+            &project_dir,
+            &pythonpath,
+            &mutants_dir,
+            &config.tests_dir,
+        )
+        .context("Stats collection failed")?;
         eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
         Some(s)
     };
 
     // Phase 3: Validation
     eprintln!("Running clean tests...");
-    validate_clean_run(&config.python, &project_dir, &pythonpath, &config.tests_dir)?;
+    validate_clean_run(&config.python, &project_dir, &pythonpath, &mutants_dir, &config.tests_dir)?;
     eprintln!("  done");
 
     eprintln!("Running forced-fail validation...");
-    validate_fail_run(&config.python, &project_dir, &pythonpath, &config.tests_dir)?;
+    validate_fail_run(&config.python, &project_dir, &pythonpath, &mutants_dir, &config.tests_dir)?;
     eprintln!("  done");
 
     // Phase 4: Mutation testing
@@ -152,8 +159,13 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // For no-stats mode, we need all test IDs — collect them from a dummy pytest run
     let work_items = if config.no_stats {
         // Use all tests discovered by the worker
-        let all_tests =
-            discover_tests(&config.python, &project_dir, &pythonpath, &config.tests_dir)?;
+        let all_tests = discover_tests(
+            &config.python,
+            &project_dir,
+            &pythonpath,
+            &mutants_dir,
+            &config.tests_dir,
+        )?;
         work_items
             .into_iter()
             .map(|mut item| {
@@ -356,7 +368,7 @@ async fn run_isolated(
 ) -> Result<Vec<MutantResult>> {
     let mut results = Vec::new();
     let project_dir = std::env::current_dir()?;
-    let pythonpath = build_pythonpath(harness_dir, mutants_dir, &config.paths_to_mutate);
+    let pythonpath = build_pythonpath(harness_dir, &config.paths_to_mutate);
 
     for item in work_items {
         let start = Instant::now();
@@ -382,10 +394,11 @@ async fn run_isolated(
             .arg("-x")
             .arg("-q")
             .arg("--no-header")
-            .arg("-o")
-            .arg("pythonpath=")
+            .arg("-p")
+            .arg("irradiate_harness")
             .args(&item.test_ids)
             .env("PYTHONPATH", &pythonpath)
+            .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
             .env("IRRADIATE_ACTIVE_MUTANT", &item.mutant_name)
             .current_dir(&project_dir)
             .stdin(std::process::Stdio::null())
@@ -420,27 +433,26 @@ async fn run_isolated(
 
 /// Construct the PYTHONPATH for all Python subprocesses in the pipeline.
 ///
-/// Order: `harness_dir:mutants_dir:source_parent`
+/// Order: `harness_dir:source_parent`
 ///
 /// `source_parent` is the parent of `paths_to_mutate`, so sibling module
 /// imports in the source tree resolve correctly. For example, if
 /// `paths_to_mutate` is `src/mylib`, the parent `src` is added, allowing
 /// `import mylib` to find the real (unmutated) sibling packages.
 ///
+/// `mutants_dir` is no longer on PYTHONPATH — the MutantFinder import hook
+/// (installed via IRRADIATE_MUTANTS_DIR) handles mutant module resolution
+/// before sys.path is consulted.
+///
 /// If `paths_to_mutate` has no parent (is filesystem root), it falls back to
 /// itself.
 ///
-/// All five subprocess invocations (validate_clean_run, validate_fail_run,
-/// discover_tests, collect_stats, spawn_worker) must use this function so
-/// that PYTHONPATH is constructed identically everywhere.
-pub fn build_pythonpath(harness_dir: &Path, mutants_dir: &Path, paths_to_mutate: &Path) -> String {
+/// All six subprocess invocations (validate_clean_run, validate_fail_run,
+/// discover_tests, collect_stats, spawn_worker, run_isolated) must use this
+/// function so that PYTHONPATH is constructed identically everywhere.
+pub fn build_pythonpath(harness_dir: &Path, paths_to_mutate: &Path) -> String {
     let source_parent = paths_to_mutate.parent().unwrap_or(paths_to_mutate);
-    format!(
-        "{}:{}:{}",
-        harness_dir.display(),
-        mutants_dir.display(),
-        source_parent.display()
-    )
+    format!("{}:{}", harness_dir.display(), source_parent.display())
 }
 
 fn generate_mutants(
@@ -574,6 +586,7 @@ fn validate_clean_run(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
+    mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<()> {
     let output = std::process::Command::new(python)
@@ -581,10 +594,11 @@ fn validate_clean_run(
         .arg("pytest")
         .arg("-x")
         .arg("-q")
-        .arg("-o")
-        .arg("pythonpath=")
+        .arg("-p")
+        .arg("irradiate_harness")
         .arg(tests_dir)
         .env("PYTHONPATH", pythonpath)
+        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .current_dir(project_dir)
         .output()
         .context("Failed to run clean test")?;
@@ -602,6 +616,7 @@ fn validate_fail_run(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
+    mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<()> {
     let output = std::process::Command::new(python)
@@ -609,10 +624,11 @@ fn validate_fail_run(
         .arg("pytest")
         .arg("-x")
         .arg("-q")
-        .arg("-o")
-        .arg("pythonpath=")
+        .arg("-p")
+        .arg("irradiate_harness")
         .arg(tests_dir)
         .env("PYTHONPATH", pythonpath)
+        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_ACTIVE_MUTANT", "fail")
         .current_dir(project_dir)
         .output()
@@ -632,6 +648,7 @@ fn discover_tests(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
+    mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<Vec<String>> {
     let output = std::process::Command::new(python)
@@ -639,10 +656,11 @@ fn discover_tests(
         .arg("pytest")
         .arg("--collect-only")
         .arg("-q")
-        .arg("-o")
-        .arg("pythonpath=")
+        .arg("-p")
+        .arg("irradiate_harness")
         .arg(tests_dir)
         .env("PYTHONPATH", pythonpath)
+        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .current_dir(project_dir)
         .output()
         .context("Failed to collect tests")?;
@@ -841,21 +859,18 @@ mod tests {
 
     #[test]
     fn test_build_pythonpath_includes_source_parent() {
+        // INV-1: PYTHONPATH must be harness_dir:source_parent (2 components).
+        // mutants_dir is NOT on PYTHONPATH — the MutantFinder import hook handles it.
         // If paths_to_mutate is "src/mylib", the parent "src" must be on the path
         // so that `import mylib` (and sibling packages) can be resolved.
         let harness = Path::new("/tmp/harness");
-        let mutants = Path::new("/tmp/mutants");
         let paths_to_mutate = Path::new("src/mylib");
 
-        let result = build_pythonpath(harness, mutants, paths_to_mutate);
+        let result = build_pythonpath(harness, paths_to_mutate);
 
         assert!(
             result.contains("/tmp/harness"),
             "harness dir must be in PYTHONPATH"
-        );
-        assert!(
-            result.contains("/tmp/mutants"),
-            "mutants dir must be in PYTHONPATH"
         );
         assert!(
             result.contains("src"),
@@ -866,23 +881,25 @@ mod tests {
             !result.contains("src/mylib"),
             "paths_to_mutate itself must not appear — only its parent"
         );
+        // mutants_dir must NOT be in PYTHONPATH — hook handles it
+        let parts: Vec<&str> = result.split(':').collect();
+        assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
     }
 
     #[test]
     fn test_build_pythonpath_order() {
-        // harness_dir must come first so harness overrides everything,
-        // then mutants_dir so mutated code shadows the originals,
+        // harness_dir must come first (hook install before test collection),
         // then source_parent for untouched siblings.
+        // mutants_dir is handled by MutantFinder hook, NOT in PYTHONPATH.
         let harness = Path::new("/h");
-        let mutants = Path::new("/m");
         let paths_to_mutate = Path::new("src/lib");
 
-        let result = build_pythonpath(harness, mutants, paths_to_mutate);
+        let result = build_pythonpath(harness, paths_to_mutate);
         let parts: Vec<&str> = result.split(':').collect();
 
+        assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
         assert_eq!(parts[0], "/h", "harness must be first");
-        assert_eq!(parts[1], "/m", "mutants must be second");
-        assert_eq!(parts[2], "src", "source parent must be third");
+        assert_eq!(parts[1], "src", "source parent must be second");
     }
 
     #[test]
@@ -890,29 +907,42 @@ mod tests {
         // If paths_to_mutate has no parent (e.g. a bare filename with no dir component),
         // it falls back to itself rather than panicking.
         let harness = Path::new("/h");
-        let mutants = Path::new("/m");
         // A bare path like "mylib" has no meaningful parent — parent() returns ""
         let paths_to_mutate = Path::new("mylib");
 
         // Should not panic
-        let result = build_pythonpath(harness, mutants, paths_to_mutate);
+        let result = build_pythonpath(harness, paths_to_mutate);
         assert!(!result.is_empty());
         let parts: Vec<&str> = result.split(':').collect();
-        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
     }
 
     #[test]
-    fn test_build_pythonpath_all_five_sites_identical() {
-        // INV-1: All five subprocess invocations must produce the same string
+    fn test_build_pythonpath_all_six_sites_identical() {
+        // INV-1: All six subprocess invocations must produce the same string
         // given the same inputs. This test encodes that invariant by calling
         // build_pythonpath multiple times and asserting equality.
         let harness = Path::new("/tmp/h");
-        let mutants = Path::new("/tmp/m");
         let src = Path::new("project/src");
 
-        let a = build_pythonpath(harness, mutants, src);
-        let b = build_pythonpath(harness, mutants, src);
+        let a = build_pythonpath(harness, src);
+        let b = build_pythonpath(harness, src);
         assert_eq!(a, b, "build_pythonpath must be deterministic");
+    }
+
+    #[test]
+    fn test_build_pythonpath_no_mutants_dir() {
+        // mutants_dir must NOT appear in PYTHONPATH — it is passed as
+        // IRRADIATE_MUTANTS_DIR env var to activate the MutantFinder hook.
+        let harness = Path::new("/tmp/harness");
+        let paths_to_mutate = Path::new("src/mylib");
+        let mutants_dir_str = "/tmp/mutants";
+
+        let result = build_pythonpath(harness, paths_to_mutate);
+        assert!(
+            !result.contains(mutants_dir_str),
+            "mutants_dir must not be in PYTHONPATH — hook handles it"
+        );
     }
 
     // --- path_to_module tests ---

@@ -295,8 +295,8 @@ async fn test_stats_collection() {
     let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
 
     let mutants_dir = _tmp.path().to_path_buf();
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &mutants_dir, &fixture.join("src"));
-    let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, "tests")
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &fixture.join("src"));
+    let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, &mutants_dir, "tests")
         .expect("Stats collection should succeed");
 
     println!("tests_by_function: {:?}", test_stats.tests_by_function);

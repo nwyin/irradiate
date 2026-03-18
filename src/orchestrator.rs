@@ -30,8 +30,8 @@ pub struct PoolConfig {
     /// Default timeout if no baseline duration is known.
     pub default_timeout: Duration,
     /// Pre-built PYTHONPATH string for worker subprocesses.
-    /// Must include harness_dir, mutants_dir, and the project source parent so
-    /// sibling module imports in mutated code resolve correctly.
+    /// Format: harness_dir:source_parent. mutants_dir is passed as
+    /// IRRADIATE_MUTANTS_DIR env var and handled by the MutantFinder import hook.
     pub pythonpath: String,
     /// Respawn workers after this many mutants to prevent pytest state accumulation.
     /// Set to 0 to disable recycling.

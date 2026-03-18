@@ -210,17 +210,14 @@ class MutationWorkerPlugin:
 
 def main():  # pragma: no mutate
     socket_path = os.environ["IRRADIATE_SOCKET"]
-    mutants_dir = os.environ.get("IRRADIATE_MUTANTS_DIR", "mutants")
     tests_dir = os.environ.get("IRRADIATE_TESTS_DIR", "tests")
     use_legacy = os.environ.get("IRRADIATE_WORKER_LEGACY", "").strip() == "1"
 
-    # Defensively add mutants_dir to sys.path so mutated modules can be
-    # imported even if PYTHONPATH was not set by the caller. In normal
-    # operation the orchestrator sets PYTHONPATH (via pipeline::build_pythonpath)
-    # which already includes mutants_dir, so this is a no-op guard against
-    # misconfigured invocations (e.g. running worker.py by hand).
-    if mutants_dir not in sys.path:
-        sys.path.insert(0, os.path.abspath(mutants_dir))
+    # Import irradiate_harness BEFORE pytest to install the MutantFinder import
+    # hook. The hook intercepts imports of mutated modules from mutants/; it
+    # must be active before pytest imports test files (which import source under
+    # test) during collection.
+    import irradiate_harness as _irradiate_harness  # noqa: F401
 
     import pytest
 
@@ -234,7 +231,9 @@ def main():  # pragma: no mutate
 
     # Run pytest: collection happens, then our plugin intercepts the run loop
     # to process mutant assignments via IPC.
-    pytest.main([tests_dir, "-o", "pythonpath="], plugins=[plugin])
+    # The import hook (installed via irradiate_harness.__init__) handles mutant
+    # module resolution — no sys.path manipulation needed.
+    pytest.main([tests_dir], plugins=[plugin])
 
     sock.close()
 

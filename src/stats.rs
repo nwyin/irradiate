@@ -45,10 +45,14 @@ impl TestStats {
 ///
 /// `pythonpath` must be pre-built by the caller using `pipeline::build_pythonpath`
 /// so that all subprocess invocations use identical PYTHONPATH construction logic.
+///
+/// `mutants_dir` is passed as `IRRADIATE_MUTANTS_DIR` so the MutantFinder import
+/// hook activates and loads trampolined modules from mutants/ instead of PYTHONPATH.
 pub fn collect_stats(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
+    mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
@@ -61,12 +65,13 @@ pub fn collect_stats(
         .arg("pytest")
         .arg("--irradiate-stats")
         .arg("-p")
+        .arg("irradiate_harness")
+        .arg("-p")
         .arg("irradiate_harness.stats_plugin")
         .arg("-q")
-        .arg("-o")
-        .arg("pythonpath=")
         .arg(tests_dir)
         .env("PYTHONPATH", pythonpath)
+        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)
         .current_dir(project_dir)
         .output()
