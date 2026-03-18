@@ -77,6 +77,13 @@ class ConfigSummary:
         total = k + s
         return (k / total * 100) if total > 0 else None
 
+    def ms_per_mutant(self) -> float | None:
+        wall = self.median_wall()
+        mutants = self.consensus_mutants()
+        if wall is None or mutants is None or mutants == 0:
+            return None
+        return wall * 1000 / mutants
+
 
 # ── Parsers ───────────────────────────────────────────────────────────────
 
@@ -306,8 +313,8 @@ def build_markdown_table(
         "",
         f"CPUs: {ncpu}  |  Runs per config: {runs} (plus 1 warmup discarded)",
         "",
-        "| Configuration | Median Wall (s) | Mutants | Killed | Survived | Score | Mut/s | Peak RSS (MB) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Configuration | Median Wall (s) | Mutants | Killed | Survived | Score | ms/mutant | Mut/s | Peak RSS (MB) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
 
     for s in summaries:
@@ -317,9 +324,10 @@ def build_markdown_table(
         killed = fmt_int(s.consensus_killed())
         survived = fmt_int(s.consensus_survived())
         score = fmt_score(s.mutation_score())
+        ms_per_mut = f"{s.ms_per_mutant():.1f}" if s.ms_per_mutant() is not None else "—"
         mps = fmt_mps(s.median_mps())
         rss = fmt_rss(s.median_rss())
-        lines.append(f"| {label} | {wall} | {mutants} | {killed} | {survived} | {score} | {mps} | {rss} |")
+        lines.append(f"| {label} | {wall} | {mutants} | {killed} | {survived} | {score} | {ms_per_mut} | {mps} | {rss} |")
 
     lines += [
         "",
@@ -357,6 +365,7 @@ def build_raw_data(
                 "killed": s.consensus_killed(),
                 "survived": s.consensus_survived(),
                 "mutation_score_pct": s.mutation_score(),
+                "ms_per_mutant": s.ms_per_mutant(),
                 "median_mps": s.median_mps(),
                 "runs": [asdict(r) for r in s.runs],
             }

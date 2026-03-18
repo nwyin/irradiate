@@ -40,6 +40,7 @@ Results are written to `bench/results/<timestamp>/<target>/`:
 |---|---|---|
 | `simple_project` | `tests/fixtures/simple_project/` | Minimal irradiate fixture (3 functions, 3 tests) |
 | `my_lib` | `vendor/mutmut/e2e_projects/my_lib/` | mutmut's own e2e fixture |
+| `synth` | `bench/targets/synth/` | Synthetic utility library (~150 mutants) designed to show pool worker advantage |
 
 ## Configurations tested
 

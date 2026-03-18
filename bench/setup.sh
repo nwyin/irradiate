@@ -11,13 +11,13 @@ echo "Project root: $ROOT"
 echo
 
 # ── 1. Build irradiate release binary ─────────────────────────────────────
-echo "[1/6] Building irradiate (release)..."
+echo "[1/7] Building irradiate (release)..."
 cargo build --release
 echo "      binary: target/release/irradiate"
 echo
 
 # ── 2. Bench venv with mutmut installed ───────────────────────────────────
-echo "[2/6] Setting up bench/.venv with mutmut..."
+echo "[2/7] Setting up bench/.venv with mutmut..."
 uv venv bench/.venv --python python3.12 --seed
 uv pip install --python bench/.venv/bin/python \
     -e vendor/mutmut \
@@ -27,7 +27,7 @@ echo "      mutmut: $(bench/.venv/bin/mutmut version 2>/dev/null || echo 'instal
 echo
 
 # ── 3. simple_project venv ────────────────────────────────────────────────
-echo "[3/6] Setting up tests/fixtures/simple_project/.venv..."
+echo "[3/7] Setting up tests/fixtures/simple_project/.venv..."
 cd tests/fixtures/simple_project
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -37,7 +37,7 @@ cd "$ROOT"
 echo
 
 # ── 4. my_lib venv ────────────────────────────────────────────────────────
-echo "[4/6] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
+echo "[4/7] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
 cd vendor/mutmut/e2e_projects/my_lib
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -47,13 +47,24 @@ uv pip install --python .venv/bin/python -e .
 cd "$ROOT"
 echo
 
-# ── 5. Bootstrap vendor corpora ───────────────────────────────────────────
-echo "[5/6] Bootstrapping vendor corpora (bench/corpora/)..."
+# ── 5. synth venv ─────────────────────────────────────────────────────────
+echo "[5/7] Setting up bench/targets/synth/.venv..."
+cd bench/targets/synth
+if [ ! -d .venv ]; then
+    uv venv --python python3.12 --seed
+fi
+uv pip install --python .venv/bin/python pytest hatchling
+uv pip install --python .venv/bin/python -e .
+cd "$ROOT"
+echo
+
+# ── 6. Bootstrap vendor corpora ───────────────────────────────────────────
+echo "[6/7] Bootstrapping vendor corpora (bench/corpora/)..."
 bash "$ROOT/scripts/bootstrap-vendors.sh"
 echo
 
-# ── 6. Set up venvs for vendor corpora ────────────────────────────────────
-echo "[6/6] Setting up venvs for vendor corpora..."
+# ── 7. Set up venvs for vendor corpora ────────────────────────────────────
+echo "[7/7] Setting up venvs for vendor corpora..."
 
 setup_vendor_venv() {
     local name="$1"
@@ -82,4 +93,5 @@ echo
 echo "=== Setup complete ==="
 echo "Run benchmarks with: bash bench/compare.sh simple_project"
 echo "                 or: bash bench/compare.sh my_lib"
+echo "                 or: bash bench/compare.sh synth"
 echo "Run vendor smoke tests with: bash tests/vendor_test.sh"
