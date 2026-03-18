@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 const HARNESS_INIT: &str = include_str!("../harness/__init__.py");
 const HARNESS_WORKER: &str = include_str!("../harness/worker.py");
 const HARNESS_STATS_PLUGIN: &str = include_str!("../harness/stats_plugin.py");
+const HARNESS_IMPORT_HOOK: &str = include_str!("../harness/import_hook.py");
 
 /// Extract the embedded Python harness files to the given directory.
 /// Returns the path to the harness directory.
@@ -21,6 +22,8 @@ pub fn extract_harness(base_dir: &Path) -> Result<PathBuf> {
         .context("Failed to write worker.py")?;
     fs::write(pkg_dir.join("stats_plugin.py"), HARNESS_STATS_PLUGIN)
         .context("Failed to write stats_plugin.py")?;
+    fs::write(pkg_dir.join("import_hook.py"), HARNESS_IMPORT_HOOK)
+        .context("Failed to write import_hook.py")?;
 
     Ok(harness_dir)
 }
@@ -51,6 +54,10 @@ mod tests {
         assert!(harness_dir
             .join("irradiate_harness")
             .join("stats_plugin.py")
+            .exists());
+        assert!(harness_dir
+            .join("irradiate_harness")
+            .join("import_hook.py")
             .exists());
 
         // Verify content

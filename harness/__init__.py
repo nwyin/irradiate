@@ -1,7 +1,17 @@
 # irradiate harness — imported as irradiate_harness in mutated Python files
 import os
+import sys
 
 active_mutant = os.environ.get("IRRADIATE_ACTIVE_MUTANT")
+
+_mutants_dir = os.environ.get("IRRADIATE_MUTANTS_DIR")
+if _mutants_dir:
+    import importlib
+
+    from irradiate_harness.import_hook import MutantFinder
+
+    sys.meta_path.insert(0, MutantFinder(_mutants_dir))
+    importlib.invalidate_caches()
 
 
 class ProgrammaticFailException(Exception):
