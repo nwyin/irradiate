@@ -16,6 +16,9 @@ venv/
 tests/fixtures/simple_project/mutants/
 tests/fixtures/simple_project/.irradiate/
 
+# Vendor smoke test repos and results (downloaded at runtime)
+tests/vendor_repos/
+
 # Vendor (reference only, cloned separately)
 /vendor/
 
