@@ -58,7 +58,11 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         }
         // Handle module-level docstrings (single-line or multi-line).
         if t.starts_with("\"\"\"") || t.starts_with("'''") {
-            let quote = if t.starts_with("\"\"\"") { "\"\"\"" } else { "'''" };
+            let quote = if t.starts_with("\"\"\"") {
+                "\"\"\""
+            } else {
+                "'''"
+            };
             let rest = &t[quote.len()..];
             if rest.contains(quote) {
                 // Single-line docstring: opens and closes on the same line.
@@ -224,7 +228,11 @@ fn find_trampoline_idx(
 fn extract_class_name(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("class ")?;
     let name = rest.split(['(', ':']).next()?.trim();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 fn extract_func_name(line: &str) -> &str {
@@ -456,7 +464,10 @@ class Finder:
             })
             .expect("wrapper def add( should exist");
         let indent = wrapper_line.len() - wrapper_line.trim_start().len();
-        assert_eq!(indent, 0, "top-level wrapper must be at indent 0, got: {wrapper_line:?}");
+        assert_eq!(
+            indent, 0,
+            "top-level wrapper must be at indent 0, got: {wrapper_line:?}"
+        );
     }
 
     #[test]
@@ -475,10 +486,16 @@ class Calc:
         let orig_line = result
             .source
             .lines()
-            .find(|l| l.trim_start().starts_with("def xǁCalcǁadd__irradiate_orig("))
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("def xǁCalcǁadd__irradiate_orig(")
+            })
             .expect("mangled orig def should exist");
         let indent = orig_line.len() - orig_line.trim_start().len();
-        assert!(indent > 0, "mangled orig must be indented (inside class body), got: {orig_line:?}");
+        assert!(
+            indent > 0,
+            "mangled orig must be indented (inside class body), got: {orig_line:?}"
+        );
 
         // Also verify the lookup dict is indented inside the class body
         let dict_line = result
@@ -487,7 +504,10 @@ class Calc:
             .find(|l| l.trim_start().starts_with("xǁCalcǁadd__irradiate_mutants"))
             .expect("mangled mutants dict should exist");
         let dict_indent = dict_line.len() - dict_line.trim_start().len();
-        assert!(dict_indent > 0, "mangled mutants dict must be indented (inside class body), got: {dict_line:?}");
+        assert!(
+            dict_indent > 0,
+            "mangled mutants dict must be indented (inside class body), got: {dict_line:?}"
+        );
     }
 
     #[test]
@@ -502,7 +522,10 @@ class Calc:
             .find(|l| l.starts_with("def x_add__irradiate_orig("))
             .expect("mangled orig def should exist at module level");
         let indent = orig_line.len() - orig_line.trim_start().len();
-        assert_eq!(indent, 0, "top-level mangled orig must be at module level, got: {orig_line:?}");
+        assert_eq!(
+            indent, 0,
+            "top-level mangled orig must be at module level, got: {orig_line:?}"
+        );
     }
 
     #[test]
@@ -543,10 +566,16 @@ class Processor:
                 t.starts_with("def run(") && !t.contains("mutmut")
             })
             .expect("wrapper for run should exist");
-        assert!(run_wrapper > class_pos, "run wrapper must be after class definition");
+        assert!(
+            run_wrapper > class_pos,
+            "run wrapper must be after class definition"
+        );
         let run_text = lines[run_wrapper];
         let run_indent = run_text.len() - run_text.trim_start().len();
-        assert!(run_indent > 0, "run wrapper must be indented inside Processor");
+        assert!(
+            run_indent > 0,
+            "run wrapper must be indented inside Processor"
+        );
     }
 
     #[test]
@@ -564,8 +593,14 @@ class Beta:
         let result = mutate_file(source, "dual").unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
-        let alpha_pos = lines.iter().position(|l| l.contains("class Alpha")).expect("class Alpha");
-        let beta_pos = lines.iter().position(|l| l.contains("class Beta")).expect("class Beta");
+        let alpha_pos = lines
+            .iter()
+            .position(|l| l.contains("class Alpha"))
+            .expect("class Alpha");
+        let beta_pos = lines
+            .iter()
+            .position(|l| l.contains("class Beta"))
+            .expect("class Beta");
 
         // Both classes should appear in the output
         assert!(alpha_pos < beta_pos, "Alpha before Beta");
@@ -608,7 +643,10 @@ class Beta:
         for &pos in &wrapper_positions {
             let text = lines[pos];
             let ind = text.len() - text.trim_start().len();
-            assert!(ind > 0, "process wrapper at line {pos} should be indented, got: {text:?}");
+            assert!(
+                ind > 0,
+                "process wrapper at line {pos} should be indented, got: {text:?}"
+            );
         }
     }
 
@@ -635,7 +673,10 @@ class Beta:
             .position(|l| l.contains("import irradiate_harness"))
             .expect("trampoline preamble must be present");
 
-        assert!(doc_pos < future_pos, "docstring (line {doc_pos}) must come before __future__ (line {future_pos})");
+        assert!(
+            doc_pos < future_pos,
+            "docstring (line {doc_pos}) must come before __future__ (line {future_pos})"
+        );
         assert!(
             future_pos < preamble_pos,
             "from __future__ (line {future_pos}) must come before trampoline preamble (line {preamble_pos})"
@@ -663,7 +704,10 @@ class Beta:
             .position(|l| l.starts_with("\"\"\"Multi"))
             .expect("docstring opener must be present in output");
 
-        assert!(doc_pos < preamble_pos, "docstring opener (line {doc_pos}) must come before preamble (line {preamble_pos})");
+        assert!(
+            doc_pos < preamble_pos,
+            "docstring opener (line {doc_pos}) must come before preamble (line {preamble_pos})"
+        );
         assert!(
             future_pos < preamble_pos,
             "from __future__ (line {future_pos}) must come before trampoline preamble (line {preamble_pos})"
@@ -686,7 +730,10 @@ class Beta:
             .position(|l| l.contains("import irradiate_harness"))
             .expect("trampoline preamble must be present");
 
-        assert!(doc_pos < preamble_pos, "docstring (line {doc_pos}) must come before preamble (line {preamble_pos})");
+        assert!(
+            doc_pos < preamble_pos,
+            "docstring (line {doc_pos}) must come before preamble (line {preamble_pos})"
+        );
     }
 
     // --- multi-line signature tests ---
@@ -801,7 +848,11 @@ class Markup:
 
         // wrapper should exist, exactly once
         let count = result.source.matches("def format_map(").count();
-        assert_eq!(count, 1, "Should have exactly one format_map wrapper\n{}", result.source);
+        assert_eq!(
+            count, 1,
+            "Should have exactly one format_map wrapper\n{}",
+            result.source
+        );
 
         // The wrapper should be indented inside the class
         let wrapper_line = result
@@ -813,16 +864,27 @@ class Markup:
             })
             .expect("wrapper def format_map( should exist");
         let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
-        assert!(indent_len > 0, "wrapper must be indented inside class body\n{}", result.source);
+        assert!(
+            indent_len > 0,
+            "wrapper must be indented inside class body\n{}",
+            result.source
+        );
 
         // Mangled orig should also be inside the class body (indented) — INV-4 (super() fix)
         let orig_line = result
             .source
             .lines()
-            .find(|l| l.trim_start().starts_with("def xǁMarkupǁformat_map__irradiate_orig("))
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("def xǁMarkupǁformat_map__irradiate_orig(")
+            })
             .expect("mangled orig should exist");
         let orig_indent = orig_line.len() - orig_line.trim_start().len();
-        assert!(orig_indent > 0, "mangled orig must be inside class body (super() fix)\n{}", result.source);
+        assert!(
+            orig_indent > 0,
+            "mangled orig must be inside class body (super() fix)\n{}",
+            result.source
+        );
     }
 
     #[test]
@@ -882,7 +944,10 @@ class Calc:
         let result = mutate_file(source, "mod").unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
-        let comment_pos = lines.iter().position(|l| *l == "# comment").expect("comment must be present");
+        let comment_pos = lines
+            .iter()
+            .position(|l| *l == "# comment")
+            .expect("comment must be present");
         let future_pos = lines
             .iter()
             .position(|l| l.starts_with("from __future__"))
@@ -892,8 +957,14 @@ class Calc:
             .position(|l| l.contains("import irradiate_harness"))
             .expect("trampoline preamble must be present");
 
-        assert!(comment_pos < future_pos, "comment must appear before __future__");
-        assert!(future_pos < preamble_pos, "from __future__ must appear before trampoline preamble");
+        assert!(
+            comment_pos < future_pos,
+            "comment must appear before __future__"
+        );
+        assert!(
+            future_pos < preamble_pos,
+            "from __future__ must appear before trampoline preamble"
+        );
     }
 
     #[test]
@@ -908,8 +979,14 @@ class Calc:
             .expect("trampoline preamble must be present");
         // The very first non-empty line should be the preamble (or part of it),
         // and there must be no `from __future__` anywhere (none in source).
-        assert!(!result.source.contains("from __future__"), "no __future__ in output when not in source");
-        assert_eq!(preamble_pos, 0, "preamble must start at line 0 when no __future__ present");
+        assert!(
+            !result.source.contains("from __future__"),
+            "no __future__ in output when not in source"
+        );
+        assert_eq!(
+            preamble_pos, 0,
+            "preamble must start at line 0 when no __future__ present"
+        );
     }
 
     #[test]
@@ -925,7 +1002,10 @@ class Single:
 
         // class body should not be empty — the wrapper must be there
         let lines: Vec<&str> = result.source.lines().collect();
-        let class_pos = lines.iter().position(|l| l.contains("class Single")).expect("class Single");
+        let class_pos = lines
+            .iter()
+            .position(|l| l.contains("class Single"))
+            .expect("class Single");
 
         // The very next non-empty line after `class Single:` must be the wrapper
         let first_body_line = lines[class_pos + 1..]
@@ -961,7 +1041,10 @@ class Single:
     fn is_valid_python(source: &str) -> bool {
         use std::io::Write;
         let mut child = match std::process::Command::new("python3")
-            .args(["-c", "import sys; compile(sys.stdin.read(), 'test.py', 'exec')"])
+            .args([
+                "-c",
+                "import sys; compile(sys.stdin.read(), 'test.py', 'exec')",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

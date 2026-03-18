@@ -205,12 +205,17 @@ fn stmt_contains_yield(stmt: &Statement) -> bool {
             CompoundStatement::If(if_stmt) => {
                 expr_contains_yield(&if_stmt.test)
                     || suite_contains_yield(&if_stmt.body)
-                    || if_stmt.orelse.as_ref().is_some_and(|orelse| match orelse.as_ref() {
-                        cst::OrElse::Elif(elif) => {
-                            expr_contains_yield(&elif.test) || suite_contains_yield(&elif.body)
-                        }
-                        cst::OrElse::Else(else_clause) => suite_contains_yield(&else_clause.body),
-                    })
+                    || if_stmt
+                        .orelse
+                        .as_ref()
+                        .is_some_and(|orelse| match orelse.as_ref() {
+                            cst::OrElse::Elif(elif) => {
+                                expr_contains_yield(&elif.test) || suite_contains_yield(&elif.body)
+                            }
+                            cst::OrElse::Else(else_clause) => {
+                                suite_contains_yield(&else_clause.body)
+                            }
+                        })
             }
             CompoundStatement::While(w) => {
                 expr_contains_yield(&w.test) || suite_contains_yield(&w.body)
@@ -225,7 +230,9 @@ fn stmt_contains_yield(stmt: &Statement) -> bool {
             CompoundStatement::Try(t) => {
                 suite_contains_yield(&t.body)
                     || t.handlers.iter().any(|h| suite_contains_yield(&h.body))
-                    || t.finalbody.as_ref().is_some_and(|fin| suite_contains_yield(&fin.body))
+                    || t.finalbody
+                        .as_ref()
+                        .is_some_and(|fin| suite_contains_yield(&fin.body))
             }
             _ => false,
         },
@@ -255,10 +262,14 @@ fn expr_contains_yield(expr: &Expression) -> bool {
         Expression::UnaryOperation(unop) => expr_contains_yield(&unop.expression),
         Expression::Comparison(cmp) => {
             expr_contains_yield(&cmp.left)
-                || cmp.comparisons.iter().any(|c| expr_contains_yield(&c.comparator))
+                || cmp
+                    .comparisons
+                    .iter()
+                    .any(|c| expr_contains_yield(&c.comparator))
         }
         Expression::Call(call) => {
-            expr_contains_yield(&call.func) || call.args.iter().any(|a| expr_contains_yield(&a.value))
+            expr_contains_yield(&call.func)
+                || call.args.iter().any(|a| expr_contains_yield(&a.value))
         }
         Expression::IfExp(ifexp) => {
             expr_contains_yield(&ifexp.body)
@@ -266,7 +277,10 @@ fn expr_contains_yield(expr: &Expression) -> bool {
                 || expr_contains_yield(&ifexp.orelse)
         }
         Expression::Tuple(t) => t.elements.iter().any(|el| {
-            if let cst::Element::Simple { value: ref e_val, .. } = el {
+            if let cst::Element::Simple {
+                value: ref e_val, ..
+            } = el
+            {
                 expr_contains_yield(e_val)
             } else {
                 false
@@ -1178,7 +1192,11 @@ mod tests {
         let source = "def foo(s):\n    return s.replace('\"', 'x')\n";
         let fms = collect_file_mutations(source);
         if let Some(fm) = fms.first() {
-            for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+            for m in fm
+                .mutations
+                .iter()
+                .filter(|m| m.operator == "string_mutation")
+            {
                 // The replacement must be a valid Python string literal.
                 // For '"', it must be delimited by single-quotes: starts with ' ends with '
                 if m.original == "'\"'" {
@@ -1205,7 +1223,11 @@ mod tests {
         let source = "def foo(s):\n    return s.replace(\"'\", 'x')\n";
         let fms = collect_file_mutations(source);
         if let Some(fm) = fms.first() {
-            for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+            for m in fm
+                .mutations
+                .iter()
+                .filter(|m| m.operator == "string_mutation")
+            {
                 if m.original == "\"'\"" {
                     // Must be delimited by double-quotes
                     assert!(
@@ -1223,7 +1245,10 @@ mod tests {
     fn test_string_mutation_normal_strings_unaffected() {
         let source = "def greet():\n    return \"hello\"\n";
         let fms = collect_file_mutations(source);
-        let string_mut = fms[0].mutations.iter().find(|m| m.operator == "string_mutation");
+        let string_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "string_mutation");
         assert!(string_mut.is_some(), "Normal string must still be mutated");
         assert_eq!(
             string_mut.unwrap().replacement,
@@ -1242,7 +1267,11 @@ mod tests {
         let source = "def escape(s):\n    return s.replace('\"', '&#34;')\n";
         let fms = collect_file_mutations(source);
         let fm = fms.first().expect("should collect mutations from escape()");
-        for m in fm.mutations.iter().filter(|m| m.operator == "string_mutation") {
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "string_mutation")
+        {
             let mutated_func = apply_mutation(&fm.source, m);
             assert!(
                 parse_module(&mutated_func, None).is_ok(),
@@ -1268,7 +1297,10 @@ mod tests {
         let source = "def gen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "should find mutations (compop on n > 0)");
-        assert!(fms[0].is_generator, "function with yield should be is_generator=true");
+        assert!(
+            fms[0].is_generator,
+            "function with yield should be is_generator=true"
+        );
         assert!(!fms[0].is_async, "plain generator is not async");
     }
 
@@ -1278,7 +1310,10 @@ mod tests {
         let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "should find mutations (compop on n > 0)");
-        assert!(fms[0].is_generator, "async function with yield should be is_generator=true");
+        assert!(
+            fms[0].is_generator,
+            "async function with yield should be is_generator=true"
+        );
         assert!(fms[0].is_async, "should also be is_async=true");
     }
 
@@ -1288,7 +1323,10 @@ mod tests {
         let source = "def add(a, b):\n    return a + b\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
-        assert!(!fms[0].is_generator, "regular function must not be is_generator");
+        assert!(
+            !fms[0].is_generator,
+            "regular function must not be is_generator"
+        );
     }
 
     // INV-4: yield in a separate function does NOT affect `is_generator` of a different function.
@@ -1298,9 +1336,18 @@ mod tests {
         let source =
             "def outer(x):\n    return x + 1\n\ndef inner(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
-        let outer = fms.iter().find(|fm| fm.name == "outer").expect("outer must exist");
-        let inner = fms.iter().find(|fm| fm.name == "inner").expect("inner must exist");
-        assert!(!outer.is_generator, "outer has no yield, must not be is_generator");
+        let outer = fms
+            .iter()
+            .find(|fm| fm.name == "outer")
+            .expect("outer must exist");
+        let inner = fms
+            .iter()
+            .find(|fm| fm.name == "inner")
+            .expect("inner must exist");
+        assert!(
+            !outer.is_generator,
+            "outer has no yield, must not be is_generator"
+        );
         assert!(inner.is_generator, "inner has yield, must be is_generator");
     }
 }

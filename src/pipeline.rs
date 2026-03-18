@@ -107,11 +107,23 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Phase 3: Validation
     eprintln!("Running clean tests...");
-    validate_clean_run(&config.python, &project_dir, &pythonpath, &mutants_dir, &config.tests_dir)?;
+    validate_clean_run(
+        &config.python,
+        &project_dir,
+        &pythonpath,
+        &mutants_dir,
+        &config.tests_dir,
+    )?;
     eprintln!("  done");
 
     eprintln!("Running forced-fail validation...");
-    validate_fail_run(&config.python, &project_dir, &pythonpath, &mutants_dir, &config.tests_dir)?;
+    validate_fail_run(
+        &config.python,
+        &project_dir,
+        &pythonpath,
+        &mutants_dir,
+        &config.tests_dir,
+    )?;
     eprintln!("  done");
 
     // Phase 4: Mutation testing
@@ -1386,7 +1398,11 @@ mod tests {
 
         // Files must land under mutants/simple_lib/
         assert!(
-            mutants_tmp.path().join("simple_lib").join("__init__.py").exists(),
+            mutants_tmp
+                .path()
+                .join("simple_lib")
+                .join("__init__.py")
+                .exists(),
             "simple_lib/__init__.py must be in mutants/simple_lib/"
         );
     }
@@ -1405,6 +1421,9 @@ mod tests {
 
         // Should not panic even when parent() returns an empty component
         let result = generate_mutants(tmp.path(), mutants_tmp.path());
-        assert!(result.is_ok(), "should not fail for package dirs with no parent prefix");
+        assert!(
+            result.is_ok(),
+            "should not fail for package dirs with no parent prefix"
+        );
     }
 }

@@ -54,6 +54,15 @@ The integration tests need Python with pytest. Set up with:
 cd tests/fixtures && uv venv && uv pip install pytest
 ```
 
+## Git hooks
+
+Install pre-commit hooks with:
+```bash
+bash scripts/install-hooks.sh
+```
+
+The hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before every commit.
+
 ## Commit guidelines
 
 - Run `cargo check && cargo clippy -- -D warnings && cargo test` before every commit

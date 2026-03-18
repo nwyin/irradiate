@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== pre-commit: cargo fmt ==="
+cargo fmt --check
+
+echo "=== pre-commit: cargo clippy ==="
+cargo clippy -- -D warnings
+
+echo "=== pre-commit: cargo test ==="
+# Run lib unit tests and proptest_mutation; skip worker_pool_integration which requires Python venv setup.
+cargo test --lib --test proptest_mutation

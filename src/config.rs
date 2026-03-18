@@ -104,7 +104,16 @@ future_unknown_key = "something"
         let result: Result<ProjectConfig, _> = toml::from_str(toml_str);
         assert!(result.is_ok());
         let config = result.unwrap();
-        assert_eq!(config.tool.irradiate.as_ref().unwrap().paths_to_mutate.as_deref(), Some("src"));
+        assert_eq!(
+            config
+                .tool
+                .irradiate
+                .as_ref()
+                .unwrap()
+                .paths_to_mutate
+                .as_deref(),
+            Some("src")
+        );
     }
 
     #[test]

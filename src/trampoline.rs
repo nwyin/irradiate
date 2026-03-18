@@ -63,10 +63,21 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     module_lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
 
     // Trampoline wrapper with original name and signature
-    let self_arg = if fm.class_name.is_some() { "self" } else { "None" };
+    let self_arg = if fm.class_name.is_some() {
+        "self"
+    } else {
+        "None"
+    };
     let params_text = &fm.params_source;
-    let wrapper_code =
-        generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async, fm.is_generator, &fm.return_annotation);
+    let wrapper_code = generate_wrapper_function(
+        &fm.name,
+        &mangled,
+        params_text,
+        self_arg,
+        fm.is_async,
+        fm.is_generator,
+        &fm.return_annotation,
+    );
 
     TrampolineOutput {
         module_code: module_lines.join("\n"),
@@ -114,7 +125,11 @@ fn generate_wrapper_function(
     // Class method wrappers must look up the mangled orig/mutants via `type(self)` because
     // class body names are NOT in scope for methods — they are class attributes, not locals/globals.
     // Top-level functions use bare module-level names (no prefix needed).
-    let lookup_prefix = if self_arg == "self" { "type(self)." } else { "" };
+    let lookup_prefix = if self_arg == "self" {
+        "type(self)."
+    } else {
+        ""
+    };
     let trampoline_call = format!(
         "_irradiate_trampoline({lookup_prefix}{mangled_name}__irradiate_orig, {lookup_prefix}{mangled_name}__irradiate_mutants, {args_list}, {kwargs_dict}, {self_arg})"
     );
@@ -188,7 +203,10 @@ fn split_params(s: &str) -> Vec<String> {
 
 /// Parse parameter names from a params source string.
 /// Returns (positional_args, keyword_only_args, kwargs_name).
-pub fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>, Option<String>) {
+pub fn parse_param_names(
+    params_source: &str,
+    has_self: bool,
+) -> (Vec<String>, Vec<String>, Option<String>) {
     let mut pos_args = Vec::new();
     let mut kw_args = Vec::new();
     let mut kwargs_name: Option<String> = None;
@@ -374,7 +392,10 @@ mod tests {
             output.module_code.contains("x_add__irradiate_mutants"),
             "Should have lookup dict"
         );
-        assert!(output.wrapper_code.contains("def add("), "Should have trampoline wrapper");
+        assert!(
+            output.wrapper_code.contains("def add("),
+            "Should have trampoline wrapper"
+        );
         assert!(!output.mutant_keys.is_empty(), "Should produce mutant keys");
         assert!(
             output.mutant_keys[0].starts_with("my_lib.x_add__irradiate_"),
@@ -385,7 +406,8 @@ mod tests {
     // INV-1: Parameters with generic type annotations parse to the correct name only.
     #[test]
     fn test_parse_param_names_generic_annotation() {
-        let (pos_args, kw_args, kwargs) = parse_param_names("self, mapping: cabc.Mapping[str, t.Any], /", true);
+        let (pos_args, kw_args, kwargs) =
+            parse_param_names("self, mapping: cabc.Mapping[str, t.Any], /", true);
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
         assert_eq!(kwargs, None);
@@ -406,7 +428,8 @@ mod tests {
     // INV-3: Nested brackets parse correctly.
     #[test]
     fn test_parse_param_names_nested_brackets() {
-        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Dict[str, List[int]], y: int", true);
+        let (pos_args, kw_args, kwargs) =
+            parse_param_names("self, x: Dict[str, List[int]], y: int", true);
         assert_eq!(pos_args, vec!["x", "y"]);
         assert_eq!(kw_args, Vec::<String>::new());
         assert_eq!(kwargs, None);
@@ -424,7 +447,8 @@ mod tests {
     // Tuple with ellipsis and keyword-only args after *.
     #[test]
     fn test_parse_param_names_tuple_kwonly() {
-        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Tuple[int, ...], *, key: str", true);
+        let (pos_args, kw_args, kwargs) =
+            parse_param_names("self, x: Tuple[int, ...], *, key: str", true);
         assert_eq!(pos_args, vec!["x"]);
         assert_eq!(kw_args, vec!["key"]);
         assert_eq!(kwargs, None);
@@ -433,7 +457,8 @@ mod tests {
     // Multiple bracket types: Dict[str, Tuple[int, ...]].
     #[test]
     fn test_parse_param_names_deeply_nested() {
-        let (pos_args, kw_args, kwargs) = parse_param_names("self, x: Dict[str, Tuple[int, ...]], y: int", true);
+        let (pos_args, kw_args, kwargs) =
+            parse_param_names("self, x: Dict[str, Tuple[int, ...]], y: int", true);
         assert_eq!(pos_args, vec!["x", "y"]);
         assert_eq!(kw_args, Vec::<String>::new());
         assert_eq!(kwargs, None);
@@ -442,7 +467,8 @@ mod tests {
     // Positional-only separator after bracketed annotation.
     #[test]
     fn test_parse_param_names_pos_only_after_bracket() {
-        let (pos_args, kw_args, kwargs) = parse_param_names("self, mapping: Mapping[str, Any], /", true);
+        let (pos_args, kw_args, kwargs) =
+            parse_param_names("self, mapping: Mapping[str, Any], /", true);
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
         assert_eq!(kwargs, None);
@@ -460,30 +486,59 @@ mod tests {
     // INV: **kwargs is merged into call_kwargs in the wrapper.
     #[test]
     fn test_wrapper_kwargs_forwarding() {
-        let wrapper = generate_wrapper_function("func_with_star", "x_func_with_star", "a, /, b, *, c, **kwargs", "None", false, false, "");
+        let wrapper = generate_wrapper_function(
+            "func_with_star",
+            "x_func_with_star",
+            "a, /, b, *, c, **kwargs",
+            "None",
+            false,
+            false,
+            "",
+        );
         // kwargs must be spread into the call_kwargs dict
-        assert!(wrapper.contains("**kwargs"), "wrapper must forward **kwargs: {wrapper}");
-        assert!(wrapper.contains("'c': c"), "wrapper must include c in call_kwargs: {wrapper}");
+        assert!(
+            wrapper.contains("**kwargs"),
+            "wrapper must forward **kwargs: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("'c': c"),
+            "wrapper must include c in call_kwargs: {wrapper}"
+        );
     }
 
     // INV-1: Return type annotation is included in wrapper def line.
     #[test]
     fn test_wrapper_return_annotation_preserved() {
-        let wrapper = generate_wrapper_function("some_func", "x_some_func", "a, b: str = \"111\"", "None", false, false, " -> int | None");
-        assert!(wrapper.starts_with("def some_func(a, b: str = \"111\") -> int | None:"), "wrapper must include return annotation: {wrapper}");
+        let wrapper = generate_wrapper_function(
+            "some_func",
+            "x_some_func",
+            "a, b: str = \"111\"",
+            "None",
+            false,
+            false,
+            " -> int | None",
+        );
+        assert!(
+            wrapper.starts_with("def some_func(a, b: str = \"111\") -> int | None:"),
+            "wrapper must include return annotation: {wrapper}"
+        );
     }
 
     // INV-3: Wrapper without return annotation or kwargs still correct.
     #[test]
     fn test_wrapper_no_annotation_no_kwargs() {
         let wrapper = generate_wrapper_function("add", "x_add", "a, b", "None", false, false, "");
-        assert!(wrapper.starts_with("def add(a, b):"), "wrapper def line must be clean: {wrapper}");
+        assert!(
+            wrapper.starts_with("def add(a, b):"),
+            "wrapper def line must be clean: {wrapper}"
+        );
     }
 
     // INV: generate_trampoline produces a wrapper with return annotation from function source.
     #[test]
     fn test_generate_trampoline_return_annotation() {
-        let source = "def some_func(a, b: str = \"111\", c: int = 0) -> int | None:\n    return a + c\n";
+        let source =
+            "def some_func(a, b: str = \"111\", c: int = 0) -> int | None:\n    return a + c\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "should find mutations in some_func");
         let output = generate_trampoline(&fms[0], "my_lib");
@@ -530,9 +585,13 @@ mod tests {
     // INV-1: Class method trampoline wrapper passes `self` as self_arg.
     #[test]
     fn test_trampoline_wrapper_class_method_uses_self_arg() {
-        let source = "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
+        let source =
+            "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
         let fms = collect_file_mutations(source);
-        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let class_fm = fms
+            .iter()
+            .find(|fm| fm.class_name.is_some())
+            .expect("should find class method");
         let output = generate_trampoline(class_fm, "point_module");
         assert!(
             output.wrapper_code.contains(", self)"),
@@ -546,9 +605,13 @@ mod tests {
     // for methods — they are class attributes, not locals or globals.
     #[test]
     fn test_class_method_wrapper_uses_type_self_lookup() {
-        let source = "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
+        let source =
+            "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
         let fms = collect_file_mutations(source);
-        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let class_fm = fms
+            .iter()
+            .find(|fm| fm.class_name.is_some())
+            .expect("should find class method");
         let output = generate_trampoline(class_fm, "point_module");
         assert!(
             output.wrapper_code.contains("type(self)."),
@@ -572,7 +635,10 @@ mod tests {
     fn test_class_method_wrapper_not_hardcoded_class_name() {
         let source = "class MyClass:\n    def method(self, v):\n        return v + 1\n";
         let fms = collect_file_mutations(source);
-        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let class_fm = fms
+            .iter()
+            .find(|fm| fm.class_name.is_some())
+            .expect("should find class method");
         let output = generate_trampoline(class_fm, "mod");
         // type(self). is used — not the literal class name
         assert!(
@@ -607,10 +673,15 @@ mod tests {
     fn test_generator_wrapper_uses_yield_from() {
         let source = "def gen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
-        assert!(!fms.is_empty(), "generator with compop must produce mutations");
+        assert!(
+            !fms.is_empty(),
+            "generator with compop must produce mutations"
+        );
         let output = generate_trampoline(&fms[0], "gen_mod");
         assert!(
-            output.wrapper_code.contains("yield from _irradiate_trampoline("),
+            output
+                .wrapper_code
+                .contains("yield from _irradiate_trampoline("),
             "Generator wrapper must use 'yield from', got:\n{}",
             output.wrapper_code
         );
@@ -626,10 +697,15 @@ mod tests {
     fn test_async_generator_wrapper_uses_async_for_yield() {
         let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
-        assert!(!fms.is_empty(), "async generator with compop must produce mutations");
+        assert!(
+            !fms.is_empty(),
+            "async generator with compop must produce mutations"
+        );
         let output = generate_trampoline(&fms[0], "agen_mod");
         assert!(
-            output.wrapper_code.contains("async for _item in _irradiate_trampoline("),
+            output
+                .wrapper_code
+                .contains("async for _item in _irradiate_trampoline("),
             "Async generator wrapper must use 'async for _item in', got:\n{}",
             output.wrapper_code
         );
@@ -658,7 +734,9 @@ mod tests {
         assert!(!fms.is_empty());
         let output = generate_trampoline(&fms[0], "fetch_mod");
         assert!(
-            output.wrapper_code.contains("return await _irradiate_trampoline("),
+            output
+                .wrapper_code
+                .contains("return await _irradiate_trampoline("),
             "Async regular wrapper must use 'return await', got:\n{}",
             output.wrapper_code
         );
@@ -672,7 +750,9 @@ mod tests {
         assert!(!fms.is_empty());
         let output = generate_trampoline(&fms[0], "math_mod");
         assert!(
-            output.wrapper_code.contains("return _irradiate_trampoline("),
+            output
+                .wrapper_code
+                .contains("return _irradiate_trampoline("),
             "Sync regular wrapper must use 'return', got:\n{}",
             output.wrapper_code
         );
