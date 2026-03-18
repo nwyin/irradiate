@@ -74,7 +74,7 @@ def run_items_directly(items, fail_fast=True):
     return 1 if failed else 0
 
 
-def _force_teardown(item):
+def _force_teardown(item):  # pragma: no mutate
     """Force teardown of all active fixtures on the session's setup state."""
     try:
         state = item.session._setupstate
@@ -208,7 +208,7 @@ class MutationWorkerPlugin:
         return True  # Signal to pytest that we handled the run loop
 
 
-def main():
+def main():  # pragma: no mutate
     socket_path = os.environ["IRRADIATE_SOCKET"]
     mutants_dir = os.environ.get("IRRADIATE_MUTANTS_DIR", "mutants")
     tests_dir = os.environ.get("IRRADIATE_TESTS_DIR", "tests")

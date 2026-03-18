@@ -119,4 +119,43 @@ echo "  --isolate matches worker pool results: OK"
 rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 
 echo ""
+echo "=== Harness self-mutation ==="
+HARNESS_TESTS_DIR="$SCRIPT_DIR/harness_tests"
+
+# Set up harness test venv if needed
+if [ ! -d "$HARNESS_TESTS_DIR/.venv" ]; then
+    echo "Setting up harness test venv..."
+    (cd "$HARNESS_TESTS_DIR" && uv venv --python 3.12 && uv pip install pytest)
+fi
+
+# Verify the harness tests pass on their own before mutation testing
+echo "  Running harness unit tests..."
+(cd "$HARNESS_TESTS_DIR" && .venv/bin/python -m pytest -q 2>&1)
+echo "  Harness unit tests: OK"
+
+# Run irradiate on its own harness (verify it runs without crashing)
+# mutants/ and .irradiate/ are created relative to cwd (ROOT_DIR)
+rm -rf "$ROOT_DIR/mutants" "$ROOT_DIR/.irradiate"
+
+echo "  Running irradiate on harness/ (self-mutation)..."
+SELFMUT_OUTPUT=$( cd "$ROOT_DIR" && \
+    "$BINARY" run \
+    --paths-to-mutate harness/ \
+    --tests-dir "$HARNESS_TESTS_DIR" \
+    --python "$HARNESS_TESTS_DIR/.venv/bin/python3" \
+    --timeout-multiplier 10 \
+    --isolate 2>&1 || true )
+echo "$SELFMUT_OUTPUT"
+
+# Verify it completed without a panic (exit 0 or non-zero both acceptable; panic = "panicked at")
+if echo "$SELFMUT_OUTPUT" | grep -q "panicked at"; then
+    echo "FAIL: irradiate panicked during harness self-mutation"
+    exit 1
+fi
+echo "  Harness self-mutation: OK (no panic)"
+
+# Clean up
+rm -rf "$ROOT_DIR/mutants" "$ROOT_DIR/.irradiate"
+
+echo ""
 echo "=== E2E tests: PASS ==="
