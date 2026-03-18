@@ -114,17 +114,36 @@ Otherwise, extract to module level.
 
 ## Recommendation
 
-**Approach B (rewrite to explicit super)** is the best fit for irradiate's
-Rust-based codegen:
+**Approach A (keep mangled code inside the class body)** — matching mutmut's
+proven strategy.
 
-1. Minimal change to current architecture
-2. Simple text-level transformation: find `super()` in method source, replace
-   with `super(ClassName, self)` (or `super(ClassName, cls)` for classmethods)
-3. Covers the vast majority of real-world Python code
-4. Edge cases (aliased super, nested functions) can be handled incrementally
+Approach B (rewrite `super()`) was initially tempting as a minimal change, but
+it has real edge-case risks: `super` aliased to a variable, nested in
+comprehensions/lambdas, classmethods with `cls` instead of `self`, and subtle
+behavioral differences in multiple-inheritance diamonds where explicit
+`super(ClassName, self)` is not identical to implicit `super()`.
 
-If we later find cases where the rewrite is insufficient, we can fall back to
-**Approach D** (hybrid) for those specific methods.
+Approach A avoids the problem entirely with no detection or rewriting needed.
+The downsides are cosmetic:
+
+- **Class attribute pollution**: mangled names like `xǁClassǁmethod__irradiate_orig`
+  appear in `dir(cls)` / `vars(cls)`. Unlikely to collide with anything due to
+  the `xǁ` prefix. Metaclasses that introspect `__dict__` would see them, but
+  this is the same tradeoff mutmut makes and hasn't been a problem in practice.
+- **Larger class bodies**: more code inside the class. No runtime impact.
+
+mutmut has been shipping this approach for years with real users. It works.
+
+### What changes in codegen
+
+Currently (`src/codegen.rs` and `src/trampoline.rs`):
+- Wrapper stays inside the class body (indented) ✓
+- Orig, variants, and lookup dict are extracted to module level ✗
+
+After the fix:
+- Wrapper stays inside the class body ✓
+- Orig, variants, and lookup dict also stay inside the class body ✓
+- Top-level functions continue to use module-level placement (no change)
 
 ## References
 
