@@ -489,6 +489,16 @@ fn generate_mutants(
 
                 Ok(Some((module_name, mutated.mutant_names)))
             } else {
+                // No mutations found, but copy the original file verbatim so
+                // the full package structure is present in mutants/.  Without
+                // this, sibling imports break because Python finds the package
+                // in mutants/ (first on PYTHONPATH) but missing modules aren't
+                // there.
+                let dest = mutants_dir.join(rel_path);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, &source)?;
                 Ok(None)
             }
         })
@@ -1140,5 +1150,61 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "mypkg.x_bar__mutmut_1");
         assert_eq!(loaded[0].1, 1);
+    }
+
+    // --- generate_mutants: full source tree mirror ---
+
+    #[test]
+    fn test_generate_mutants_copies_unmutated_files() {
+        // A file with no functions produces no mutations — but it must still be
+        // copied into mutants/ so sibling imports don't break.
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // File that WILL produce mutations (has a function with arithmetic)
+        std::fs::write(src_tmp.path().join("math_ops.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        // File that will NOT produce mutations (just a constant)
+        std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
+
+        generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
+
+        // Both files must be present in mutants/
+        assert!(mutants_tmp.path().join("math_ops.py").exists(), "mutated file must be in mutants/");
+        assert!(mutants_tmp.path().join("constants.py").exists(), "unmutated file must be copied to mutants/");
+
+        // The unmutated file content must match the original exactly
+        let original = std::fs::read_to_string(src_tmp.path().join("constants.py")).unwrap();
+        let copied = std::fs::read_to_string(mutants_tmp.path().join("constants.py")).unwrap();
+        assert_eq!(original, copied, "unmutated file must be copied verbatim");
+    }
+
+    #[test]
+    fn test_generate_mutants_preserves_package_structure() {
+        // Multi-file package: generate_mutants must mirror all .py files so that
+        // `import pkg.utils` works when pkg is loaded from mutants/.
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        let pkg = src_tmp.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+
+        // __init__.py — no functions, no mutations
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        // core.py — has a function, will produce mutations
+        std::fs::write(pkg.join("core.py"), "def process(x):\n    return x + 1\n").unwrap();
+        // utils.py — only constants, no mutations
+        std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
+
+        generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
+
+        let mutants_pkg = mutants_tmp.path().join("pkg");
+        assert!(mutants_pkg.join("__init__.py").exists(), "pkg/__init__.py must be in mutants/");
+        assert!(mutants_pkg.join("core.py").exists(), "pkg/core.py must be in mutants/");
+        assert!(mutants_pkg.join("utils.py").exists(), "pkg/utils.py must be in mutants/");
+
+        // utils.py content must be verbatim
+        let original = std::fs::read_to_string(pkg.join("utils.py")).unwrap();
+        let mirrored = std::fs::read_to_string(mutants_pkg.join("utils.py")).unwrap();
+        assert_eq!(original, mirrored, "unmutated utils.py must be copied verbatim");
     }
 }
