@@ -15,58 +15,63 @@ pub fn mangle_name(name: &str, class_name: Option<&str>) -> String {
     }
 }
 
+/// Result of generating a trampoline for a single function.
+pub struct TrampolineOutput {
+    /// Module-level code: renamed orig, mutant variants, lookup dict, __name__ assignment.
+    /// These have mangled names and belong at module level.
+    pub module_code: String,
+    /// Wrapper function with the original name and signature.
+    /// For class methods, must be indented and placed inside the class body.
+    /// For top-level functions, goes at module level.
+    pub wrapper_code: String,
+    /// Mutant keys like "module.x_func__mutmut_1".
+    pub mutant_keys: Vec<String>,
+}
+
 /// Generate the full trampolined output for a single function.
-///
-/// Returns (generated_code, list_of_mutant_keys) where mutant_keys are
-/// like "module.x_func__mutmut_1".
-pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> (String, Vec<String>) {
+pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> TrampolineOutput {
     let mangled = mangle_name(&fm.name, fm.class_name.as_deref());
-    let mut lines = Vec::new();
+    let mut module_lines = Vec::new();
     let mut mutant_keys = Vec::new();
 
     // Original function, renamed
     let orig_name = format!("{mangled}__mutmut_orig");
     let renamed_orig = rename_function(&fm.source, &fm.name, &orig_name);
-    lines.push(renamed_orig);
-    lines.push(String::new());
+    module_lines.push(renamed_orig);
+    module_lines.push(String::new());
 
     // Mutant variants
     for (i, mutation) in fm.mutations.iter().enumerate() {
         let variant_name = format!("{mangled}__mutmut_{}", i + 1);
         let mutated_source = apply_mutation(&fm.source, mutation);
         let renamed_variant = rename_function(&mutated_source, &fm.name, &variant_name);
-        lines.push(renamed_variant);
-        lines.push(String::new());
+        module_lines.push(renamed_variant);
+        module_lines.push(String::new());
 
         mutant_keys.push(format!("{module_name}.{variant_name}"));
     }
 
     // Lookup dict
-    lines.push(format!("{mangled}__mutmut_mutants = {{"));
+    module_lines.push(format!("{mangled}__mutmut_mutants = {{"));
     for (i, _) in fm.mutations.iter().enumerate() {
         let variant_name = format!("{mangled}__mutmut_{}", i + 1);
-        lines.push(format!("    '{variant_name}': {variant_name},"));
+        module_lines.push(format!("    '{variant_name}': {variant_name},"));
     }
-    lines.push("}".to_string());
+    module_lines.push("}".to_string());
 
     // Set __name__ on orig for trampoline dispatch
-    lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
-    lines.push(String::new());
+    module_lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
 
     // Trampoline wrapper with original name and signature
-    let self_arg = if fm.class_name.is_some() {
-        // For class methods, pass self explicitly
-        "self"
-    } else {
-        "None"
-    };
-
-    // Build the call args, stripping 'self' for class methods
+    let self_arg = if fm.class_name.is_some() { "self" } else { "None" };
     let params_text = &fm.params_source;
-    let wrapper = generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async);
-    lines.push(wrapper);
+    let wrapper_code = generate_wrapper_function(&fm.name, &mangled, params_text, self_arg, fm.is_async);
 
-    (lines.join("\n"), mutant_keys)
+    TrampolineOutput {
+        module_code: module_lines.join("\n"),
+        wrapper_code,
+        mutant_keys,
+    }
 }
 
 fn generate_wrapper_function(
@@ -261,23 +266,23 @@ mod tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
 
-        let (code, keys) = generate_trampoline(&fms[0], "my_lib");
+        let output = generate_trampoline(&fms[0], "my_lib");
         assert!(
-            code.contains("x_add__mutmut_orig"),
+            output.module_code.contains("x_add__mutmut_orig"),
             "Should have renamed original"
         );
         assert!(
-            code.contains("x_add__mutmut_1"),
+            output.module_code.contains("x_add__mutmut_1"),
             "Should have at least one variant"
         );
         assert!(
-            code.contains("x_add__mutmut_mutants"),
+            output.module_code.contains("x_add__mutmut_mutants"),
             "Should have lookup dict"
         );
-        assert!(code.contains("def add("), "Should have trampoline wrapper");
-        assert!(!keys.is_empty(), "Should produce mutant keys");
+        assert!(output.wrapper_code.contains("def add("), "Should have trampoline wrapper");
+        assert!(!output.mutant_keys.is_empty(), "Should produce mutant keys");
         assert!(
-            keys[0].starts_with("my_lib.x_add__mutmut_"),
+            output.mutant_keys[0].starts_with("my_lib.x_add__mutmut_"),
             "Keys should be module-qualified"
         );
     }

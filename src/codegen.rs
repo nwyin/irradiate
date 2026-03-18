@@ -1,8 +1,8 @@
 //! File-level codegen: take a Python source file and produce the fully
 //! mutated version with all functions trampolined.
 
-use crate::mutation::collect_file_mutations;
-use crate::trampoline::{generate_trampoline, trampoline_impl};
+use crate::mutation::{collect_file_mutations, FunctionMutations};
+use crate::trampoline::{generate_trampoline, trampoline_impl, TrampolineOutput};
 
 /// Result of mutating a single Python source file.
 #[derive(Debug)]
@@ -23,44 +23,87 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         return None;
     }
 
-    let mutated_func_names: std::collections::HashSet<&str> = function_mutations
+    // Pre-generate all trampolines upfront.
+    let trampolines: Vec<TrampolineOutput> = function_mutations
         .iter()
-        .map(|fm| fm.name.as_str())
+        .map(|fm| generate_trampoline(fm, module_name))
         .collect();
 
     let mut output = String::new();
-    let mut all_mutant_names = Vec::new();
+    let mut all_mutant_names: Vec<String> = trampolines
+        .iter()
+        .flat_map(|tp| tp.mutant_keys.iter().cloned())
+        .collect();
+    // Keep insertion order stable for deterministic output.
+    all_mutant_names.dedup();
 
     // Prepend trampoline implementation
     output.push_str(trampoline_impl());
     output.push('\n');
 
     // Walk through source lines, stripping out functions that will be replaced
-    // by trampoline arrangements.
+    // by trampoline arrangements. For class methods, emit the wrapper inline
+    // (indented inside the class body). For top-level functions, the wrapper
+    // is appended after the walk.
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
+    // Track which class we're currently inside: (class_name, class_indent_level).
+    let mut current_class: Option<(String, usize)> = None;
+
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
 
-        // Check if this line starts a function definition we're mutating
-        let func_name = extract_func_name(trimmed);
-        if !func_name.is_empty() && mutated_func_names.contains(func_name) {
-            // Skip the entire function body
-            let func_indent = indent;
-            i += 1;
-            while i < lines.len() {
-                let next = lines[i];
-                let next_trimmed = next.trim_start();
-                let next_indent = next.len() - next_trimmed.len();
-                // Function ends when we hit a non-empty line at same or lesser indent
-                if !next_trimmed.is_empty() && next_indent <= func_indent {
-                    break;
-                }
-                i += 1;
+        // Exit class context when we reach a non-empty line at or above the class indent.
+        if let Some((_, class_indent)) = current_class.as_ref() {
+            if !trimmed.is_empty() && indent <= *class_indent {
+                current_class = None;
             }
+        }
+
+        // Detect class definitions.
+        if trimmed.starts_with("class ") && trimmed.contains(':') {
+            if let Some(class_name) = extract_class_name(trimmed) {
+                current_class = Some((class_name.to_string(), indent));
+            }
+            output.push_str(line);
+            output.push('\n');
+            i += 1;
             continue;
+        }
+
+        // Check if this line starts a function definition we're mutating.
+        let func_name = extract_func_name(trimmed);
+        let class_key = current_class.as_ref().map(|(name, _)| name.as_str());
+
+        if !func_name.is_empty() {
+            if let Some(idx) = find_trampoline_idx(&function_mutations, class_key, func_name) {
+                // Strip the entire function body.
+                let func_indent = indent;
+                i += 1;
+                while i < lines.len() {
+                    let next = lines[i];
+                    let next_trimmed = next.trim_start();
+                    let next_indent = next.len() - next_trimmed.len();
+                    // Function ends when we hit a non-empty line at same or lesser indent.
+                    if !next_trimmed.is_empty() && next_indent <= func_indent {
+                        break;
+                    }
+                    i += 1;
+                }
+
+                // For class methods: emit the wrapper inline, indented to the method's level.
+                // The original name is preserved so instance.method() keeps working.
+                if class_key.is_some() {
+                    let wrapper = &trampolines[idx].wrapper_code;
+                    let indented = indent_code(wrapper, func_indent);
+                    output.push_str(&indented);
+                    output.push('\n');
+                }
+                // For top-level functions: wrapper is emitted after the walk (module level).
+                continue;
+            }
         }
 
         output.push_str(line);
@@ -68,19 +111,44 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         i += 1;
     }
 
-    // Append all trampoline arrangements
+    // Append module-level code for ALL functions (mangled orig, variants, lookup dict).
+    // These have globally-unique mangled names and are safe at module level.
     output.push('\n');
-    for fm in &function_mutations {
-        let (trampoline_code, mutant_names) = generate_trampoline(fm, module_name);
-        output.push_str(&trampoline_code);
+    for tp in &trampolines {
+        output.push_str(&tp.module_code);
         output.push_str("\n\n");
-        all_mutant_names.extend(mutant_names);
+    }
+
+    // Append wrappers for TOP-LEVEL functions only.
+    // Class method wrappers were already emitted inline during the walk.
+    for (idx, fm) in function_mutations.iter().enumerate() {
+        if fm.class_name.is_none() {
+            output.push_str(&trampolines[idx].wrapper_code);
+            output.push_str("\n\n");
+        }
     }
 
     Some(MutatedFile {
         source: output,
         mutant_names: all_mutant_names,
     })
+}
+
+/// Find the index of the trampoline for (class_name, func_name) in function_mutations.
+fn find_trampoline_idx(
+    function_mutations: &[FunctionMutations],
+    class_name: Option<&str>,
+    func_name: &str,
+) -> Option<usize> {
+    function_mutations
+        .iter()
+        .position(|fm| fm.name == func_name && fm.class_name.as_deref() == class_name)
+}
+
+fn extract_class_name(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("class ")?;
+    let name = rest.split(['(', ':']).next()?.trim();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn extract_func_name(line: &str) -> &str {
@@ -93,6 +161,22 @@ fn extract_func_name(line: &str) -> &str {
     };
 
     after_def.split('(').next().unwrap_or("")
+}
+
+/// Indent every line of `code` by `indent` spaces.
+/// Empty/whitespace-only lines are left blank (no trailing spaces).
+fn indent_code(code: &str, indent: usize) -> String {
+    let prefix = " ".repeat(indent);
+    code.lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -273,6 +357,181 @@ class Finder:
         assert_eq!(
             sub_count, 1,
             "Should have exactly one 'def sub(' (the wrapper), got {sub_count}"
+        );
+    }
+
+    // INV-1: class method wrapper is indented inside class body
+    // INV-2: top-level function wrapper is at module level (indent 0)
+    // INV-3: mangled orig/variants/dict always at module level
+
+    #[test]
+    fn test_top_level_wrapper_at_module_level() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let result = mutate_file(source, "m").unwrap();
+
+        // The wrapper `def add(` must NOT be indented (indent == 0)
+        let wrapper_line = result
+            .source
+            .lines()
+            .find(|l| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with("def add(") && !trimmed.contains("mutmut")
+            })
+            .expect("wrapper def add( should exist");
+        let indent = wrapper_line.len() - wrapper_line.trim_start().len();
+        assert_eq!(indent, 0, "top-level wrapper must be at indent 0, got: {wrapper_line:?}");
+    }
+
+    #[test]
+    fn test_mangled_code_at_module_level() {
+        let source = "\
+class Calc:
+    def add(self, a, b):
+        return a + b
+";
+        let result = mutate_file(source, "m").unwrap();
+
+        // The mangled orig function definition must appear at indent 0 (module level)
+        let orig_line = result
+            .source
+            .lines()
+            .find(|l| l.starts_with("def xǁCalcǁadd__mutmut_orig("))
+            .expect("mangled orig def should exist at module level");
+        let indent = orig_line.len() - orig_line.trim_start().len();
+        assert_eq!(indent, 0, "mangled orig must be at module level, got: {orig_line:?}");
+    }
+
+    #[test]
+    fn test_mixed_class_and_top_level() {
+        // File with both a class method and a top-level function.
+        // Both should be trampolined correctly.
+        let source = "\
+def compute(x):
+    return x + 1
+
+class Processor:
+    def run(self, x):
+        return x - 1
+";
+        let result = mutate_file(source, "mixed").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        // top-level `compute` wrapper must be at indent 0
+        let compute_wrapper = lines
+            .iter()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with("def compute(") && !t.contains("mutmut")
+            })
+            .expect("wrapper for compute should exist");
+        let compute_indent = compute_wrapper.len() - compute_wrapper.trim_start().len();
+        assert_eq!(compute_indent, 0, "compute wrapper must be at module level");
+
+        // class method `run` wrapper must be indented inside Processor
+        let class_pos = lines
+            .iter()
+            .position(|l| l.contains("class Processor"))
+            .expect("class Processor should exist");
+        let run_wrapper = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def run(") && !t.contains("mutmut")
+            })
+            .expect("wrapper for run should exist");
+        assert!(run_wrapper > class_pos, "run wrapper must be after class definition");
+        let run_text = lines[run_wrapper];
+        let run_indent = run_text.len() - run_text.trim_start().len();
+        assert!(run_indent > 0, "run wrapper must be indented inside Processor");
+    }
+
+    #[test]
+    fn test_two_classes_same_method_name() {
+        // Two classes both with a `process` method — each should get its own wrapper.
+        let source = "\
+class Alpha:
+    def process(self, x):
+        return x + 1
+
+class Beta:
+    def process(self, x):
+        return x - 1
+";
+        let result = mutate_file(source, "dual").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let alpha_pos = lines.iter().position(|l| l.contains("class Alpha")).expect("class Alpha");
+        let beta_pos = lines.iter().position(|l| l.contains("class Beta")).expect("class Beta");
+
+        // Both classes should appear in the output
+        assert!(alpha_pos < beta_pos, "Alpha before Beta");
+
+        // Each class should have at least one indented `def process(` wrapper
+        // Find all `def process(` wrappers (not mangled)
+        let wrapper_positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let t = l.trim_start();
+                if t.starts_with("def process(") && !t.contains("mutmut") {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            wrapper_positions.len(),
+            2,
+            "Should have exactly 2 process wrappers (one per class), got {}: {result:?}",
+            wrapper_positions.len(),
+            result = result.source
+        );
+
+        // First wrapper should be between Alpha and Beta
+        assert!(
+            wrapper_positions[0] > alpha_pos && wrapper_positions[0] < beta_pos,
+            "First process wrapper should be inside Alpha"
+        );
+        // Second wrapper should be after Beta
+        assert!(
+            wrapper_positions[1] > beta_pos,
+            "Second process wrapper should be inside Beta"
+        );
+
+        // Both should be indented
+        for &pos in &wrapper_positions {
+            let text = lines[pos];
+            let ind = text.len() - text.trim_start().len();
+            assert!(ind > 0, "process wrapper at line {pos} should be indented, got: {text:?}");
+        }
+    }
+
+    #[test]
+    fn test_class_all_methods_mutated_not_empty() {
+        // When ALL methods are mutated, the class body shouldn't become empty.
+        // The wrappers fill the body.
+        let source = "\
+class Single:
+    def only(self, x):
+        return x + 1
+";
+        let result = mutate_file(source, "single").unwrap();
+
+        // class body should not be empty — the wrapper must be there
+        let lines: Vec<&str> = result.source.lines().collect();
+        let class_pos = lines.iter().position(|l| l.contains("class Single")).expect("class Single");
+
+        // The very next non-empty line after `class Single:` must be the wrapper
+        let first_body_line = lines[class_pos + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .expect("class body should not be empty");
+        let t = first_body_line.trim_start();
+        assert!(
+            t.starts_with("def only(") && !t.contains("mutmut"),
+            "First line of class body after stripping should be the wrapper, got: {first_body_line:?}"
         );
     }
 }
