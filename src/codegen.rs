@@ -171,6 +171,92 @@ mod tests {
     }
 
     #[test]
+    fn test_class_method_wrapper_stays_inside_class() {
+        let source = "\
+class Calculator:
+    def add(self, a, b):
+        return a + b
+";
+        let result = mutate_file(source, "calc").unwrap();
+
+        // The wrapper `def add(self, a, b)` must be INSIDE the class body,
+        // i.e. it must appear indented after `class Calculator:`.
+        // If it's at module level, `Calculator().add(1, 2)` will fail because
+        // the class has no `add` method.
+        let lines: Vec<&str> = result.source.lines().collect();
+        let class_line = lines
+            .iter()
+            .position(|l| l.contains("class Calculator"))
+            .expect("class Calculator should exist in output");
+
+        // Find the wrapper: `def add(self, a, b):` (NOT the mangled orig)
+        let wrapper_line = lines
+            .iter()
+            .position(|l| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with("def add(") && !trimmed.contains("mutmut")
+            })
+            .expect("wrapper def add( should exist in output");
+
+        assert!(
+            wrapper_line > class_line,
+            "wrapper must appear after class definition"
+        );
+
+        // The wrapper must be indented (i.e. inside the class body)
+        let wrapper_text = lines[wrapper_line];
+        let indent = wrapper_text.len() - wrapper_text.trim_start().len();
+        assert!(
+            indent > 0,
+            "wrapper 'def add(' should be indented (inside class body), but got: {:?}",
+            wrapper_text
+        );
+    }
+
+    #[test]
+    fn test_class_method_init_stays_inside_class() {
+        // Regression test for: trampolined __init__ ends up at module level,
+        // causing `TypeError: ClassName() takes no arguments`
+        let source = "\
+class Finder:
+    def __init__(self, path):
+        self.path = path
+
+    def search(self, query):
+        return query in self.path
+";
+        let result = mutate_file(source, "finder").unwrap();
+
+        // Parse the output: both __init__ and search wrappers must be inside the class
+        let lines: Vec<&str> = result.source.lines().collect();
+        let class_line = lines
+            .iter()
+            .position(|l| l.contains("class Finder"))
+            .expect("class Finder should exist");
+
+        // Find wrapper for __init__ (not the mangled orig)
+        let init_wrapper = lines
+            .iter()
+            .position(|l| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with("def __init__(") && !trimmed.contains("mutmut")
+            })
+            .expect("wrapper def __init__( should exist");
+
+        assert!(
+            init_wrapper > class_line,
+            "__init__ wrapper must appear after class definition"
+        );
+        let init_text = lines[init_wrapper];
+        let init_indent = init_text.len() - init_text.trim_start().len();
+        assert!(
+            init_indent > 0,
+            "__init__ wrapper should be indented (inside class body), but got: {:?}",
+            init_text
+        );
+    }
+
+    #[test]
     fn test_mutated_functions_not_duplicated() {
         let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
         let result = mutate_file(source, "m").unwrap();
