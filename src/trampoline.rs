@@ -111,6 +111,58 @@ fn generate_wrapper_function(
     )
 }
 
+/// Strip inline comments from a params source string (line by line).
+/// This handles `# type: ignore[override]` and similar annotations.
+fn strip_inline_comments(s: &str) -> String {
+    s.lines()
+        .map(|line| {
+            // Strip everything after the first '#' on each line.
+            // Per task spec, we don't need to handle '#' inside string literals.
+            if let Some(pos) = line.find('#') {
+                &line[..pos]
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split a parameter list string by commas, respecting bracket nesting.
+/// Only splits on commas at bracket depth 0 (not inside `[`, `(`, or `{`).
+fn split_params(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+
+    for ch in s.chars() {
+        match ch {
+            '[' | '(' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ']' | ')' | '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+
+    parts
+}
+
 /// Parse parameter names from a params source string.
 /// Returns (positional_args, keyword_only_args).
 fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<String>) {
@@ -118,7 +170,10 @@ fn parse_param_names(params_source: &str, has_self: bool) -> (Vec<String>, Vec<S
     let mut kw_args = Vec::new();
     let mut after_star = false;
 
-    for part in params_source.split(',') {
+    // Strip inline comments before splitting, then do bracket-aware split.
+    let stripped = strip_inline_comments(params_source);
+
+    for part in split_params(&stripped) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -285,5 +340,64 @@ mod tests {
             output.mutant_keys[0].starts_with("my_lib.x_add__mutmut_"),
             "Keys should be module-qualified"
         );
+    }
+
+    // INV-1: Parameters with generic type annotations parse to the correct name only.
+    #[test]
+    fn test_parse_param_names_generic_annotation() {
+        let (pos_args, kw_args) = parse_param_names("self, mapping: cabc.Mapping[str, t.Any], /", true);
+        assert_eq!(pos_args, vec!["mapping"]);
+        assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // INV-2: Inline comments do not affect parameter extraction.
+    #[test]
+    fn test_parse_param_names_inline_comment() {
+        let (pos_args, kw_args) = parse_param_names(
+            "self,\n    mapping: cabc.Mapping[str, t.Any],  # type: ignore[override]\n    /,",
+            true,
+        );
+        assert_eq!(pos_args, vec!["mapping"]);
+        assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // INV-3: Nested brackets parse correctly.
+    #[test]
+    fn test_parse_param_names_nested_brackets() {
+        let (pos_args, kw_args) = parse_param_names("self, x: Dict[str, List[int]], y: int", true);
+        assert_eq!(pos_args, vec!["x", "y"]);
+        assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // INV-4: Existing simple-param behavior unchanged.
+    #[test]
+    fn test_parse_param_names_simple() {
+        let (pos_args, kw_args) = parse_param_names("a, b, c", false);
+        assert_eq!(pos_args, vec!["a", "b", "c"]);
+        assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // Tuple with ellipsis and keyword-only args after *.
+    #[test]
+    fn test_parse_param_names_tuple_kwonly() {
+        let (pos_args, kw_args) = parse_param_names("self, x: Tuple[int, ...], *, key: str", true);
+        assert_eq!(pos_args, vec!["x"]);
+        assert_eq!(kw_args, vec!["key"]);
+    }
+
+    // Multiple bracket types: Dict[str, Tuple[int, ...]].
+    #[test]
+    fn test_parse_param_names_deeply_nested() {
+        let (pos_args, kw_args) = parse_param_names("self, x: Dict[str, Tuple[int, ...]], y: int", true);
+        assert_eq!(pos_args, vec!["x", "y"]);
+        assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // Positional-only separator after bracketed annotation.
+    #[test]
+    fn test_parse_param_names_pos_only_after_bracket() {
+        let (pos_args, kw_args) = parse_param_names("self, mapping: Mapping[str, Any], /", true);
+        assert_eq!(pos_args, vec!["mapping"]);
+        assert_eq!(kw_args, Vec::<String>::new());
     }
 }
