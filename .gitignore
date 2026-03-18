@@ -45,3 +45,4 @@ fuzz/target/
 # Benchmarks
 bench/results/
 bench/.venv/
+bench/corpora/

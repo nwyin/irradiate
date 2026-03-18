@@ -11,13 +11,13 @@ echo "Project root: $ROOT"
 echo
 
 # ── 1. Build irradiate release binary ─────────────────────────────────────
-echo "[1/4] Building irradiate (release)..."
+echo "[1/6] Building irradiate (release)..."
 cargo build --release
 echo "      binary: target/release/irradiate"
 echo
 
 # ── 2. Bench venv with mutmut installed ───────────────────────────────────
-echo "[2/4] Setting up bench/.venv with mutmut..."
+echo "[2/6] Setting up bench/.venv with mutmut..."
 uv venv bench/.venv --python python3.12 --seed
 uv pip install --python bench/.venv/bin/python \
     -e vendor/mutmut \
@@ -27,7 +27,7 @@ echo "      mutmut: $(bench/.venv/bin/mutmut version 2>/dev/null || echo 'instal
 echo
 
 # ── 3. simple_project venv ────────────────────────────────────────────────
-echo "[3/4] Setting up tests/fixtures/simple_project/.venv..."
+echo "[3/6] Setting up tests/fixtures/simple_project/.venv..."
 cd tests/fixtures/simple_project
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -37,7 +37,7 @@ cd "$ROOT"
 echo
 
 # ── 4. my_lib venv ────────────────────────────────────────────────────────
-echo "[4/4] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
+echo "[4/6] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
 cd vendor/mutmut/e2e_projects/my_lib
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -47,6 +47,39 @@ uv pip install --python .venv/bin/python -e .
 cd "$ROOT"
 echo
 
+# ── 5. Bootstrap vendor corpora ───────────────────────────────────────────
+echo "[5/6] Bootstrapping vendor corpora (bench/corpora/)..."
+bash "$ROOT/scripts/bootstrap-vendors.sh"
+echo
+
+# ── 6. Set up venvs for vendor corpora ────────────────────────────────────
+echo "[6/6] Setting up venvs for vendor corpora..."
+
+setup_vendor_venv() {
+    local name="$1"
+    local install_args="$2"
+    local vdir="$ROOT/bench/corpora/$name"
+    if [ ! -d "$vdir" ]; then
+        echo "  $name not found (clone may have failed) — skipping venv"
+        return 0
+    fi
+    if [ ! -d "$vdir/.venv" ]; then
+        echo "  Setting up $name venv..."
+        (cd "$vdir" && uv venv --python python3.12)
+        # shellcheck disable=SC2086
+        (cd "$vdir" && uv pip install $install_args) \
+            || echo "  WARNING: $name install failed — venv may be incomplete"
+    else
+        echo "  $name .venv already present, skipping"
+    fi
+}
+
+setup_vendor_venv markupsafe "pytest -e ."
+setup_vendor_venv click      "pytest -e '.[testing]'"
+setup_vendor_venv httpx      "pytest -e ."
+echo
+
 echo "=== Setup complete ==="
 echo "Run benchmarks with: bash bench/compare.sh simple_project"
 echo "                 or: bash bench/compare.sh my_lib"
+echo "Run vendor smoke tests with: bash tests/vendor_test.sh"
