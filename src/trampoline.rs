@@ -276,14 +276,20 @@ pub fn trampoline_impl() -> &'static str {
 def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None, args=None):
     active = _ih.active_mutant
     if not active:
+        if self_arg is not None:
+            return orig(self_arg, *call_args, **call_kwargs)
         return orig(*call_args, **call_kwargs) if call_args is not None else None
     if active == 'fail':
         raise _ih.ProgrammaticFailException()
     if active == 'stats':
         _ih.record_hit(orig.__module__ + '.' + orig.__name__)
+        if self_arg is not None:
+            return orig(self_arg, *call_args, **call_kwargs)
         return orig(*call_args, **call_kwargs) if call_args is not None else None
     prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_'
     if not active.startswith(prefix):
+        if self_arg is not None:
+            return orig(self_arg, *call_args, **call_kwargs)
         return orig(*call_args, **call_kwargs) if call_args is not None else None
     variant = active.rpartition('.')[-1]
     if self_arg is not None:
@@ -399,5 +405,52 @@ mod tests {
         let (pos_args, kw_args) = parse_param_names("self, mapping: Mapping[str, Any], /", true);
         assert_eq!(pos_args, vec!["mapping"]);
         assert_eq!(kw_args, Vec::<String>::new());
+    }
+
+    // INV-1/INV-2: All three passthrough paths in trampoline_impl must forward self_arg.
+    // Regression test: before fix, the inactive/stats/prefix-mismatch paths called
+    // orig(*call_args) without prepending self_arg, causing TypeError for class methods.
+    #[test]
+    fn test_trampoline_impl_all_passthrough_paths_forward_self_arg() {
+        let impl_str = trampoline_impl();
+        // 3 passthrough paths call orig(self_arg, ...) — inactive, stats, prefix-mismatch
+        let orig_self_count = impl_str.matches("orig(self_arg, *call_args").count();
+        assert_eq!(
+            orig_self_count, 3,
+            "All 3 passthrough paths (inactive, stats, prefix-mismatch) must forward self_arg to orig: found {orig_self_count}"
+        );
+        // Mutant dispatch path calls mutants[variant](self_arg, ...)
+        assert!(
+            impl_str.contains("mutants[variant](self_arg, *call_args"),
+            "Mutant dispatch path must also forward self_arg"
+        );
+    }
+
+    // INV-3: Top-level trampoline wrapper uses None as self_arg.
+    #[test]
+    fn test_trampoline_wrapper_top_level_uses_none_self_arg() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let output = generate_trampoline(&fms[0], "my_lib");
+        assert!(
+            output.wrapper_code.contains(", None)"),
+            "Top-level wrapper should pass None as self_arg; got: {}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-1: Class method trampoline wrapper passes `self` as self_arg.
+    #[test]
+    fn test_trampoline_wrapper_class_method_uses_self_arg() {
+        let source = "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n";
+        let fms = collect_file_mutations(source);
+        let class_fm = fms.iter().find(|fm| fm.class_name.is_some()).expect("should find class method");
+        let output = generate_trampoline(class_fm, "point_module");
+        assert!(
+            output.wrapper_code.contains(", self)"),
+            "Class method wrapper should pass self as self_arg; got: {}",
+            output.wrapper_code
+        );
     }
 }
