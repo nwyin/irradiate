@@ -1,0 +1,6 @@
+[project]
+name = "irradiate"
+
+[hive]
+backend = "claude"
+merge_queue_enabled = true
