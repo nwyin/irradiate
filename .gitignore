@@ -24,7 +24,6 @@ tests/vendor_repos/
 
 # Hive
 .worktrees/
-.hive/queen-context.md
 .hive/queen-state.md
 
 # OS
