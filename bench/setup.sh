@@ -11,17 +11,13 @@ echo "Project root: $ROOT"
 echo
 
 # ── 1. Build irradiate release binary ─────────────────────────────────────
-echo "[1/6] Building irradiate (release)..."
+echo "[1/7] Building irradiate (release)..."
 cargo build --release
 echo "      binary: target/release/irradiate"
 echo
 
-# TODO: re-add mutmut comparison venv when upstream fixes v3 bugs
-# (set_start_method crash #466, fork+setproctitle segfaults #446,
-#  trampoline codegen bugs #387/#480/#477)
-
 # ── 2. simple_project venv ────────────────────────────────────────────────
-echo "[2/6] Setting up tests/fixtures/simple_project/.venv..."
+echo "[2/7] Setting up tests/fixtures/simple_project/.venv..."
 cd tests/fixtures/simple_project
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -31,7 +27,7 @@ cd "$ROOT"
 echo
 
 # ── 3. my_lib venv ────────────────────────────────────────────────────────
-echo "[3/6] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
+echo "[3/7] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
 cd vendor/mutmut/e2e_projects/my_lib
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -42,7 +38,7 @@ cd "$ROOT"
 echo
 
 # ── 4. synth venv ─────────────────────────────────────────────────────────
-echo "[4/6] Setting up bench/targets/synth/.venv..."
+echo "[4/7] Setting up bench/targets/synth/.venv..."
 cd bench/targets/synth
 if [ ! -d .venv ]; then
     uv venv --python python3.12 --seed
@@ -52,13 +48,25 @@ uv pip install --python .venv/bin/python -e .
 cd "$ROOT"
 echo
 
-# ── 5. Bootstrap vendor corpora ───────────────────────────────────────────
-echo "[5/6] Bootstrapping vendor corpora (bench/corpora/)..."
+# ── 5. mutmut 2.5.1 venv (benchmark comparison) ──────────────────────────
+# We pin to 2.5.1 — the last stable release before the broken 3.x rewrite.
+# mutmut 3.0–3.5 all crash on macOS (set_start_method #466, setproctitle #446).
+# This venv also gets the synth package installed so mutmut can run its tests.
+echo "[5/7] Setting up bench/.venv (mutmut==2.5.1 for benchmark comparison)..."
+if [ ! -d bench/.venv ]; then
+    uv venv bench/.venv --python python3.12 --seed
+fi
+uv pip install --python bench/.venv/bin/python 'mutmut==2.5.1' pytest hatchling
+uv pip install --python bench/.venv/bin/python -e bench/targets/synth
+echo
+
+# ── 6. Bootstrap vendor corpora ───────────────────────────────────────────
+echo "[6/7] Bootstrapping vendor corpora (bench/corpora/)..."
 bash "$ROOT/scripts/bootstrap-vendors.sh"
 echo
 
-# ── 6. Set up venvs for vendor corpora ────────────────────────────────────
-echo "[6/6] Setting up venvs for vendor corpora..."
+# ── 7. Set up venvs for vendor corpora ────────────────────────────────────
+echo "[7/7] Setting up venvs for vendor corpora..."
 
 setup_vendor_venv() {
     local name="$1"

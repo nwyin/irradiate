@@ -11,9 +11,31 @@
 # Environment overrides:
 #   BENCH_RUNS=N    number of timed runs (default: 3)
 #
-# TODO: re-add mutmut comparison when upstream fixes v3 bugs
-#   (set_start_method crash #466, fork+setproctitle segfaults #446,
-#    trampoline codegen bugs #387/#480/#477)
+# ── APPLES-TO-ORANGES NOTE ──────────────────────────────────────────────────
+# This script compares irradiate against mutmut 2.5.1. These tools use
+# fundamentally different mutation architectures:
+#
+#   irradiate   — trampoline-based: all mutant variants compiled into one file,
+#                 switching via a global variable (no per-mutant disk I/O).
+#                 Parsing via libcst (Rust-native, pyo3).
+#
+#   mutmut 2.x  — disk-based: writes mutated source to disk, runs pytest,
+#                 restores original after each mutant. Each mutant involves
+#                 file I/O. Parsing via parso (pure Python AST).
+#
+# What this means for the numbers:
+#   • irradiate's trampoline eliminates per-mutant disk I/O — a structural
+#     advantage, not just an optimization.
+#   • Operator coverage differs; mutant counts will NOT match between tools.
+#     This is expected and not a bug.
+#   • ms/mutant is the fairest comparison metric (normalizes for count differences).
+#   • We pin mutmut to 2.5.1 — the last stable release. mutmut 3.x crashes on
+#     macOS (set_start_method #466, setproctitle #446).
+#   • mutmut 2.x does NOT use the trampoline architecture mutmut 3.x introduced.
+#     This comparison is disk-based vs trampoline, not old-mutmut vs new-mutmut.
+#
+# See bench/README.md for full methodology documentation.
+# ────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,7 +99,7 @@ NCPU="$(sysctl -n hw.ncpu)"
 
 # ── Helper: clean slate ───────────────────────────────────────────────────
 clean_slate() {
-    rm -rf "$PROJECT_DIR/mutants" "$PROJECT_DIR/.irradiate"
+    rm -rf "$PROJECT_DIR/mutants" "$PROJECT_DIR/.irradiate" "$PROJECT_DIR/.mutmut-cache"
 }
 
 # ── Helper: run one configuration ─────────────────────────────────────────
@@ -184,8 +206,40 @@ for i in $(seq 1 "$RUNS"); do
 done
 echo
 
-# TODO: re-add mutmut comparison when upstream fixes v3 bugs
-# (mutmut_Nc and mutmut_1c configs removed — broken on macOS across all v3 releases)
+# ── Run mutmut (N children) ───────────────────────────────────────────────
+# mutmut 2.5.1 pinned — see header comment for apples-to-oranges context.
+MUTMUT_PYTHON="$BENCH_DIR/.venv/bin/python"
+if [ ! -x "$MUTMUT_PYTHON" ]; then
+    echo "Warning: $MUTMUT_PYTHON not found — skipping mutmut benchmarks." >&2
+    echo "  Run: bash bench/setup.sh" >&2
+else
+    CONFIG="mutmut_${NCPU}c"
+    echo "--- $CONFIG ---"
+    ( cd "$PROJECT_DIR" && warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children "$NCPU" )
+
+    for i in $(seq 1 "$RUNS"); do
+        (
+            cd "$PROJECT_DIR"
+            run_config "$CONFIG" "$i" \
+                "$MUTMUT_PYTHON" -m mutmut run --max-children "$NCPU"
+        )
+    done
+    echo
+
+    # ── Run mutmut (1 child) ──────────────────────────────────────────────
+    CONFIG="mutmut_1c"
+    echo "--- $CONFIG ---"
+    ( cd "$PROJECT_DIR" && warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children 1 )
+
+    for i in $(seq 1 "$RUNS"); do
+        (
+            cd "$PROJECT_DIR"
+            run_config "$CONFIG" "$i" \
+                "$MUTMUT_PYTHON" -m mutmut run --max-children 1
+        )
+    done
+    echo
+fi
 
 # ── Generate summary ──────────────────────────────────────────────────────
 echo "=== Generating summary ==="
