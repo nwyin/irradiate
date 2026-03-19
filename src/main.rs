@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
                 },
                 worker_recycle_after,
                 isolate,
+                do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
             })
             .await
         }

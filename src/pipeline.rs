@@ -28,6 +28,8 @@ pub struct RunConfig {
     /// Run each mutant in a fresh subprocess instead of the worker pool.
     /// Slower but provides perfect isolation — no pytest state can leak between mutants.
     pub isolate: bool,
+    /// Glob patterns of files to skip entirely (e.g. ["**/vendor/*.py", "src/generated.py"]).
+    pub do_not_mutate: Vec<String>,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -46,7 +48,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Phase 1: Mutation generation
     eprintln!("Generating mutants...");
     let start = Instant::now();
-    let all_mutant_names = generate_mutants(&config.paths_to_mutate, &mutants_dir)?;
+    let all_mutant_names = generate_mutants(&config.paths_to_mutate, &mutants_dir, &config.do_not_mutate)?;
     let gen_time = start.elapsed();
     eprintln!(
         "  done in {:.0}ms ({} mutants across {} files)",
@@ -467,9 +469,68 @@ pub fn build_pythonpath(harness_dir: &Path, paths_to_mutate: &Path) -> String {
     format!("{}:{}", harness_dir.display(), source_parent.display())
 }
 
+/// Returns true if `path` matches the glob `pattern`.
+///
+/// Supported wildcards:
+/// - `**`  — matches any number of path segments (including zero)
+/// - `*`   — matches any sequence of characters within a single segment
+/// - `?`   — matches exactly one character within a single segment
+///
+/// Matching is done on `/`-separated components. The path and pattern are split
+/// on `/` before comparison, so platform path separators must be normalized first.
+pub fn path_matches_glob(path: &str, pattern: &str) -> bool {
+    let path_segs: Vec<&str> = path.split('/').collect();
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    glob_match_segs(&path_segs, &pat_segs)
+}
+
+fn glob_match_segs(path: &[&str], pattern: &[&str]) -> bool {
+    match (path, pattern) {
+        ([], []) => true,
+        (_, []) => false,
+        ([], [p]) => *p == "**",
+        ([], _) => false,
+        (_, ["**"]) => true, // ** at end matches any remaining path
+        (_, ["**", rest @ ..]) => {
+            // ** matches zero or more segments: try consuming 0, 1, 2, … segments.
+            for i in 0..=path.len() {
+                if glob_match_segs(&path[i..], rest) {
+                    return true;
+                }
+            }
+            false
+        }
+        ([ph, pt @ ..], [pp, prest @ ..]) => {
+            glob_match_seg(ph, pp) && glob_match_segs(pt, prest)
+        }
+    }
+}
+
+/// Match a single path segment against a single pattern segment (no `**` here).
+fn glob_match_seg(s: &str, pattern: &str) -> bool {
+    glob_match_bytes(s.as_bytes(), pattern.as_bytes())
+}
+
+fn glob_match_bytes(s: &[u8], p: &[u8]) -> bool {
+    match (s, p) {
+        ([], []) => true,
+        (_, [b'*']) => true, // * at end of pattern matches rest of segment
+        (_, []) => false,
+        ([], _) => p.iter().all(|&c| c == b'*'), // only trailing *s can match empty
+        ([_, st @ ..], [b'?', pt @ ..]) => glob_match_bytes(st, pt),
+        ([_sc, st @ ..], [b'*', pt @ ..]) => {
+            // * matches zero or more chars: try matching from current position (consume 0)
+            // or skip one char and retry.
+            glob_match_bytes(s, pt) || glob_match_bytes(st, p)
+        }
+        ([sc, st @ ..], [pc, pt @ ..]) => sc == pc && glob_match_bytes(st, pt),
+    }
+}
+
 fn generate_mutants(
     paths_to_mutate: &Path,
     mutants_dir: &Path,
+    do_not_mutate: &[String],
 ) -> Result<HashMap<String, Vec<String>>> {
     // Clean mutants dir
     if mutants_dir.exists() {
@@ -496,6 +557,9 @@ fn generate_mutants(
         paths_to_mutate
     };
 
+    // Compute project root for do_not_mutate path matching (relative to cwd).
+    let cwd = std::env::current_dir()?;
+
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
     type MutantEntry = Option<(String, Vec<String>)>;
@@ -509,6 +573,23 @@ fn generate_mutants(
             // e.g., src/click/types.py with strip_base=src → click/types.py → click.types
             let rel_path = py_file.strip_prefix(strip_base)?;
             let module_name = path_to_module(rel_path);
+
+            // Check do_not_mutate patterns against path relative to cwd.
+            // Patterns like "src/config.py" or "**/utils.py" are matched against the
+            // file path as it would appear from the project root.
+            if !do_not_mutate.is_empty() {
+                let rel_for_filter = py_file.strip_prefix(&cwd).unwrap_or(py_file);
+                let rel_filter_str = rel_for_filter.to_string_lossy().replace('\\', "/");
+                if do_not_mutate.iter().any(|pat| path_matches_glob(&rel_filter_str, pat)) {
+                    // Copy original for package integrity but skip mutation generation.
+                    let dest = mutants_dir.join(rel_path);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&dest, &source)?;
+                    return Ok(None);
+                }
+            }
 
             if let Some(mutated) = mutate_file(&source, &module_name) {
                 // Write mutated file
@@ -1276,7 +1357,7 @@ mod tests {
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
+        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
 
         // Both files must be present in mutants/
         assert!(
@@ -1311,7 +1392,7 @@ mod tests {
         // utils.py — only constants, no mutations
         std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path()).unwrap();
+        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
         assert!(
@@ -1356,7 +1437,7 @@ mod tests {
         std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points directly at the package directory "src/mypkg"
-        generate_mutants(&pkg, mutants_tmp.path()).unwrap();
+        generate_mutants(&pkg, mutants_tmp.path(), &[]).unwrap();
 
         // Files must land under mutants/mypkg/, not directly in mutants/
         let mutants_pkg = mutants_tmp.path().join("mypkg");
@@ -1394,7 +1475,7 @@ mod tests {
         std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points at the source root "src" (no __init__.py there)
-        generate_mutants(&src, mutants_tmp.path()).unwrap();
+        generate_mutants(&src, mutants_tmp.path(), &[]).unwrap();
 
         // Files must land under mutants/simple_lib/
         assert!(
@@ -1420,10 +1501,118 @@ mod tests {
         std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // Should not panic even when parent() returns an empty component
-        let result = generate_mutants(tmp.path(), mutants_tmp.path());
+        let result = generate_mutants(tmp.path(), mutants_tmp.path(), &[]);
         assert!(
             result.is_ok(),
             "should not fail for package dirs with no parent prefix"
         );
+    }
+
+    // --- path_matches_glob tests ---
+
+    #[test]
+    fn test_glob_exact_match() {
+        assert!(path_matches_glob("src/config.py", "src/config.py"));
+        assert!(!path_matches_glob("src/other.py", "src/config.py"));
+    }
+
+    #[test]
+    fn test_glob_star_in_segment() {
+        assert!(path_matches_glob("src/config.py", "src/*.py"));
+        assert!(!path_matches_glob("src/sub/config.py", "src/*.py"));
+    }
+
+    #[test]
+    fn test_glob_double_star_any_depth() {
+        // ** matches zero, one, or many segments
+        assert!(path_matches_glob("utils.py", "**/utils.py"));
+        assert!(path_matches_glob("src/utils.py", "**/utils.py"));
+        assert!(path_matches_glob("a/b/utils.py", "**/utils.py"));
+        assert!(!path_matches_glob("a/b/other.py", "**/utils.py"));
+    }
+
+    #[test]
+    fn test_glob_question_mark() {
+        assert!(path_matches_glob("src/foo.py", "src/f?o.py"));
+        assert!(!path_matches_glob("src/fxo.py", "src/fo.py")); // length mismatch
+    }
+
+    #[test]
+    fn test_glob_star_matches_empty() {
+        // * can match an empty string within a segment
+        assert!(path_matches_glob("src/a.py", "src/*.py"));
+    }
+
+    #[test]
+    fn test_glob_double_star_at_end() {
+        assert!(path_matches_glob("src/a/b/c.py", "src/**"));
+        assert!(path_matches_glob("src/file.py", "src/**"));
+    }
+
+    #[test]
+    fn test_glob_no_match_different_extension() {
+        assert!(!path_matches_glob("src/config.txt", "src/config.py"));
+    }
+
+    // --- generate_mutants do_not_mutate enforcement tests ---
+
+    #[test]
+    fn test_do_not_mutate_exact_path_skips_mutation() {
+        // When a file matches a do_not_mutate pattern, it must be copied verbatim (no mutations).
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // File that WOULD produce mutations
+        std::fs::write(
+            src_tmp.path().join("config.py"),
+            "def f(x):\n    return x + 1\n",
+        )
+        .unwrap();
+        // Another mutatable file (to verify the pipeline still runs)
+        std::fs::write(
+            src_tmp.path().join("core.py"),
+            "def g(x):\n    return x + 1\n",
+        )
+        .unwrap();
+
+        // Build pattern that matches config.py. Since the test uses absolute paths,
+        // we match using just the filename via **.
+        let pattern = "**/config.py".to_string();
+        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[pattern]).unwrap();
+
+        // config.py should NOT be in the mutant names (skipped)
+        for (module, _) in &result {
+            assert!(
+                !module.contains("config"),
+                "config module must not produce mutants when do_not_mutate matches it"
+            );
+        }
+
+        // config.py must still exist in mutants/ (copied verbatim for package integrity)
+        assert!(
+            mutants_tmp.path().join("config.py").exists(),
+            "skipped file must still be copied to mutants/ for package integrity"
+        );
+
+        // core.py must still produce mutants
+        assert!(
+            result.contains_key("core"),
+            "non-skipped file must still produce mutants"
+        );
+    }
+
+    #[test]
+    fn test_do_not_mutate_no_patterns_processes_all() {
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            src_tmp.path().join("lib.py"),
+            "def f(x):\n    return x + 1\n",
+        )
+        .unwrap();
+
+        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
+        assert!(!result.is_empty(), "empty do_not_mutate list must not skip any files");
     }
 }

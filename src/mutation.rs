@@ -97,6 +97,9 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
 /// Skip rules from the design doc.
 const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__new__"];
 
+/// Builtin function calls that are never mutated (neither the call itself nor its arguments).
+static NEVER_MUTATE_FUNCTION_CALLS: &[&str] = &["len", "isinstance"];
+
 fn collect_function_mutations(
     func: &cst::FunctionDef,
     class_name: Option<&str>,
@@ -444,6 +447,29 @@ fn collect_small_statement_mutations(
         SmallStatement::Assert(a) => {
             collect_expr_mutations(&a.test, source, cursor, mutations, ignored);
         }
+        SmallStatement::AnnAssign(a) => {
+            // Type annotations are never mutated. Only process the assigned value (if any).
+            // The full AnnAssign text is "target: annotation" or "target: annotation = value".
+            let full_text = codegen_node(a);
+            let stmt_start = source[*cursor..]
+                .find(&full_text)
+                .map(|p| *cursor + p)
+                .unwrap_or(*cursor);
+
+            if let Some(ref val) = a.value {
+                let val_text = codegen_node(val);
+                // Use rfind so that if val_text appears in the annotation too, we find the
+                // value occurrence (which is always last in the full text).
+                let val_in_full = full_text
+                    .rfind(&val_text)
+                    .unwrap_or(full_text.len().saturating_sub(val_text.len()));
+                *cursor = stmt_start + val_in_full;
+                collect_expr_mutations(val, source, cursor, mutations, ignored);
+            } else {
+                // Pure annotation (no value): "x: int" — advance cursor past it entirely.
+                *cursor = stmt_start + full_text.len();
+            }
+        }
         _ => {}
     }
 }
@@ -523,11 +549,15 @@ fn collect_expr_mutations(
             add_string_mutation_at(s, expr_start, mutations);
         }
         Expression::Call(call) => {
-            add_method_mutations(call, expr_start, mutations);
-            add_arg_removal_mutations(call, &expr_text, expr_start, mutations);
-            collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
-            for arg in &call.args {
-                collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
+            // Skip calls to builtins that should never be mutated (len, isinstance, etc.).
+            let is_skip = matches!(&*call.func, Expression::Name(n) if NEVER_MUTATE_FUNCTION_CALLS.contains(&n.value));
+            if !is_skip {
+                add_method_mutations(call, expr_start, mutations);
+                add_arg_removal_mutations(call, &expr_text, expr_start, mutations);
+                collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
+                for arg in &call.args {
+                    collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
+                }
             }
         }
         Expression::IfExp(ifexp) => {
@@ -1822,6 +1852,104 @@ mod tests {
         assert_eq!(muts.len(), 2, "f(a, *args) must produce 2 arg_removal mutations; got: {replacements:?}");
         assert!(replacements.iter().any(|r| r.contains("f(None, *args)")), "missing f(None, *args)");
         assert!(replacements.iter().any(|r| r.contains("f(*args)")), "missing f(*args)");
+    }
+
+    // --- annotation skip tests ---
+
+    // INV-1: Type annotations in function parameters produce 0 mutations.
+    #[test]
+    fn test_annotation_skip_param_types() {
+        // int and str appear in the function signature, not the body.
+        // The cursor starts past the header so they are never visited.
+        let source = "def f(x: int) -> str:\n    return x\n";
+        let fms = collect_file_mutations(source);
+        // The body only has `return x` — `x` is a Name but not True/False/deepcopy → 0 mutations.
+        // Verify no mutations come from `int` or `str` in the signature.
+        let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
+        let ann_muts: Vec<_> = all_muts
+            .iter()
+            .filter(|m| m.original == "int" || m.original == "str")
+            .collect();
+        assert!(ann_muts.is_empty(), "type annotations must not produce mutations");
+    }
+
+    // INV-2: Variable annotation (AnnAssign) produces 0 mutations on the annotation.
+    #[test]
+    fn test_annotation_skip_ann_assign_type() {
+        // `x: int = 5` — the annotation `int` must not be mutated; the value 5 may be.
+        let source = "def foo():\n    x: int = 5\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
+        let int_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "int").collect();
+        assert!(int_muts.is_empty(), "annotation 'int' must not produce mutations");
+        // The value 5 should produce a number mutation.
+        let num_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "number_mutation").collect();
+        assert!(!num_muts.is_empty(), "value '5' in annotation assignment should still be mutated");
+    }
+
+    // INV-3: Pure type annotation (no value) produces 0 mutations.
+    #[test]
+    fn test_annotation_skip_pure_ann_assign() {
+        // `x: int` with no value — nothing should be mutated.
+        let source = "def foo():\n    x: int\n    return 1 + 1\n";
+        let fms = collect_file_mutations(source);
+        let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
+        let int_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "int").collect();
+        assert!(int_muts.is_empty(), "pure annotation 'x: int' must produce 0 mutations on int");
+    }
+
+    // INV-4: Generic annotation like List[int] produces 0 mutations.
+    #[test]
+    fn test_annotation_skip_generic() {
+        let source = "def foo():\n    x: list = []\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
+        // The annotation `list` is a Name, but should not produce mutations.
+        let list_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "list").collect();
+        assert!(list_muts.is_empty(), "annotation 'list' must not produce mutations");
+    }
+
+    // --- NEVER_MUTATE_FUNCTION_CALLS tests ---
+
+    // INV-5: len(x) produces 0 mutations (call and argument both skipped).
+    #[test]
+    fn test_len_call_not_mutated() {
+        let source = "def foo(x):\n    return len(x)\n";
+        let fms = collect_file_mutations(source);
+        // len(x) should produce 0 mutations total (no arg_removal, no method_swap, x not visited).
+        assert!(fms.is_empty() || fms[0].mutations.is_empty(), "len(x) must produce 0 mutations");
+    }
+
+    // INV-6: isinstance(x, int) produces 0 mutations.
+    #[test]
+    fn test_isinstance_call_not_mutated() {
+        let source = "def foo(x):\n    return isinstance(x, int)\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty() || fms[0].mutations.is_empty(), "isinstance(x, int) must produce 0 mutations");
+    }
+
+    // INV-7: Regular calls are still mutated (len/isinstance skip is not a general rule).
+    #[test]
+    fn test_regular_calls_still_mutated() {
+        let source = "def foo(x):\n    return list(x)\n";
+        let fms = collect_file_mutations(source);
+        // list(x) — arg x produces arg_removal mutation (replace with None)
+        let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
+        assert!(!all_muts.is_empty(), "regular calls like list(x) must still produce mutations");
+    }
+
+    // INV-8: len() inside a larger expression doesn't block other mutations.
+    #[test]
+    fn test_len_inside_expression_doesnt_block_other_muts() {
+        // a + len(x): the + should still produce a binop_swap mutation.
+        let source = "def foo(a, x):\n    return a + len(x)\n";
+        let fms = collect_file_mutations(source);
+        let binops: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "binop_swap")
+            .collect();
+        assert!(!binops.is_empty(), "binop + should still produce a mutation even when len() is present");
     }
 }
 
