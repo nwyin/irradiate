@@ -509,6 +509,7 @@ fn collect_expr_mutations(
         }
         Expression::Call(call) => {
             add_method_mutations(call, expr_start, mutations);
+            add_arg_removal_mutations(call, &expr_text, expr_start, mutations);
             collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
             for arg in &call.args {
                 collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
@@ -873,6 +874,87 @@ fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec
                 }
                 break;
             }
+        }
+    }
+}
+
+/// Build the text of an `Arg` for use in reconstructed call expressions, omitting any
+/// trailing comma (so that callers can join with `", "` freely).
+fn arg_text_no_comma(arg: &cst::Arg) -> String {
+    let star = arg.star;
+    let kw_part = if let Some(ref kw) = arg.keyword {
+        format!("{}=", kw.value)
+    } else {
+        String::new()
+    };
+    let value = codegen_node(&arg.value);
+    format!("{star}{kw_part}{value}")
+}
+
+/// Generate arg-removal mutations for a function call expression.
+///
+/// For each argument that is not a starred (`*`/`**`) expression:
+/// 1. If the argument is not already `None`, generate a mutation that replaces it with `None`.
+/// 2. If the call has more than one argument, generate a mutation that removes the argument
+///    entirely (with its surrounding comma handled implicitly by reconstructing the arg list).
+///
+/// Both mutation kinds use the operator name `"arg_removal"`.
+fn add_arg_removal_mutations(
+    call: &cst::Call,
+    call_text: &str,
+    expr_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let args = &call.args;
+    if args.is_empty() {
+        return;
+    }
+
+    let func_text = codegen_node(&*call.func);
+
+    for (i, arg) in args.iter().enumerate() {
+        // Skip *args and **kwargs (starred expressions).
+        if !arg.star.is_empty() {
+            continue;
+        }
+
+        let arg_value_text = codegen_node(&arg.value);
+        let is_none = arg_value_text.trim() == "None";
+
+        // Mutation 1: replace this arg's value with None (skip if already None).
+        if !is_none {
+            let new_args: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(j, a)| {
+                    if j == i {
+                        // Preserve keyword= prefix, replace value with None.
+                        if let Some(ref kw) = a.keyword {
+                            format!("{}=None", kw.value)
+                        } else {
+                            "None".to_string()
+                        }
+                    } else {
+                        arg_text_no_comma(a)
+                    }
+                })
+                .collect();
+            let new_call = format!("{}({})", func_text, new_args.join(", "));
+            record_mutation(call_text, &new_call, "arg_removal", expr_start, mutations);
+        }
+
+        // Mutation 2: remove this arg entirely (skip if it is the only arg).
+        // Comma handling is implicit: we reconstruct the arg list without the removed arg
+        // and join with ", ", which correctly handles first/middle/last removal.
+        if args.len() > 1 {
+            let new_args: Vec<String> = args
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| arg_text_no_comma(a))
+                .collect();
+            let new_call = format!("{}({})", func_text, new_args.join(", "));
+            record_mutation(call_text, &new_call, "arg_removal", expr_start, mutations);
         }
     }
 }
@@ -1429,6 +1511,146 @@ mod tests {
             "outer has no yield, must not be is_generator"
         );
         assert!(inner.is_generator, "inner has yield, must be is_generator");
+    }
+
+    // --- arg_removal operator tests ---
+
+    fn arg_removal_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "arg_removal")
+            .collect()
+    }
+
+    // INV-1: f(a, b) → 4 arg_removal mutations: replace each arg + remove each arg
+    #[test]
+    fn test_arg_removal_two_args() {
+        let source = "def foo(a, b):\n    f(a, b)\n";
+        let muts = arg_removal_mutations(source);
+        let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
+        assert_eq!(muts.len(), 4, "f(a, b) must produce 4 arg_removal mutations; got: {replacements:?}");
+        assert!(replacements.iter().any(|r| r.contains("f(None, b)")), "missing f(None, b)");
+        assert!(replacements.iter().any(|r| r.contains("f(a, None)")), "missing f(a, None)");
+        assert!(replacements.iter().any(|r| r.contains("f(b)")), "missing f(b)");
+        assert!(replacements.iter().any(|r| r.contains("f(a)")), "missing f(a)");
+    }
+
+    // INV-2: f(a) → 1 mutation: replace with None (no removal)
+    #[test]
+    fn test_arg_removal_single_arg() {
+        let source = "def foo(a):\n    f(a)\n";
+        let muts = arg_removal_mutations(source);
+        assert_eq!(muts.len(), 1, "f(a) must produce exactly 1 arg_removal mutation");
+        assert!(muts[0].replacement.contains("f(None)"), "should produce f(None)");
+    }
+
+    // INV-3: f(*args) → 0 arg_removal mutations
+    #[test]
+    fn test_arg_removal_star_args_skipped() {
+        let source = "def foo(args):\n    f(*args)\n";
+        let muts = arg_removal_mutations(source);
+        assert!(muts.is_empty(), "f(*args) must produce 0 arg_removal mutations");
+    }
+
+    // INV-4: f(**kwargs) → 0 arg_removal mutations
+    #[test]
+    fn test_arg_removal_double_star_kwargs_skipped() {
+        let source = "def foo(kwargs):\n    f(**kwargs)\n";
+        let muts = arg_removal_mutations(source);
+        assert!(muts.is_empty(), "f(**kwargs) must produce 0 arg_removal mutations");
+    }
+
+    // INV-5: f(None) → 0 arg_removal mutations (already None, only arg so no removal)
+    #[test]
+    fn test_arg_removal_already_none_single() {
+        let source = "def foo():\n    f(None)\n";
+        let muts = arg_removal_mutations(source);
+        assert!(muts.is_empty(), "f(None) single arg must produce 0 arg_removal mutations");
+    }
+
+    // INV-6: f() → 0 arg_removal mutations
+    #[test]
+    fn test_arg_removal_empty_call() {
+        let source = "def foo():\n    f()\n";
+        let muts = arg_removal_mutations(source);
+        assert!(muts.is_empty(), "f() must produce 0 arg_removal mutations");
+    }
+
+    // INV-7: f(a, b=2) handles keyword args correctly
+    #[test]
+    fn test_arg_removal_keyword_arg() {
+        let source = "def foo(a):\n    f(a, b=2)\n";
+        let muts = arg_removal_mutations(source);
+        let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
+        assert_eq!(muts.len(), 4, "f(a, b=2) must produce 4 arg_removal mutations; got: {replacements:?}");
+        assert!(replacements.iter().any(|r| r.contains("f(None, b=2)")), "missing f(None, b=2)");
+        assert!(replacements.iter().any(|r| r.contains("f(a, b=None)")), "missing f(a, b=None)");
+        assert!(replacements.iter().any(|r| r.contains("f(b=2)")), "missing f(b=2)");
+        assert!(replacements.iter().any(|r| r.contains("f(a)")), "missing f(a)");
+    }
+
+    // Three-arg call: f(a, b, c) → 6 mutations (replace each × 3 + remove each × 3)
+    #[test]
+    fn test_arg_removal_three_args() {
+        let source = "def foo(a, b, c):\n    f(a, b, c)\n";
+        let muts = arg_removal_mutations(source);
+        let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
+        assert_eq!(muts.len(), 6, "f(a, b, c) must produce 6 arg_removal mutations; got: {replacements:?}");
+        // replace mutations
+        assert!(replacements.iter().any(|r| r.contains("f(None, b, c)")), "missing f(None, b, c)");
+        assert!(replacements.iter().any(|r| r.contains("f(a, None, c)")), "missing f(a, None, c)");
+        assert!(replacements.iter().any(|r| r.contains("f(a, b, None)")), "missing f(a, b, None)");
+        // removal mutations
+        assert!(replacements.iter().any(|r| r.contains("f(b, c)")), "missing f(b, c) — remove first");
+        assert!(replacements.iter().any(|r| r.contains("f(a, c)")), "missing f(a, c) — remove middle");
+        assert!(replacements.iter().any(|r| r.contains("f(a, b)")), "missing f(a, b) — remove last");
+    }
+
+    // None arg in multi-arg call: removal is generated even though replace is skipped
+    #[test]
+    fn test_arg_removal_none_arg_in_multi_arg() {
+        let source = "def foo(b):\n    f(None, b)\n";
+        let muts = arg_removal_mutations(source);
+        let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
+        // arg 0 (None): no replace (already None), but remove → f(b)
+        // arg 1 (b): replace → f(None, None), remove → f(None)
+        assert_eq!(muts.len(), 3, "f(None, b) must produce 3 arg_removal mutations; got: {replacements:?}");
+        assert!(replacements.iter().any(|r| r.contains("f(b)")), "missing f(b)");
+        assert!(replacements.iter().any(|r| r.contains("f(None, None)")), "missing f(None, None)");
+        assert!(replacements.iter().any(|r| r.contains("f(None)")), "missing f(None)");
+    }
+
+    // INV-8: All generated arg_removal mutations produce syntactically valid Python
+    #[test]
+    fn test_arg_removal_all_mutations_parseable() {
+        let source = "def foo(a, b, c):\n    result = f(a, b, c)\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.first().expect("should collect mutations");
+        for m in fm.mutations.iter().filter(|m| m.operator == "arg_removal") {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "arg_removal mutation '{}' → '{}' produced unparseable Python:\n{}",
+                m.original, m.replacement, mutated
+            );
+        }
+    }
+
+    // Mixed: star and normal args together — only non-starred args get mutations
+    #[test]
+    fn test_arg_removal_mixed_star_and_normal() {
+        // f(a, *args) — arg 0 is normal, arg 1 is starred
+        let source = "def foo(a, args):\n    f(a, *args)\n";
+        let muts = arg_removal_mutations(source);
+        // arg 0 (a): replace with None (1 mutation); no removal because starred args.len()=2 BUT
+        // *args is skipped, so the removal loop sees len=2 > 1 and removes arg 0 → f(*args)
+        let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
+        // arg 0 produces: replace → f(None, *args), remove → f(*args)
+        // arg 1 (*args): skipped entirely
+        assert_eq!(muts.len(), 2, "f(a, *args) must produce 2 arg_removal mutations; got: {replacements:?}");
+        assert!(replacements.iter().any(|r| r.contains("f(None, *args)")), "missing f(None, *args)");
+        assert!(replacements.iter().any(|r| r.contains("f(*args)")), "missing f(*args)");
     }
 }
 
