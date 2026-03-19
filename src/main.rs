@@ -44,9 +44,10 @@ enum Commands {
         #[arg(long, default_value = "python3")]
         python: String,
 
-        /// Respawn workers after N mutants to prevent pytest state accumulation (0 to disable)
-        #[arg(long, default_value_t = 100)]
-        worker_recycle_after: usize,
+        /// Respawn workers after N mutants to prevent pytest state accumulation (0 to disable).
+        /// Default: auto-tune (100 normally, reduced to 20 when session-scoped fixtures detected).
+        #[arg(long)]
+        worker_recycle_after: Option<usize>,
 
         /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
         #[arg(long, default_value_t = 0)]

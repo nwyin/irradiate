@@ -2641,7 +2641,11 @@ mod match_case_removal_tests {
         for source in &cases {
             let fms = collect_file_mutations(source);
             for fm in &fms {
-                for m in fm.mutations.iter().filter(|m| m.operator == "lambda_mutation") {
+                for m in fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "lambda_mutation")
+                {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
                         parse_module(&mutated, None).is_ok(),

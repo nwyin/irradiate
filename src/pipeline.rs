@@ -24,8 +24,10 @@ pub struct RunConfig {
     pub covered_only: bool,
     pub python: PathBuf,
     pub mutant_filter: Option<Vec<String>>,
-    /// Respawn workers after this many mutants (0 = disabled).
-    pub worker_recycle_after: usize,
+    /// Respawn workers after this many mutants.
+    /// `None` = auto-tune (default 100, reduced to 20 if session fixtures detected).
+    /// `Some(0)` = disabled. `Some(n)` = explicit user override.
+    pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
     /// Run each mutant in a fresh subprocess instead of the worker pool.

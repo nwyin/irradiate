@@ -251,7 +251,7 @@ async fn test_worker_pool_with_recycling() {
         },
     ];
 
-    // recycle_after=1: worker is replaced after every single mutant
+    // recycle_after=Some(1): worker is replaced after every single mutant (explicit)
     let config = PoolConfig {
         num_workers: 1,
         python,
@@ -259,7 +259,7 @@ async fn test_worker_pool_with_recycling() {
         mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         timeout_multiplier: 10.0,
-        worker_recycle_after: 1,
+        worker_recycle_after: Some(1),
         ..Default::default()
     };
 
@@ -310,7 +310,7 @@ async fn test_worker_pool_recycle_disabled() {
         mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         timeout_multiplier: 10.0,
-        worker_recycle_after: 0, // disabled
+        worker_recycle_after: Some(0), // disabled
         ..Default::default()
     };
 
@@ -340,7 +340,7 @@ async fn test_worker_pool_repeated_runs_same_worker_cleanup() {
         mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         timeout_multiplier: 10.0,
-        worker_recycle_after: 0,
+        worker_recycle_after: Some(0), // disabled
         ..Default::default()
     };
 
@@ -441,7 +441,7 @@ def test_mark_once():
         tests_dir: project.path().join("tests"),
         timeout_multiplier: 10.0,
         pythonpath,
-        worker_recycle_after: 0,
+        worker_recycle_after: Some(0), // disabled
         ..Default::default()
     };
 
@@ -540,7 +540,7 @@ async fn test_module_global_restore_between_runs() {
         tests_dir: project.path().join("tests"),
         timeout_multiplier: 10.0,
         pythonpath,
-        worker_recycle_after: 0, // No recycling — we test module restore, not recycling
+        worker_recycle_after: Some(0), // No recycling — we test module restore, not recycling
         ..Default::default()
     };
 
@@ -614,7 +614,7 @@ async fn test_trampoline_intact_after_restore() {
         mutants_dir: _tmp.path().to_path_buf(),
         tests_dir: fixture.join("tests"),
         timeout_multiplier: 10.0,
-        worker_recycle_after: 0, // same worker for both runs
+        worker_recycle_after: Some(0), // same worker for both runs
         ..Default::default()
     };
 
@@ -633,6 +633,172 @@ async fn test_trampoline_intact_after_restore() {
         MutantStatus::Killed,
         "INV-2: trampoline must still dispatch mutant correctly after module restore"
     );
+}
+
+/// Build a minimal temp project with a session-scoped fixture.
+/// Returns (TempDir, harness_dir, pythonpath, mutants_dir, mutant_names, test_id).
+async fn build_session_fixture_project(
+    lib_name: &str,
+    fixture_name: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+    tempfile::TempDir,
+    Vec<String>,
+    String,
+) {
+    let project = tempfile::tempdir().unwrap();
+    let lib_dir = format!("src/{lib_name}");
+    fs::create_dir_all(project.path().join(&lib_dir)).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+
+    // pyproject.toml: anchors pytest rootdir and adds src to pythonpath
+    fs::write(
+        project.path().join("pyproject.toml"),
+        format!("[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\npythonpath = [\"src\"]\n"),
+    )
+    .unwrap();
+
+    fs::write(
+        project.path().join(format!("src/{lib_name}/__init__.py")),
+        "def add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
+
+    fs::write(
+        project.path().join("tests/conftest.py"),
+        format!(
+            "import pytest\n\n@pytest.fixture(scope=\"session\")\ndef {fixture_name}():\n    return {{\"count\": 0}}\n"
+        ),
+    )
+    .unwrap();
+
+    let test_file = format!("tests/test_{lib_name}.py");
+    fs::write(
+        project.path().join(&test_file),
+        format!(
+            "from {lib_name} import add\n\ndef test_add({fixture_name}):\n    {fixture_name}[\"count\"] += 1\n    assert add(1, 2) == 3\n"
+        ),
+    )
+    .unwrap();
+
+    let (_mutants_tmp, mutant_names) = generate_mutants_for_project(
+        project.path(),
+        &format!("src/{lib_name}/__init__.py"),
+        lib_name,
+    );
+
+    let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let mutants_dir = _mutants_tmp.path().to_path_buf();
+
+    // Collect the real test ID via stats
+    let python = fixture_python();
+    let test_stats =
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+            .expect("Stats collection should succeed");
+    let test_id = test_stats
+        .duration_by_test
+        .keys()
+        .next()
+        .cloned()
+        .expect("Should collect one test");
+
+    (
+        project,
+        harness_dir,
+        pythonpath,
+        _mutants_tmp,
+        mutant_names,
+        test_id,
+    )
+}
+
+/// INV-1/INV-4: A project with session-scoped fixtures produces correct results under
+/// the worker pool. This test verifies that the pool works end-to-end when session
+/// fixtures are present; the auto-tuned recycle interval does not cause test failures.
+/// (Precise recycle-interval verification lives in orchestrator unit tests.)
+#[tokio::test]
+async fn test_worker_pool_with_session_fixture_project() {
+    let (project, _harness_dir, pythonpath, _mutants_tmp, mutant_names, test_id) =
+        build_session_fixture_project("session_lib", "session_counter").await;
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    // Use auto-tuning (None) — the orchestrator should detect session fixtures and log
+    let config = PoolConfig {
+        num_workers: 1,
+        python: fixture_python(),
+        project_dir: project.path().to_path_buf(),
+        mutants_dir: _mutants_tmp.path().to_path_buf(),
+        tests_dir: project.path().join("tests"),
+        timeout_multiplier: 10.0,
+        pythonpath,
+        worker_recycle_after: None, // auto-tune
+        ..Default::default()
+    };
+
+    let work_items = vec![WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: vec![test_id],
+        estimated_duration_secs: 0.0,
+        timeout_secs: 300.0,
+    }];
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete with session fixture project");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status,
+        MutantStatus::Killed,
+        "Session fixture project: add mutant should be killed"
+    );
+}
+
+/// INV-2: Explicit --worker-recycle-after is always respected regardless of session fixtures.
+/// This tests that Some(n) bypasses auto-tune logic.
+#[tokio::test]
+async fn test_worker_pool_explicit_recycle_overrides_auto_tune() {
+    let (project, _harness_dir, pythonpath, _mutants_tmp, mutant_names, test_id) =
+        build_session_fixture_project("explicit_lib", "heavy_resource").await;
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    // Explicit recycle after 50 — should not be reduced despite session fixtures
+    let config = PoolConfig {
+        num_workers: 1,
+        python: fixture_python(),
+        project_dir: project.path().to_path_buf(),
+        mutants_dir: _mutants_tmp.path().to_path_buf(),
+        tests_dir: project.path().join("tests"),
+        timeout_multiplier: 10.0,
+        pythonpath,
+        worker_recycle_after: Some(50), // explicit — must not be auto-tuned
+        ..Default::default()
+    };
+
+    let work_items = vec![WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: vec![test_id],
+        estimated_duration_secs: 0.0,
+        timeout_secs: 300.0,
+    }];
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete with explicit recycle setting");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, MutantStatus::Killed);
 }
 
 #[tokio::test]

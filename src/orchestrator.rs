@@ -34,8 +34,11 @@ pub struct PoolConfig {
     /// IRRADIATE_MUTANTS_DIR env var and handled by the MutantFinder import hook.
     pub pythonpath: String,
     /// Respawn workers after this many mutants to prevent pytest state accumulation.
-    /// Set to 0 to disable recycling.
-    pub worker_recycle_after: usize,
+    /// `None` = auto-tune: defaults to 100, but reduced to 20 if session-scoped fixtures
+    /// are detected (to limit state leakage).
+    /// `Some(0)` = disable recycling entirely.
+    /// `Some(n)` = explicit user override, always respected regardless of fixture detection.
+    pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
 }
@@ -51,7 +54,7 @@ impl Default for PoolConfig {
             timeout_multiplier: 10.0,
             default_timeout: Duration::from_secs(30),
             pythonpath: String::new(),
-            worker_recycle_after: 100,
+            worker_recycle_after: None,
             max_worker_memory_mb: 0,
         }
     }
@@ -278,6 +281,29 @@ async fn check_rss(pid: u32) -> Result<usize> {
     text.trim().parse::<usize>().map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Determine the effective recycling interval given user configuration and fixture detection.
+///
+/// - `configured = None`: auto-tune mode. Default 100, reduced to 20 if session fixtures found.
+/// - `configured = Some(n)`: explicit user override; always returned as-is.
+pub(crate) fn determine_recycle_after(
+    configured: Option<usize>,
+    has_session_fixtures: bool,
+    session_fixture_count: usize,
+) -> usize {
+    match configured {
+        Some(explicit) => explicit,
+        None => {
+            const DEFAULT: usize = 100;
+            const SESSION_FIXTURE_REDUCED: usize = 20;
+            if has_session_fixtures && session_fixture_count > 0 {
+                DEFAULT.min(SESSION_FIXTURE_REDUCED)
+            } else {
+                DEFAULT
+            }
+        }
+    }
+}
+
 async fn dispatch_work(
     listener: UnixListener,
     mut processes: Vec<Child>,
@@ -314,7 +340,10 @@ async fn dispatch_work(
     // Workers flagged for recycling on next result (memory limit exceeded)
     let mut workers_pending_memory_recycle: HashSet<usize> = HashSet::new();
 
-    let recycle_after = config.worker_recycle_after;
+    // Effective recycle interval: starts at the user-configured value (or 100 if auto).
+    // May be reduced on first Ready message if session fixtures are detected.
+    let mut recycle_after = config.worker_recycle_after.unwrap_or(100);
+    let mut session_detection_done = false;
     let max_worker_memory_mb = config.max_worker_memory_mb;
     let accept_timeout = Duration::from_secs(30);
     let default_timeout = config.default_timeout;
@@ -408,8 +437,40 @@ async fn dispatch_work(
                             }
                             Ok(Ok(_)) => {
                                 match serde_json::from_str::<WorkerMessage>(line.trim()) {
-                                    Ok(WorkerMessage::Ready { pid, .. }) => {
+                                    Ok(WorkerMessage::Ready {
+                                        pid,
+                                        has_session_fixtures,
+                                        session_fixture_count,
+                                        ..
+                                    }) => {
                                         info!("Worker {worker_id} (pid {pid}) connected and ready");
+
+                                        // Auto-tune recycling interval on first worker connection.
+                                        if !session_detection_done {
+                                            session_detection_done = true;
+                                            let new_recycle = determine_recycle_after(
+                                                config.worker_recycle_after,
+                                                has_session_fixtures,
+                                                session_fixture_count,
+                                            );
+                                            if has_session_fixtures && config.worker_recycle_after.is_none() {
+                                                warn!(
+                                                    "Session-scoped fixtures detected ({session_fixture_count}); \
+                                                     reducing worker recycle interval to {new_recycle} for correctness. \
+                                                     Use --worker-recycle-after to override."
+                                                );
+                                                info!(
+                                                    "Auto-tuning worker recycle interval: {recycle_after} → {new_recycle}"
+                                                );
+                                                recycle_after = new_recycle;
+                                            } else if has_session_fixtures {
+                                                info!(
+                                                    "Session-scoped fixtures detected ({session_fixture_count}); \
+                                                     respecting explicit --worker-recycle-after={recycle_after}"
+                                                );
+                                            }
+                                        }
+
                                         worker_pids.insert(worker_id, pid);
                                         let msg_tx = spawn_worker_task(
                                             worker_id,
@@ -658,5 +719,53 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["m_a", "m_b"]);
+    }
+
+    // --- determine_recycle_after tests (INV-1, INV-2, INV-4) ---
+
+    /// INV-1: Auto-mode with session fixtures → reduced interval.
+    #[test]
+    fn test_determine_recycle_after_auto_with_session_fixtures() {
+        let result = determine_recycle_after(None, true, 3);
+        assert_eq!(result, 20, "session fixtures detected in auto mode → 20");
+    }
+
+    /// INV-2: Explicit user override is always respected, even with session fixtures.
+    #[test]
+    fn test_determine_recycle_after_explicit_with_session_fixtures() {
+        let result = determine_recycle_after(Some(50), true, 3);
+        assert_eq!(result, 50, "explicit setting must override auto-tune");
+    }
+
+    /// INV-2: Explicit 0 (disabled) is respected even with session fixtures.
+    #[test]
+    fn test_determine_recycle_after_explicit_zero_with_session_fixtures() {
+        let result = determine_recycle_after(Some(0), true, 5);
+        assert_eq!(result, 0, "explicit 0 (disabled) must be respected");
+    }
+
+    /// INV-4: Auto-mode without session fixtures → default interval.
+    #[test]
+    fn test_determine_recycle_after_auto_no_session_fixtures() {
+        let result = determine_recycle_after(None, false, 0);
+        assert_eq!(result, 100, "no session fixtures → default 100");
+    }
+
+    /// Auto-mode, has_session_fixtures=true but count=0 → no reduction (shouldn't happen
+    /// in practice, but guards against inconsistent Python-side behavior).
+    #[test]
+    fn test_determine_recycle_after_auto_fixture_flag_true_count_zero() {
+        let result = determine_recycle_after(None, true, 0);
+        assert_eq!(
+            result, 100,
+            "count=0 prevents reduction even if flag is true"
+        );
+    }
+
+    /// Explicit 1 means recycle after every mutant — common in tests.
+    #[test]
+    fn test_determine_recycle_after_explicit_one() {
+        let result = determine_recycle_after(Some(1), false, 0);
+        assert_eq!(result, 1);
     }
 }
