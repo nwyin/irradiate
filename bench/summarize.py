@@ -251,7 +251,7 @@ def config_label(config: str, ncpu: int) -> str:
         "irradiate_pool_1w": "irradiate pool (1w)",
         "irradiate_isolate": "irradiate isolate",
         f"mutmut_{ncpu}c": f"mutmut ({ncpu}c)",
-        "mutmut_1c": "mutmut (1c)",
+        "mutmut_1c": "mutmut 2.5.1",
     }
     return labels.get(config, config)
 

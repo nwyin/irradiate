@@ -143,6 +143,26 @@ def fmt_rss(v: float | None) -> str:
     return f"{v:.0f}" if v is not None else "&mdash;"
 
 
+def fmt_wall_range(median: float | None, mn: float | None, mx: float | None) -> str:
+    """Format wall time in ms, with optional range."""
+    if median is None:
+        return "&mdash;"
+    med_ms, mn_ms, mx_ms = median * 1000, (mn or 0) * 1000, (mx or 0) * 1000
+    s = f"{med_ms:,.0f}"
+    if mn is not None and mx is not None and abs(mx_ms - mn_ms) > 50:
+        s += f" ({mn_ms:,.0f}&ndash;{mx_ms:,.0f})"
+    return s
+
+
+def fmt_speedup(ms_per_mutant: float | None, baseline_ms: float | None) -> str:
+    if ms_per_mutant is None or baseline_ms is None or ms_per_mutant == 0:
+        return "&mdash;"
+    ratio = baseline_ms / ms_per_mutant
+    if abs(ratio - 1.0) < 0.05:
+        return "1.0x"
+    return f"{ratio:.1f}x"
+
+
 def is_fastest(config: str, configs: list[dict]) -> bool:
     """True if this config has the lowest ms_per_mutant among all configs."""
     vals: list[tuple[float, str]] = []
@@ -154,6 +174,14 @@ def is_fastest(config: str, configs: list[dict]) -> bool:
         return False
     best_config = min(vals, key=lambda x: x[0])[1]
     return config == best_config
+
+
+def mutmut_baseline_ms(configs: list[dict]) -> float | None:
+    """Find the mutmut config's ms_per_mutant to use as speedup baseline."""
+    for c in configs:
+        if c.get("config", "").startswith("mutmut"):
+            return c.get("ms_per_mutant")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +203,7 @@ def _hero_html() -> str:
     <a href="#get-started">Get started</a>
     <a href="#benchmarks">Benchmarks</a>
     <a href="#vendor-tests">Vendor tests</a>
-    <a href="#architecture">Architecture</a>
+    <a href="https://github.com/tau/irradiate">GitHub</a>
   </nav>
 
   <div class="section" id="get-started">
@@ -222,22 +250,25 @@ def _benchmarks_html(bench_dir: Path) -> str:
     target = data.get("target", "unknown")
     ncpu = data.get("ncpu", "?")
     runs = data.get("runs", "?")
+    baseline_ms = mutmut_baseline_ms(configs)
 
     rows = ""
     for cfg in configs:
         config_key = cfg.get("config", "")
         label = escape(cfg.get("label", config_key))
-        wall = fmt_val(cfg.get("median_wall_secs"), 1)
+        wall = fmt_wall_range(cfg.get("median_wall_secs"), cfg.get("min_wall_secs"), cfg.get("max_wall_secs"))
         mutants = fmt_val(cfg.get("mutants"))
         killed = fmt_val(cfg.get("killed"))
         survived = fmt_val(cfg.get("survived"))
         score = fmt_score(cfg.get("mutation_score_pct"))
         ms_per_mut = fmt_ms(cfg.get("ms_per_mutant"))
+        mps = fmt_val(cfg.get("median_mps"), 1)
         rss = fmt_rss(cfg.get("median_rss_mb"))
+        speedup = fmt_speedup(cfg.get("ms_per_mutant"), baseline_ms)
 
         highlight = is_fastest(config_key, configs)
         row_class = ' class="row-highlight"' if highlight else ""
-        label_cell = f'<td class="config-label highlight">{label} <span class="fastest-badge">fastest</span></td>' if highlight else f"<td class=\"config-label\">{label}</td>"
+        label_cell = f'<td class="config-label highlight">{label} <span class="fastest-badge">fastest</span></td>' if highlight else f'<td class="config-label">{label}</td>'
 
         rows += f"""<tr{row_class}>
   {label_cell}
@@ -247,6 +278,8 @@ def _benchmarks_html(bench_dir: Path) -> str:
   <td>{survived}</td>
   <td>{score}</td>
   <td>{ms_per_mut}</td>
+  <td>{mps}</td>
+  <td>{speedup}</td>
   <td>{rss}</td>
 </tr>"""
 
@@ -256,11 +289,12 @@ def _benchmarks_html(bench_dir: Path) -> str:
   <p class="section-desc">
     Target: <code>{escape(target)}</code> &middot;
     CPUs: {ncpu} &middot;
-    Runs: {runs} &middot;
+    Runs: {runs} (plus 1 warmup discarded) &middot;
     Source: <code>{escape(source)}</code>
   </p>
   <p class="section-desc">
-    ms/mutant is the fairest comparison metric — it normalizes for operator coverage differences between tools.
+    ms/mutant is the fairest comparison metric &mdash; it normalizes for operator coverage differences between tools.
+    Speedup is relative to mutmut&rsquo;s ms/mutant.
     irradiate pool mode uses persistent pre-warmed pytest workers; isolate mode is most comparable to mutmut.
   </p>
   <div class="table-wrap">
@@ -268,12 +302,14 @@ def _benchmarks_html(bench_dir: Path) -> str:
       <thead>
         <tr>
           <th>Configuration</th>
-          <th>Wall (s)</th>
+          <th>Wall (ms)</th>
           <th>Mutants</th>
           <th>Killed</th>
           <th>Survived</th>
           <th>Score</th>
           <th>ms/mutant</th>
+          <th>Mut/s</th>
+          <th>Speedup</th>
           <th>Peak RSS (MB)</th>
         </tr>
       </thead>
@@ -283,8 +319,11 @@ def _benchmarks_html(bench_dir: Path) -> str:
     </table>
   </div>
   <p class="bench-note">
-    Note: mutant counts differ between tools due to operator coverage gaps.
-    irradiate currently implements a subset of mutmut&rsquo;s operators.
+    Note: mutmut 2.5.1 is strictly serial &mdash; it runs one mutant at a time with no parallel execution.
+    irradiate pool mode runs multiple pre-warmed pytest workers in parallel;
+    irradiate isolate mode spawns a fresh process per mutant (most comparable to mutmut).
+    Mutant counts differ between tools due to operator coverage gaps.
+    Wall time range (min&ndash;max) shown when spread exceeds 50ms.
   </p>
 </section>"""
 
@@ -385,70 +424,6 @@ def _vendor_tests_html(vendor_data: dict | None) -> str:
       </tbody>
     </table>
   </div>
-</section>"""
-
-
-# ---------------------------------------------------------------------------
-# Section 4: Architecture
-# ---------------------------------------------------------------------------
-
-
-def _architecture_html() -> str:
-    return """
-<section class="section" id="architecture">
-  <h2>Architecture</h2>
-  <p class="section-desc">
-    irradiate is a Rust binary that orchestrates Python mutation testing. The key design is a
-    <strong>worker pool of pre-warmed pytest processes</strong> — each worker starts once, imports
-    the test suite, and then runs individual test items on demand via Unix socket IPC. This eliminates
-    the per-mutant Python interpreter startup cost that makes naive approaches slow.
-  </p>
-
-  <div class="arch-pipeline">
-    <div class="pipeline-step">
-      <div class="step-icon">①</div>
-      <div class="step-body">
-        <strong>Parse</strong>
-        <p>libcst walks each Python source file to identify mutation points: binary operators,
-        comparison operators, boolean operators, string/number literals, method names, and more.</p>
-      </div>
-    </div>
-    <div class="pipeline-arrow">&rarr;</div>
-    <div class="pipeline-step">
-      <div class="step-icon">②</div>
-      <div class="step-body">
-        <strong>Mutate</strong>
-        <p>For each mutation point, a variant is generated. Rayon parallelizes this across all
-        source files. Each function produces an <em>orig</em> variant plus N mutant variants.</p>
-      </div>
-    </div>
-    <div class="pipeline-arrow">&rarr;</div>
-    <div class="pipeline-step">
-      <div class="step-icon">③</div>
-      <div class="step-body">
-        <strong>Trampoline</strong>
-        <p>Functions are name-mangled (<code>x_func</code>, <code>x&curren;Class&curren;method</code>)
-        and wrapped in a dispatch shim that reads <code>irradiate_harness.active_mutant</code>
-        to select which variant to execute at runtime.</p>
-      </div>
-    </div>
-    <div class="pipeline-arrow">&rarr;</div>
-    <div class="pipeline-step">
-      <div class="step-icon">④</div>
-      <div class="step-body">
-        <strong>Test</strong>
-        <p>A tokio-based worker pool spawns N Python processes. Each worker connects via Unix socket,
-        receives <code>Run(mutant_id, test_ids)</code> messages, and reports back
-        <code>Killed</code> / <code>Survived</code> / <code>Error</code> results.</p>
-      </div>
-    </div>
-  </div>
-
-  <p class="section-desc" style="margin-top:1rem;">
-    <a href="docs/design.md">Full architecture and design rationale &rarr;</a>
-    &nbsp;&middot;&nbsp;
-    <a href="docs/roadmap.md">Roadmap and known gaps &rarr;</a>
-  </p>
 </section>"""
 
 
@@ -610,6 +585,7 @@ tr:hover { background: rgba(88,166,255,0.04); }
     font-size: 0.8rem;
     margin-top: 0.5rem;
 }
+.bench-table td:nth-child(9) { font-weight: 600; }
 
 /* Badges */
 .badge {
@@ -622,53 +598,6 @@ tr:hover { background: rgba(88,166,255,0.04); }
 .badge-pass { background: rgba(63,185,80,0.15); color: var(--green); }
 .badge-fail { background: rgba(248,81,73,0.15); color: var(--red); }
 .badge-pending { background: rgba(139,148,158,0.15); color: var(--text-muted); }
-
-/* Architecture pipeline */
-.arch-pipeline {
-    display: flex;
-    align-items: flex-start;
-    gap: 0;
-    margin: 1.25rem 0;
-    flex-wrap: wrap;
-    gap: 0.25rem;
-}
-.pipeline-step {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    flex: 1;
-    min-width: 180px;
-    display: flex;
-    gap: 0.75rem;
-    align-items: flex-start;
-}
-.step-icon {
-    font-size: 1.25rem;
-    color: var(--accent);
-    line-height: 1;
-    flex-shrink: 0;
-}
-.step-body strong { display: block; font-size: 0.9rem; margin-bottom: 0.25rem; }
-.step-body p { font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; }
-.step-body code {
-    font-family: var(--mono);
-    font-size: 0.85em;
-    background: var(--surface2);
-    padding: 0.1em 0.3em;
-    border-radius: 3px;
-}
-.pipeline-arrow {
-    color: var(--text-muted);
-    font-size: 1.25rem;
-    padding: 0.75rem 0.25rem;
-    flex-shrink: 0;
-    align-self: flex-start;
-}
-@media (max-width: 768px) {
-    .arch-pipeline { flex-direction: column; }
-    .pipeline-arrow { transform: rotate(90deg); align-self: center; }
-}
 
 /* Footer */
 footer {
@@ -694,7 +623,6 @@ def generate_html(bench_dir: Path, vendor_data: dict | None, version: str, sha: 
     hero = _hero_html()
     benchmarks = _benchmarks_html(bench_dir)
     vendor = _vendor_tests_html(vendor_data)
-    arch = _architecture_html()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -711,7 +639,6 @@ def generate_html(bench_dir: Path, vendor_data: dict | None, version: str, sha: 
 {hero}
 {benchmarks}
 {vendor}
-{arch}
 
 <footer>
   <a href="https://github.com/tau/irradiate">irradiate</a> v{version}
