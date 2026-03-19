@@ -234,6 +234,7 @@ fn stmt_contains_yield(stmt: &Statement) -> bool {
                         .as_ref()
                         .is_some_and(|fin| suite_contains_yield(&fin.body))
             }
+            CompoundStatement::Match(m) => m.cases.iter().any(|c| suite_contains_yield(&c.body)),
             _ => false,
         },
     }
@@ -371,6 +372,20 @@ fn collect_statement_mutations(
                 if let Some(ref fin) = t.finalbody {
                     collect_suite_mutations(&fin.body, source, cursor, mutations, ignored);
                 }
+            }
+            CompoundStatement::Match(m) => {
+                // Save cursor before any recursion so we can find the match statement start.
+                let cursor_before = *cursor;
+                // Recurse into subject and case bodies for expression mutations.
+                collect_expr_mutations(&m.subject, source, cursor, mutations, ignored);
+                for case in &m.cases {
+                    if let Some(ref guard) = case.guard {
+                        collect_expr_mutations(guard, source, cursor, mutations, ignored);
+                    }
+                    collect_suite_mutations(&case.body, source, cursor, mutations, ignored);
+                }
+                // Generate match case removal mutations (one per case, when N > 1).
+                add_match_case_removal_mutations(m, source, cursor_before, mutations);
             }
             _ => {}
         },
@@ -958,6 +973,162 @@ fn add_arg_removal_mutations(
         }
     }
 }
+
+// --- Match case removal ---
+
+/// Generate one mutation per case in a match statement, each removing one case block.
+///
+/// Strategy: locate the match keyword in func_source using text search from cursor_before,
+/// then find each case block by scanning lines at the expected indentation level.
+/// This avoids relying on libcst codegen which uses relative (not absolute) indentation.
+fn add_match_case_removal_mutations(
+    match_stmt: &cst::Match,
+    source: &str,
+    cursor_before: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let n_cases = match_stmt.cases.len();
+    if n_cases <= 1 {
+        return;
+    }
+
+    // Find the "match <subject>:" header in source from cursor_before.
+    let subject_text = codegen_node(&match_stmt.subject);
+    let match_header_pattern = format!("match {subject_text}:");
+    let match_kw_pos = match source[cursor_before..].find(&match_header_pattern) {
+        Some(p) => cursor_before + p,
+        None => return,
+    };
+
+    // Compute the match line start (byte offset of the indent before "match").
+    let match_line_start = source[..match_kw_pos].rfind('\n').map_or(0, |p| p + 1);
+    let match_indent_len = match_kw_pos - match_line_start;
+
+    // Find the end of the match header line (the \n after "match ...:").
+    let match_header_end = match source[match_kw_pos..].find('\n') {
+        Some(p) => match_kw_pos + p + 1,
+        None => return,
+    };
+
+    // Locate each case block start by scanning lines in the match body.
+    let case_line_starts =
+        match find_case_line_starts(source, match_header_end, match_indent_len, n_cases) {
+            Some(v) => v,
+            None => return,
+        };
+
+    // Find where the match block ends (first non-blank line at <= match_indent_len, or source end).
+    let match_end = find_block_end(source, match_header_end, match_indent_len);
+
+    // The full original text of the match statement (including its leading indentation).
+    let match_original = &source[match_line_start..match_end];
+
+    // Generate one removal mutation per case.
+    for i in 0..n_cases {
+        let case_rel_start = case_line_starts[i] - match_line_start;
+        let case_rel_end = if i + 1 < n_cases {
+            case_line_starts[i + 1] - match_line_start
+        } else {
+            match_end - match_line_start
+        };
+
+        let replacement = format!(
+            "{}{}",
+            &match_original[..case_rel_start],
+            &match_original[case_rel_end..]
+        );
+
+        record_mutation(
+            match_original,
+            &replacement,
+            "match_case_removal",
+            match_line_start,
+            mutations,
+        );
+    }
+}
+
+/// Find the byte offsets of `n_cases` case block lines within a match body.
+///
+/// Scans lines forward from `from`, tracking the indentation level of the first
+/// non-blank line (which must be a `case` line). Subsequent `case` lines at the
+/// same indentation are recorded. Lines at deeper indentation are skipped (they
+/// are case bodies, potentially including nested match statements). If a non-blank
+/// line at ≤ match_indent_len is encountered before finding all cases, returns None.
+fn find_case_line_starts(
+    source: &str,
+    from: usize,
+    match_indent_len: usize,
+    n_cases: usize,
+) -> Option<Vec<usize>> {
+    let mut result = Vec::new();
+    let mut pos = from;
+    // The indentation of case lines (match_indent + one level); set from the first case found.
+    let mut case_indent_len: Option<usize> = None;
+
+    while result.len() < n_cases && pos < source.len() {
+        let line_end = source[pos..].find('\n').map_or(source.len(), |p| pos + p + 1);
+        let line = &source[pos..line_end];
+
+        if !line.trim().is_empty() {
+            let line_indent = line.len()
+                - line
+                    .trim_start_matches([' ', '\t'])
+                    .len();
+
+            if line_indent <= match_indent_len {
+                // Exited the match block without finding all cases.
+                return None;
+            }
+
+            let target = *case_indent_len.get_or_insert(line_indent);
+
+            if line_indent == target {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("case ") || trimmed.starts_with("case\t") {
+                    result.push(pos);
+                }
+            }
+            // Lines at deeper indent are case bodies (or nested match cases) — skip.
+        }
+
+        pos = line_end;
+    }
+
+    if result.len() == n_cases {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Find the byte offset where a block indented deeper than `block_indent_len` ends.
+///
+/// Starting from `from`, scans lines until it finds a non-blank line at indentation
+/// ≤ `block_indent_len` (which signals the end of the block) or reaches the end of source.
+fn find_block_end(source: &str, from: usize, block_indent_len: usize) -> usize {
+    let mut pos = from;
+
+    while pos < source.len() {
+        let line_end = source[pos..].find('\n').map_or(source.len(), |p| pos + p + 1);
+        let line = &source[pos..line_end];
+
+        if !line.trim().is_empty() {
+            let line_indent = line.len()
+                - line
+                    .trim_start_matches([' ', '\t'])
+                    .len();
+            if line_indent <= block_indent_len {
+                return pos;
+            }
+        }
+
+        pos = line_end;
+    }
+
+    source.len()
+}
+
 
 // --- Utility ---
 
@@ -1792,6 +1963,200 @@ mod offset_correctness_tests {
                 slice, m.original,
                 "Span [{}, {}) should equal original '{}'",
                 m.start, m.end, m.original
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod match_case_removal_tests {
+    use super::*;
+
+    fn match_case_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "match_case_removal")
+            .collect()
+    }
+
+    // INV-1: A match with 1 case produces 0 mutations.
+    #[test]
+    fn test_single_case_no_mutations() {
+        let source = "def foo(cmd):\n    match cmd:\n        case _:\n            return 0\n";
+        let muts = match_case_mutations(source);
+        assert!(muts.is_empty(), "1-case match must produce 0 mutations");
+    }
+
+    // INV-2: A match with 2 cases produces 2 mutations.
+    #[test]
+    fn test_two_cases_two_mutations() {
+        let source = "def foo(cmd):\n    match cmd:\n        case \"quit\":\n            return 0\n        case _:\n            return 1\n";
+        let muts = match_case_mutations(source);
+        assert_eq!(muts.len(), 2, "2-case match must produce 2 mutations");
+    }
+
+    // INV-3: A match with 3 cases produces 3 mutations.
+    #[test]
+    fn test_three_cases_three_mutations() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"quit\":\n",
+            "            return 0\n",
+            "        case \"hello\":\n",
+            "            print(\"hi\")\n",
+            "        case _:\n",
+            "            print(\"unknown\")\n",
+        );
+        let muts = match_case_mutations(source);
+        assert_eq!(muts.len(), 3, "3-case match must produce 3 mutations");
+    }
+
+    // INV-4: Generated Python from each mutation is syntactically valid.
+    #[test]
+    fn test_mutations_produce_valid_python() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"quit\":\n",
+            "            return 0\n",
+            "        case \"hello\":\n",
+            "            return 1\n",
+            "        case _:\n",
+            "            return 2\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        for m in fm.mutations.iter().filter(|m| m.operator == "match_case_removal") {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "Removing case produced invalid Python:\n{mutated}"
+            );
+        }
+    }
+
+    // INV-5: Removing case[0] keeps case[1] and case[2].
+    #[test]
+    fn test_remove_first_case() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"quit\":\n",
+            "            return 0\n",
+            "        case \"hello\":\n",
+            "            return 1\n",
+            "        case _:\n",
+            "            return 2\n",
+        );
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        let muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+            .collect();
+        assert_eq!(muts.len(), 3);
+
+        // The mutation that removes case "quit" should keep the other two cases.
+        let mutants: Vec<String> = muts.iter().map(|m| apply_mutation(&fm.source, m)).collect();
+
+        // One mutant drops "quit" branch
+        assert!(
+            mutants.iter().any(|s| !s.contains("\"quit\"") && s.contains("\"hello\"") && s.contains("case _")),
+            "One mutant should remove 'quit' case while keeping 'hello' and '_'"
+        );
+
+        // One mutant drops "hello" branch
+        assert!(
+            mutants.iter().any(|s| s.contains("\"quit\"") && !s.contains("\"hello\"") && s.contains("case _")),
+            "One mutant should remove 'hello' case while keeping 'quit' and '_'"
+        );
+
+        // One mutant drops wildcard branch
+        assert!(
+            mutants.iter().any(|s| s.contains("\"quit\"") && s.contains("\"hello\"") && !s.contains("case _")),
+            "One mutant should remove '_' case while keeping 'quit' and 'hello'"
+        );
+    }
+
+    // INV-6: Nested match statements each produce their own mutations independently.
+    #[test]
+    fn test_nested_match_independent_mutations() {
+        let source = concat!(
+            "def foo(cmd, sub):\n",
+            "    match cmd:\n",
+            "        case \"outer_a\":\n",
+            "            match sub:\n",
+            "                case \"inner_1\":\n",
+            "                    return 0\n",
+            "                case \"inner_2\":\n",
+            "                    return 1\n",
+            "        case \"outer_b\":\n",
+            "            return 2\n",
+        );
+        let muts = match_case_mutations(source);
+        // Outer match has 2 cases → 2 mutations.
+        // Inner match has 2 cases → 2 mutations.
+        // Total: 4 match_case_removal mutations.
+        assert_eq!(
+            muts.len(),
+            4,
+            "Outer (2 cases) + inner (2 cases) = 4 match_case_removal mutations, got: {muts:?}"
+        );
+    }
+
+    // INV-7: Span correctness — original text equals func_source[start..end].
+    #[test]
+    fn test_span_correctness() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"quit\":\n",
+            "            return 0\n",
+            "        case _:\n",
+            "            return 1\n",
+        );
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        for m in fm.mutations.iter().filter(|m| m.operator == "match_case_removal") {
+            let slice = &fm.source[m.start..m.end];
+            assert_eq!(
+                slice, m.original,
+                "Span [{}, {}) must equal original",
+                m.start, m.end
+            );
+        }
+    }
+
+    // INV-8: Indentation is preserved in remaining cases after removal.
+    #[test]
+    fn test_indentation_preserved() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"quit\":\n",
+            "            return 0\n",
+            "        case _:\n",
+            "            return 1\n",
+        );
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        let muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+            .collect();
+        assert_eq!(muts.len(), 2);
+
+        for m in &muts {
+            let mutated = apply_mutation(&fm.source, m);
+            // The remaining "case" line must still be indented by 8 spaces.
+            assert!(
+                mutated.contains("        case "),
+                "Case indentation must be preserved: {mutated:?}"
             );
         }
     }
