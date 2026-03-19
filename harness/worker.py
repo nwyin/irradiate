@@ -53,11 +53,71 @@ class MutationWorkerPlugin:
         self.current_run_nodeids = set()
         self.current_item_nodeid = None
         self.current_run_reports = []
+        self._source_module_names = []  # modules loaded via MutantFinder
+        self._module_snapshots = {}  # mod_name -> shallow copy of vars(mod)
 
     def pytest_collection_finish(self, session):
         for index, item in enumerate(session.items):
             self.items[item.nodeid] = item
             self.item_order[item.nodeid] = index
+        self._identify_source_modules()
+
+    def _identify_source_modules(self):
+        """Detect which sys.modules entries were loaded via the MutantFinder import hook."""
+        from irradiate_harness.import_hook import MutantFinder
+
+        finder = None
+        for hook in sys.meta_path:
+            if isinstance(hook, MutantFinder):
+                finder = hook
+                break
+
+        if finder is None:
+            self._source_module_names = []
+            return
+
+        # Cache entries with truthy value (not False) are source-under-test
+        source_names = {name for name, entry in finder._cache.items() if entry}
+        # Intersect with currently loaded modules; exclude irradiate_harness itself
+        self._source_module_names = [
+            name
+            for name in source_names
+            if name in sys.modules
+            and name != "irradiate_harness"
+            and not name.startswith("irradiate_harness.")
+        ]
+
+    def _snapshot_source_modules(self):
+        """Shallow-copy source module state before the first mutant run.
+
+        This snapshot is taken once, before any test runs. Between mutant
+        runs, _restore_source_modules() resets each module back to this state,
+        preventing globals mutated by one test from leaking into the next run.
+        """
+        self._module_snapshots = {}
+        for mod_name in self._source_module_names:
+            mod = sys.modules.get(mod_name)
+            if mod is not None:
+                # Shallow copy: stores references, not deep copies.
+                # Handles scalar globals, class defs, function refs correctly.
+                # Mutable containers modified in-place (list.append, dict[k]=v)
+                # are NOT isolated — recycling handles that case.
+                self._module_snapshots[mod_name] = dict(vars(mod))
+
+    def _restore_source_modules(self):
+        """Restore source module state to the pre-run snapshot.
+
+        Called in the finally block after each mutant run to reset module-level
+        globals that tests may have modified. The shallow snapshot captures the
+        module dict at collection time, so trampolined functions are preserved.
+        irradiate_harness.active_mutant is NOT affected (separate module).
+        """
+        for mod_name, snapshot in self._module_snapshots.items():
+            mod = sys.modules.get(mod_name)
+            if mod is not None:
+                current = vars(mod)
+                current.clear()
+                current.update(snapshot)
 
     def _reset_run_state(self):
         self.current_run_mutant = None
@@ -112,6 +172,10 @@ class MutationWorkerPlugin:
             self.sock,
             {"type": "ready", "pid": os.getpid(), "tests": list(self.items.keys())},
         )
+
+        # Snapshot module state AFTER collection (tests have imported source modules)
+        # but BEFORE the first mutant run. Restored between runs to prevent leakage.
+        self._snapshot_source_modules()
 
         while True:
             msg, self.buf = recv_message(self.sock, self.buf)
@@ -186,6 +250,7 @@ class MutationWorkerPlugin:
                     )
                 finally:
                     self._reset_run_state()
+                    self._restore_source_modules()
                     irradiate_harness.active_mutant = None
 
         return True  # Signal to pytest that we handled the run loop

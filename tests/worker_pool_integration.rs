@@ -473,6 +473,168 @@ def test_mark_once():
     );
 }
 
+/// INV-1: Module global modified by test in mutant run N is restored before run N+1.
+///
+/// The test sets `leaky.SETTING = True` and asserts it starts as `False`.
+/// Without module restore, run 2 sees `True` from run 1 → assertion fails → killed (wrong).
+/// With module restore, run 2 sees the original `False` → assertion passes → survived (correct).
+#[tokio::test]
+async fn test_module_global_restore_between_runs() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("src/leaky")).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+
+    // Include a binop so mutate_file produces at least one mutation.
+    // The test only touches SETTING (module-level global), not the add function.
+    fs::write(
+        project.path().join("src/leaky/__init__.py"),
+        "SETTING = False\n\ndef add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
+
+    // This test asserts SETTING starts False, then sets it to True.
+    // If module state leaks across runs, run 2 sees True from the start → assertion fails.
+    fs::write(
+        project.path().join("tests/test_leaky.py"),
+        concat!(
+            "import leaky\n",
+            "\n",
+            "def test_setting_starts_false():\n",
+            "    assert leaky.SETTING is False, ",
+            r#"f"SETTING should be False at start of run, got {leaky.SETTING}""#,
+            "\n",
+            "    leaky.SETTING = True\n",
+        ),
+    )
+    .unwrap();
+
+    let python = fixture_python();
+    let (_tmp, _) =
+        generate_mutants_for_project(project.path(), "src/leaky/__init__.py", "leaky");
+    let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let mutants_dir = _tmp.path().to_path_buf();
+
+    // Use stats collection to discover the actual test ID format (pytest nodeids vary).
+    let test_stats =
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+            .expect("leaky project stats collection should succeed");
+    let test_id = test_stats
+        .duration_by_test
+        .keys()
+        .next()
+        .cloned()
+        .expect("leaky project should have one test");
+    let mut candidate_test_ids = vec![test_id.clone()];
+    if let Some(stripped) = test_id.strip_prefix("tests/") {
+        candidate_test_ids.push(stripped.to_string());
+    } else {
+        candidate_test_ids.push(format!("tests/{test_id}"));
+    }
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: project.path().to_path_buf(),
+        mutants_dir,
+        tests_dir: project.path().join("tests"),
+        timeout_multiplier: 10.0,
+        pythonpath,
+        worker_recycle_after: 0, // No recycling — we test module restore, not recycling
+        ..Default::default()
+    };
+
+    // Use nonexistent mutant names: trampoline calls original, so tests see real behavior.
+    // Both runs use the same test which asserts SETTING starts False.
+    let work_items = vec![
+        WorkItem {
+            mutant_name: "leaky.x_nonexistent__irradiate_1".to_string(),
+            test_ids: candidate_test_ids.clone(),
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+        WorkItem {
+            mutant_name: "leaky.x_nonexistent__irradiate_2".to_string(),
+            test_ids: candidate_test_ids,
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+    ];
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].status, MutantStatus::Survived, "First run should survive");
+    assert_eq!(
+        results[1].status,
+        MutantStatus::Survived,
+        "INV-1: second run must see restored SETTING=False, not leaked True from run 1"
+    );
+}
+
+/// INV-2: Trampolined function dispatch still works after module restore.
+///
+/// After restore, the trampoline dict and variant functions must be intact.
+/// We run a real mutant (not nonexistent) and verify it is still killed by the test.
+#[tokio::test]
+async fn test_trampoline_intact_after_restore() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    // Run two mutants on the same worker (no recycling).
+    // First run: add_mutant → should be killed.
+    // Second run: add_mutant again → should also be killed (trampoline intact after restore).
+    let work_items = vec![
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+    ];
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: fixture.clone(),
+        mutants_dir: _tmp.path().to_path_buf(),
+        tests_dir: fixture.join("tests"),
+        timeout_multiplier: 10.0,
+        worker_recycle_after: 0, // same worker for both runs
+        ..Default::default()
+    };
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].status,
+        MutantStatus::Killed,
+        "INV-2: first run must kill the mutant"
+    );
+    assert_eq!(
+        results[1].status,
+        MutantStatus::Killed,
+        "INV-2: trampoline must still dispatch mutant correctly after module restore"
+    );
+}
+
 #[tokio::test]
 async fn test_stats_collection() {
     let fixture = fixture_dir();
