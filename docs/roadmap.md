@@ -33,6 +33,29 @@ Remaining cache work is follow-up scope:
 - remote/shared cache
 - cache GC / pruning
 
+## Mutation Application Correctness
+
+The mutation engine uses a monotonically-advancing cursor to track byte offsets during CST traversal. Several procedural operators that previously bypassed this mechanism have been fixed:
+
+- **Lambda mutations** (`db02917`): replaced `String::replace()` with byte-offset splice targeting only the body after the `:` separator.
+- **Method swap** (`e575e73`): replaced `rfind(method_name)` heuristic with structural dot-offset computed from the `Attribute` CST node.
+- **Match case removal** (`8ed09f5`): replaced indentation-based line scanning with CST-aware pattern anchoring using each case's pattern text as a search anchor.
+- **Assignment mutations** (`badd409`): audit found and fixed a bug where chained assignments (`a = b = c`) dropped intermediate targets. Added explanatory comment for `find('=')` safety.
+
+## Warm-Session State Isolation
+
+Three layers of defense against state leakage in the warm-session worker model:
+
+1. **Module state snapshot/restore** (`18efd8f`): between mutant runs, the worker snapshots `vars()` of all source-under-test modules (identified via the `MutantFinder` import hook's cache) and restores them after each run. Warning registries are also cleared. This handles the common case of tests reassigning module-level names.
+
+2. **Session-fixture detection + auto-tuned recycling** (`d3951ea`): during collection, the worker inspects pytest's fixture manager for session-scoped fixtures. When detected, the orchestrator reduces the recycling interval (100 → 20) unless the user explicitly set `--worker-recycle-after`. Fixture names are logged.
+
+3. **`--verify-survivors`** (`3d2c94a`): after warm-session testing, re-tests all survived mutants in `--isolate` mode. Result discrepancies (survived → killed) are corrected and the cache is updated.
+
+Remaining work:
+- Selective `importlib.reload()` for deep mutable state (GitHub issue #7, deferred)
+- Empirical compatibility testing with popular pytest plugins
+
 ## Worker Pool Hardening
 
 This area is now largely complete for the current worker architecture:
@@ -131,7 +154,7 @@ Regardless of which fast architecture we standardize, the worker must handle:
 ### Risks
 
 - **Private pytest internals were a maintenance hazard**: the earlier prototype depended on underscored pytest APIs and internal state containers. Mitigation: the default fast path now uses pytest hooks instead, and future changes should keep private dependencies isolated and explicit.
-- **State leakage remains the core semantic risk for warm-session execution**: session fixtures, module globals, and plugin state survive between mutants. Mitigation: worker recycling (already implemented via `--worker-recycle-after`) and `--isolate`.
+- **State leakage is now defended in depth for warm-session execution**: module globals are snapshot/restored between runs, session-fixture presence auto-tunes recycling, and `--verify-survivors` catches remaining false negatives. Residual risk: deep mutations to mutable module-level objects (dict/list contents) are not caught by shallow snapshot/restore.
 - **Fork safety is the core semantic risk for snapshot/fork execution**: some plugins and runtimes behave poorly if pytest is forked after initialization. Mitigation: treat fork-snapshot as an explicit backend with compatibility testing, not as the only execution mode.
 - **Plugin compatibility remains a product concern either way**: some plugins assume one session = one run, others may assume no post-init fork. Mitigation: document incompatible plugins, keep multiple backends, and bias toward conservative fallbacks when behavior is unclear.
 - **Fixture teardown ordering still matters**: running items out of collection order may trigger fixtures in unexpected sequences. Mitigation: run items in original collection order within each mutant.
@@ -176,28 +199,45 @@ Architectural feedback recorded after the implementation reached end-to-end work
 
 ### Main critiques
 
-#### Mutation application is the biggest correctness risk
+#### Mutation application correctness (addressed)
 
-The mutation engine uses text-based CST walking for discovery and applies mutations through text substitution. Repeated identical tokens inside one function can map to the wrong source slice.
+The mutation engine uses text-based CST walking for discovery and applies mutations through text substitution. A monotonically-advancing cursor correctly disambiguates repeated tokens. Several procedural operators previously bypassed this cursor mechanism; these have now been fixed:
 
-#### Warm-session execution now exists, but compatibility remains the real risk
+- **Lambda mutations**: replaced `String::replace()` (all occurrences) with byte-offset splice targeting only the body
+- **Method swap**: replaced `rfind` heuristic with structural dot-offset from the `Attribute` CST node
+- **Match case removal**: replaced indentation-based line scanning with CST-aware pattern anchoring using case pattern text
+- **Assignment mutations**: audit found and fixed a bug where chained assignments (`a = b = c`) dropped intermediate targets
 
-The worker pool now executes pre-collected items inside a long-lived pytest session through pytest's hook machinery. The main remaining risk in this area is not raw performance, but semantic leakage across mutants: session-scoped fixtures, mutable plugin state, and suites that assume one pytest session equals one logical run.
+Remaining concerns are limited to edge cases in the libcst Rust crate's codegen (e.g., indentation normalization for nested structures).
+
+#### Warm-session state leakage (addressed)
+
+The worker pool reuses a single pytest session across mutant runs. Three layers of defense are now implemented:
+
+1. **Module state snapshot/restore**: between mutant runs, the worker snapshots and restores `vars()` of all source-under-test modules (identified via the `MutantFinder` import hook). This prevents tests that modify module globals from leaking state to subsequent mutant runs. Warning registries are also cleared.
+
+2. **Session-fixture detection + auto-tuned recycling**: during collection, the worker detects session-scoped fixtures via pytest's fixture manager. When detected, the orchestrator automatically reduces the recycling interval (100 → 20) unless the user explicitly set `--worker-recycle-after`. A warning is logged.
+
+3. **`--verify-survivors`**: after warm-session testing, re-tests all survived mutants in `--isolate` mode. Any result that flips (survived → killed) is corrected and the cache is updated. This catches false negatives from any leakage that snapshot/restore and recycling miss.
+
+Remaining risks are limited to deep mutations of mutable module-level objects (e.g., `mylib.cache.update(...)`) which shallow snapshot/restore doesn't catch. Selective `importlib.reload()` is tracked as a future option (GitHub issue #7).
 
 #### Worker lifecycle hardening is mostly done
 
 - `--isolate` mode works.
-- `--worker-recycle-after` bounds state leakage.
+- `--worker-recycle-after` bounds state leakage (auto-tuned when session fixtures detected).
 - Per-mutant timeout budgets are derived from collected test durations.
 - Respawned workers can rejoin the pool.
 - The scheduler now uses collected test durations for longest-first ordering.
-- Remaining concerns are empirical: compatibility testing, tuning recycle defaults, and deciding whether a fork-snapshot backend is worth the complexity.
+- Module state snapshot/restore prevents the most common leakage vector.
+- `--verify-survivors` provides a correctness safety net.
+- Remaining concerns are empirical: compatibility testing with diverse pytest plugin ecosystems, and deciding whether a fork-snapshot backend is worth the complexity.
 
 ### Recommended sequencing
 
-1. Tighten mutation correctness: move from substring-based application toward stable spans or structured rewriting.
-2. Expand compatibility coverage for the warm-session worker and keep `--isolate` as the conservative fallback.
-3. Expand operator coverage after the foundation above is solid.
+1. Expand operator coverage now that the mutation engine and warm-session model are both hardened.
+2. Empirical compatibility testing across diverse pytest plugin ecosystems.
+3. Cache follow-ups (`--no-cache`, remote/shared cache, GC).
 
 ---
 
@@ -205,11 +245,14 @@ The worker pool now executes pre-collected items inside a long-lived pytest sess
 
 | # | Item | Effort | Impact | Status |
 |---|------|--------|--------|--------|
-| 1 | Mutation application correctness | L | Prevents incorrect source rewrites on repeated identical spans | |
-| 2 | Warm-session compatibility hardening | M | Better behavior on complex pytest/plugin ecosystems | |
-| 3 | Cache follow-ups (`--no-cache`, remote, GC) | M | Better operability beyond the local always-on cache | |
-| ~~4~~ | ~~Content-addressable cache~~ | L | ~~Big perf win on incremental runs~~ | done — local cache + `cache clean` |
-| ~~5~~ | ~~Direct test execution via hook-driven worker~~ | L | ~~The core performance win — 5-10× on real projects~~ | done |
-| ~~6~~ | ~~Worker pool hardening (respawn, memory, scheduling, timeouts)~~ | L | ~~Robustness at scale~~ | done |
-| ~~7~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
-| ~~8~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |
+| 1 | Operator coverage expansion | M | More mutation types = better test quality signal | |
+| 2 | Cache follow-ups (`--no-cache`, remote, GC) | M | Better operability beyond the local always-on cache | |
+| 3 | Plugin compatibility testing | M | Confidence that warm-session works with popular pytest plugins | |
+| 4 | Selective module reload (Tier 3 cleanup) | M | Handles deep mutable state leakage that snapshot/restore misses | future — GitHub #7 |
+| ~~5~~ | ~~Mutation application correctness~~ | L | ~~Prevents incorrect source rewrites~~ | done — lambda splice, method dot-offset, match CST anchoring, chained assignment fix |
+| ~~6~~ | ~~Warm-session compatibility hardening~~ | M | ~~Prevent state leakage between mutant runs~~ | done — module snapshot/restore, session-fixture detection, `--verify-survivors` |
+| ~~7~~ | ~~Content-addressable cache~~ | L | ~~Big perf win on incremental runs~~ | done — local cache + `cache clean` |
+| ~~8~~ | ~~Direct test execution via hook-driven worker~~ | L | ~~The core performance win — 5-10× on real projects~~ | done |
+| ~~9~~ | ~~Worker pool hardening (respawn, memory, scheduling, timeouts)~~ | L | ~~Robustness at scale~~ | done |
+| ~~10~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
+| ~~11~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |

@@ -42,6 +42,7 @@ irradiate show module.x_func__mutmut_1
 | **Mutation generation** | Sequential Python (LibCST) | Parallel Rust (libcst crate + rayon) |
 | **Result I/O** | JSON write per mutant | Batched writes |
 | **Isolation** | Fork per mutant only | Default warm-session + `--isolate` flag for full subprocess isolation |
+| **State leakage** | None (fresh process per mutant) | Module snapshot/restore between runs, session-fixture-aware recycling, `--verify-survivors` safety net |
 | **Worker health** | — | Memory monitoring, automatic respawn, configurable recycling |
 | **Test selection** | Coverage-based | Coverage-based + duration-aware scheduling (longest-first ordering, per-mutant timeout budgets) |
 
