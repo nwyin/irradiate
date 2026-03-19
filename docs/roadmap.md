@@ -38,9 +38,14 @@ Note: `--isolate` mode and `--worker-recycle-after` are already implemented.
 
 ## Design Decision: Worker Execution Model
 
-### Current approach
+### Current state
 
-Workers call `pytest.main(["-x", "--no-header", "-q"] + test_ids)` for every mutant. This re-invokes pytest's full startup sequence — argument parsing, plugin loading, test collection, fixture resolution — then runs the selected tests and exits. The pre-collected test items from the `ItemCollector` plugin are used only for reporting available tests to the orchestrator, not for execution.
+The harness now has two execution paths:
+
+- **Legacy path**: call `pytest.main(["-x", "--no-header", "-q"] + test_ids)` for every mutant. This re-invokes pytest's full startup sequence — argument parsing, plugin loading, test collection, fixture resolution — then runs the selected tests and exits.
+- **Fast path**: keep a pytest session alive inside the worker, collect once, then execute pre-collected items directly for each mutant.
+
+Today the fast path proves the performance model, but it currently does so by reaching into pytest internals (`_pytest.runner.runtestprotocol`, `_setupstate`, per-item report buffers). So the design question is no longer "should we have a direct execution path?" but "which fast execution architecture do we want to standardize and harden?"
 
 ### Why this exists
 
@@ -55,33 +60,97 @@ On a typical project with 200ms pytest startup and 1000 mutants:
 
 Without direct execution, the worker pool is just a process pool with warm Python interpreters, saving only the Python startup time (~50ms), not the pytest startup time (~200ms).
 
-### What direct execution requires
+### Fast execution options
 
-The target API is `_pytest.runner.runtestprotocol(item, nextitem=None)`, which:
-1. Calls setup hooks (fixture instantiation)
-2. Runs the test function
-3. Calls teardown hooks (fixture cleanup)
-4. Returns a list of `TestReport` objects
+#### Option 1: Warm session + hook-driven execution
 
-Between mutant runs, the worker must reset:
-- **Test outcomes**: clear any cached `TestReport` objects
-- **Captured output**: reset the capture manager plugin
-- **Fixture state**: session-scoped fixtures persist (by design), function-scoped fixtures are fresh per item
-- **Plugin state**: some plugins accumulate state (warnings, coverage) that needs clearing
+This keeps the current worker shape:
+
+1. Start pytest once per worker
+2. Collect all tests once
+3. Own `pytest_runtestloop` inside a worker plugin
+4. Receive `(mutant_name, [test_ids])` over IPC
+5. Resolve nodeids to pre-collected `Item` objects
+6. Execute each item through pytest's hook machinery (`pytest_runtest_protocol`, `pytest_runtest_logreport`) instead of importing `_pytest.runner` directly
+
+This is closest to how `pytest-xdist` workers behave: each worker is a miniature pytest runner that owns collection and executes selected items as the controller sends them work.
+
+**Pros**
+- Preserves the main performance win: startup/collection paid once per worker
+- Smallest implementation delta from the current worker/orchestrator design
+- Keeps the existing nodeid-based IPC model
+- Moves the execution path closer to documented pytest hook surfaces
+
+**Cons**
+- Session-scoped fixtures, module globals, and plugin state still live across mutants
+- Some plugins assume one pytest session equals one logical run
+- We may still need careful cleanup or selective recycling between runs
+
+#### Option 2: Fork snapshot from a warm collected parent
+
+This is a Unix-only design, but Windows support is not a requirement for this project.
+
+1. Start pytest once in a parent worker process
+2. Collect all tests once
+3. Leave the parent idle as a "clean enough" snapshot
+4. `fork()` a child per mutant or per small batch
+5. In the child, set `active_mutant`, run the selected items, report results, and exit
+6. The parent never accumulates post-run test state because each mutant runs in a short-lived child
+
+**Pros**
+- Much stronger isolation between mutants
+- Better crash containment: child crashes do not poison the parent collector
+- Retains much of the startup/collection win because the address space is inherited via `fork`
+
+**Cons**
+- Higher implementation complexity than the warm-session model
+- Higher per-mutant overhead than direct in-session execution
+- Forking an already-initialized pytest process can have plugin- and platform-specific sharp edges, especially if plugins start threads, register process-global resources, or otherwise assume no post-initialization fork
+- Still not as correct or portable as full `--isolate`
+
+### Shared requirements for any fast path
+
+Regardless of which fast architecture we standardize, the worker must handle:
+
+- **Fixture teardown semantics**: preserve pytest's expected setup/teardown ordering for selected items
+- **Captured output reset**: no stdout/stderr leakage between mutant runs
+- **Plugin state accumulation**: warnings, coverage, junitxml, and custom plugins may keep mutable session state
+- **Result collection**: convert test outcomes back into a simple killed/survived/error signal for the orchestrator
+- **Fallbacks**: keep `--isolate` and worker recycling available when a suite is incompatible with the fast path
 
 ### Risks
 
-- **Pytest internal API instability**: `_pytest.runner.runtestprotocol` is private API. Mitigation: version-check at startup, fall back to `pytest.main()` on unrecognized versions.
-- **State leakage**: session-scoped fixtures, module-level variables, and global state survive between runs. Mitigation: worker recycling (respawn every N mutants, already implemented via `--worker-recycle-after`).
-- **Plugin compatibility**: some pytest plugins assume one session = one run. Mitigation: document incompatible plugins, offer `--isolate` fallback (already implemented).
-- **Fixture teardown ordering**: running items out of collection order may trigger fixtures in unexpected sequences. Mitigation: run items in their original collection order within each mutant.
+- **Private pytest internals are a maintenance hazard**: the current fast path depends on underscored pytest APIs and internal state containers. Mitigation: move the primary implementation toward public hook surfaces where possible.
+- **State leakage remains the core semantic risk for warm-session execution**: session fixtures, module globals, and plugin state survive between mutants. Mitigation: worker recycling (already implemented via `--worker-recycle-after`) and `--isolate`.
+- **Fork safety is the core semantic risk for snapshot/fork execution**: some plugins and runtimes behave poorly if pytest is forked after initialization. Mitigation: treat fork-snapshot as an explicit backend with compatibility testing, not as the only execution mode.
+- **Plugin compatibility remains a product concern either way**: some plugins assume one session = one run, others may assume no post-init fork. Mitigation: document incompatible plugins, keep multiple backends, and bias toward conservative fallbacks when behavior is unclear.
+- **Fixture teardown ordering still matters**: running items out of collection order may trigger fixtures in unexpected sequences. Mitigation: run items in original collection order within each mutant.
+
+### Recommendation
+
+If we have to pick one fast architecture as the default product path, the best next step is:
+
+1. **Standardize on Option 1**: warm session + hook-driven execution
+2. Replace direct imports of `_pytest.runner.runtestprotocol` with pytest hook calls where feasible
+3. Treat worker recycling as part of the default correctness story, not just a debugging escape hatch
+4. Keep `--isolate` as the strongest fallback
+5. Consider Option 2 later as an experimental Unix-only backend if real-world suites show too much leakage under the warm-session model
+
+Why this is the recommended default:
+
+- It preserves nearly all of the performance upside
+- It fits the current worker/orchestrator architecture with minimal churn
+- It reduces dependency on private pytest internals without changing the core execution model
+- It avoids making post-initialization `fork()` behavior the foundation of the product
 
 ### Phased approach
 
 1. **Phase 1 (done)**: `pytest.main()` per mutant. Correct but slow. Validates the pool architecture.
-2. **Phase 2 (next)**: `runtestprotocol()` on pre-collected items. The main performance win. Add version check + fallback.
-3. **Phase 3 (done)**: Worker recycling via `--worker-recycle-after`. Bounds state leakage.
-4. **Phase 4 (done)**: `--isolate` flag. Fresh subprocess per mutant for max correctness.
+2. **Phase 2 (prototype exists, needs hardening)**: direct execution on pre-collected items inside a long-lived worker session. This is the main performance win, but the current implementation still leans on private pytest internals.
+3. **Phase 3 (next)**: rework the fast path around pytest's hook machinery and tighten state-reset/reporting semantics so the default backend is not built around underscored imports.
+4. **Phase 4 (done)**: Worker recycling via `--worker-recycle-after`. Bounds state leakage.
+5. **Phase 5 (done)**: `--isolate` flag. Fresh subprocess per mutant for max correctness.
+6. **Phase 6 (optional, later)**: evaluate a Unix-only fork-snapshot backend as a middle ground between warm-session speed and `--isolate` correctness.
 
 ---
 
