@@ -934,9 +934,16 @@ fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec
         for &(from, to) in METHOD_SWAPS {
             if method_trimmed == from {
                 let func_text = codegen_node(&*call.func);
-                if let Some(pos) = func_text.rfind(from) {
-                    record_mutation(from, to, "method_swap", expr_start + pos, mutations);
-                }
+                // Structural offset: the method name is always after the last dot in an
+                // Attribute node. Using rfind('.') is a structural guarantee, unlike
+                // rfind(method_name) which is a text heuristic that happens to work for
+                // symmetric cases like `find.find()` but is not structurally sound.
+                let dot_pos = func_text.rfind('.').expect("Attribute node always contains a dot");
+                // Skip any whitespace between the dot and the method name (codegen may add space).
+                let after_dot = &func_text[dot_pos + 1..];
+                let leading_ws = after_dot.len() - after_dot.trim_start().len();
+                let method_start = dot_pos + 1 + leading_ws;
+                record_mutation(from, to, "method_swap", expr_start + method_start, mutations);
                 break;
             }
         }
@@ -1579,6 +1586,69 @@ mod tests {
             .filter(|m| m.operator == "method_swap")
             .collect();
         assert_eq!(method_muts.len(), 2, "Should find 2 method swap mutations");
+    }
+
+    // INV-1: When the object variable name equals the method name, the mutation span
+    // must cover the method (after the dot), NOT the object name (before the dot).
+    #[test]
+    fn test_method_swap_object_name_equals_method_name() {
+        let source = "def foo(s):\n    return find.find('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .expect("Should find method_swap mutation on find.find()");
+
+        assert_eq!(m.original, "find");
+        assert_eq!(m.replacement, "rfind");
+
+        // The span must cover exactly the method name text.
+        let span_text = &fms[0].source[m.start..m.end];
+        assert_eq!(span_text, "find", "Span should cover the method name, not the object");
+
+        // The character immediately before the method start must be a dot.
+        assert_eq!(
+            &fms[0].source[m.start - 1..m.start],
+            ".",
+            "Character before method span start must be a dot"
+        );
+    }
+
+    // INV-3: For any method_swap mutation m, source[m.start..m.end] equals the original name.
+    // Also validates that the character before the span is always a dot (structural guarantee).
+    #[test]
+    fn test_method_swap_span_structural_correctness() {
+        let cases = [
+            "def foo(s):\n    return s.lower()\n",
+            "def foo(s):\n    return s.upper()\n",
+            "def foo(s):\n    return find.find('x')\n",
+            "def foo(s):\n    return lower.lower()\n",
+            "def foo(s):\n    return s.strip().lower()\n",
+            "def foo(s):\n    return upper.upper()\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in &fm.mutations {
+                    if m.operator == "method_swap" {
+                        let span_text = &fm.source[m.start..m.end];
+                        assert_eq!(
+                            span_text, m.original,
+                            "INV-3: span [{}, {}) = {:?} but original = {:?} in {:?}",
+                            m.start, m.end, span_text, m.original, source
+                        );
+                        // Structural guarantee: immediately before the method name is always a dot.
+                        assert_eq!(
+                            &fm.source[m.start - 1..m.start],
+                            ".",
+                            "Character before method span must be a dot, violated in {:?}",
+                            source
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
