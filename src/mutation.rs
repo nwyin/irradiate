@@ -850,6 +850,14 @@ static METHOD_SWAPS: &[(&str, &str)] = &[
     ("rstrip", "lstrip"),
     ("find", "rfind"),
     ("rfind", "find"),
+    ("ljust", "rjust"),
+    ("rjust", "ljust"),
+    ("index", "rindex"),
+    ("rindex", "index"),
+    ("removeprefix", "removesuffix"),
+    ("removesuffix", "removeprefix"),
+    ("partition", "rpartition"),
+    ("rpartition", "partition"),
 ];
 
 fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec<Mutation>) {
@@ -1155,6 +1163,78 @@ mod tests {
         let m = method_mut.unwrap();
         assert_eq!(m.original, "lstrip");
         assert_eq!(m.replacement, "rstrip");
+    }
+
+    #[test]
+    fn test_method_swap_ljust_rjust() {
+        let source = "def foo(s):\n    return s.ljust(10)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "ljust");
+        assert_eq!(m.replacement, "rjust");
+    }
+
+    #[test]
+    fn test_method_swap_rjust_ljust() {
+        let source = "def foo(s):\n    return s.rjust(10)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "rjust");
+        assert_eq!(m.replacement, "ljust");
+    }
+
+    #[test]
+    fn test_method_swap_index_rindex() {
+        let source = "def foo(s):\n    return s.index('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "index");
+        assert_eq!(m.replacement, "rindex");
+    }
+
+    #[test]
+    fn test_method_swap_rindex_index() {
+        let source = "def foo(s):\n    return s.rindex('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "rindex");
+        assert_eq!(m.replacement, "index");
+    }
+
+    #[test]
+    fn test_method_swap_removeprefix_removesuffix() {
+        let source = "def foo(s):\n    return s.removeprefix('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "removeprefix");
+        assert_eq!(m.replacement, "removesuffix");
+    }
+
+    #[test]
+    fn test_method_swap_removesuffix_removeprefix() {
+        let source = "def foo(s):\n    return s.removesuffix('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "removesuffix");
+        assert_eq!(m.replacement, "removeprefix");
+    }
+
+    #[test]
+    fn test_method_swap_partition_rpartition() {
+        let source = "def foo(s):\n    return s.partition('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "partition");
+        assert_eq!(m.replacement, "rpartition");
+    }
+
+    #[test]
+    fn test_method_swap_rpartition_partition() {
+        let source = "def foo(s):\n    return s.rpartition('x')\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        assert_eq!(m.original, "rpartition");
+        assert_eq!(m.replacement, "partition");
     }
 
     #[test]
