@@ -180,11 +180,19 @@ fn spawn_worker_task(
             }
         });
 
+        // Per-mutant read timeout: starts at the global default, updated for each Run message.
+        // Duration is Copy so each loop iteration's async block captures the current value.
+        let mut current_timeout = default_timeout.mul_f64(timeout_multiplier);
+
         loop {
             tokio::select! {
                 msg = msg_rx.recv() => {
                     match msg {
                         Some(msg) => {
+                            // Update read timeout when dispatching a Run with a per-mutant timeout.
+                            if let OrchestratorMessage::Run { timeout_secs: Some(secs), .. } = &msg {
+                                current_timeout = Duration::from_secs_f64(*secs);
+                            }
                             let json = serde_json::to_string(&msg).unwrap() + "\n";
                             if write_tx.send(json).await.is_err() {
                                 let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
@@ -196,7 +204,7 @@ fn spawn_worker_task(
                 }
                 line = async {
                     let mut line = String::new();
-                    match timeout(default_timeout.mul_f64(timeout_multiplier), reader.read_line(&mut line)).await {
+                    match timeout(current_timeout, reader.read_line(&mut line)).await {
                         Ok(Ok(0)) => None, // EOF
                         Ok(Ok(_)) => Some(Ok(line)),
                         Ok(Err(e)) => Some(Err(e)),
@@ -300,6 +308,7 @@ async fn dispatch_work(
                     let msg = OrchestratorMessage::Run {
                         mutant: item.mutant_name,
                         tests: item.test_ids,
+                        timeout_secs: Some(item.timeout_secs),
                     };
                     if sender.send(msg).await.is_err() {
                         warn!("Worker {worker_id} channel closed while dispatching");

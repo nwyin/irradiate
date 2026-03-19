@@ -163,9 +163,21 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 // No stats — will be filled by worker's collected tests
                 vec![]
             };
+
+            // Compute per-mutant timeout using the same formula as isolated mode:
+            // multiply estimated test duration, floor at multiplier×DEFAULT and MIN.
+            let estimated_secs = test_stats
+                .as_ref()
+                .map(|s| s.estimated_duration(&test_ids))
+                .unwrap_or(0.0);
+            let timeout_secs = (config.timeout_multiplier * estimated_secs)
+                .max(config.timeout_multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
+                .max(MIN_ISOLATED_TIMEOUT_SECS);
+
             Some(WorkItem {
                 mutant_name: mutant_name.clone(),
                 test_ids,
+                timeout_secs,
             })
         })
         .collect();
@@ -949,6 +961,63 @@ fn diff_lines(original: &str, mutant: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- per-mutant timeout computation ---
+
+    fn compute_timeout(multiplier: f64, estimated_secs: f64) -> f64 {
+        (multiplier * estimated_secs)
+            .max(multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
+            .max(MIN_ISOLATED_TIMEOUT_SECS)
+    }
+
+    #[test]
+    fn test_per_mutant_timeout_formula_zero_duration() {
+        // INV: timeout >= MIN_ISOLATED_TIMEOUT_SECS always.
+        // INV: timeout >= multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS when estimated=0.
+        // multiplier(10) * DEFAULT(30) = 300, which dominates
+        let timeout = compute_timeout(10.0, 0.0);
+        assert!((timeout - 300.0).abs() < 1e-9, "expected 300.0, got {timeout}");
+        assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_per_mutant_timeout_formula_large_suite() {
+        // When estimated duration exceeds the default, multiplier×estimated wins.
+        // multiplier(10) * estimated(60) = 600 > multiplier * DEFAULT (300)
+        let timeout = compute_timeout(10.0, 60.0);
+        assert!((timeout - 600.0).abs() < 1e-9, "expected 600.0, got {timeout}");
+    }
+
+    #[test]
+    fn test_per_mutant_timeout_formula_min_floor() {
+        // With multiplier=1 and tiny suite, DEFAULT dominates over tiny estimated.
+        // multiplier(1) * DEFAULT(30) = 30 >> 0.001; 30 >= MIN(10)
+        let timeout = compute_timeout(1.0, 0.001);
+        assert!((timeout - 30.0).abs() < 1e-9, "expected 30.0, got {timeout}");
+        assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_per_mutant_timeout_always_at_least_min() {
+        // Property: for any (multiplier, estimated) combination, timeout >= MIN.
+        let cases: &[(f64, f64)] = &[
+            (0.01, 0.0),
+            (0.01, 100.0),
+            (1.0, 0.0),
+            (1.0, 0.5),
+            (10.0, 0.0),
+            (10.0, 5.0),
+            (100.0, 0.0),
+            (100.0, 3600.0),
+        ];
+        for &(multiplier, estimated_secs) in cases {
+            let timeout = compute_timeout(multiplier, estimated_secs);
+            assert!(
+                timeout >= MIN_ISOLATED_TIMEOUT_SECS,
+                "timeout {timeout} < MIN ({MIN_ISOLATED_TIMEOUT_SECS}) for multiplier={multiplier} estimated={estimated_secs}"
+            );
+        }
+    }
 
     #[test]
     fn test_build_pythonpath_includes_source_parent() {

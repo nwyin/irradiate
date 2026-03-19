@@ -82,14 +82,17 @@ async fn test_worker_pool_dispatches_mutants() {
         WorkItem {
             mutant_name: add_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            timeout_secs: 300.0,
         },
         WorkItem {
             mutant_name: is_pos_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
+            timeout_secs: 300.0,
         },
         WorkItem {
             mutant_name: greet_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_greet".to_string()],
+            timeout_secs: 300.0,
         },
     ];
 
@@ -159,6 +162,7 @@ async fn test_worker_pool_surviving_mutant() {
             "tests/test_simple.py::test_is_positive".to_string(),
             "tests/test_simple.py::test_greet".to_string(),
         ],
+        timeout_secs: 300.0,
     }];
 
     let results = run_worker_pool(&config, work_items)
@@ -205,14 +209,17 @@ async fn test_worker_pool_with_recycling() {
         WorkItem {
             mutant_name: add_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            timeout_secs: 300.0,
         },
         WorkItem {
             mutant_name: is_pos_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
+            timeout_secs: 300.0,
         },
         WorkItem {
             mutant_name: greet_mutant.clone(),
             test_ids: vec!["tests/test_simple.py::test_greet".to_string()],
+            timeout_secs: 300.0,
         },
     ];
 
@@ -264,6 +271,7 @@ async fn test_worker_pool_recycle_disabled() {
     let work_items = vec![WorkItem {
         mutant_name: add_mutant.clone(),
         test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+        timeout_secs: 300.0,
     }];
 
     let config = PoolConfig {

@@ -5,7 +5,14 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrchestratorMessage {
     Warmup,
-    Run { mutant: String, tests: Vec<String> },
+    Run {
+        mutant: String,
+        tests: Vec<String>,
+        /// Per-mutant timeout in seconds. Used by the worker task to bound how long
+        /// it waits for the Python worker to respond. Not consumed by the Python side.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<f64>,
+    },
     Shutdown,
 }
 
@@ -37,6 +44,8 @@ pub enum WorkerMessage {
 pub struct WorkItem {
     pub mutant_name: String,
     pub test_ids: Vec<String>,
+    /// Per-mutant timeout in seconds (multiplier × estimated test duration, floored at MIN).
+    pub timeout_secs: f64,
 }
 
 /// Result of testing a single mutant.
@@ -84,16 +93,41 @@ mod tests {
         let msg = OrchestratorMessage::Run {
             mutant: "my_lib.x_hello__irradiate_1".to_string(),
             tests: vec!["tests/test.py::test_hello".to_string()],
+            timeout_secs: Some(120.0),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"run\""));
         assert!(json.contains("my_lib.x_hello__irradiate_1"));
+        assert!(json.contains("timeout_secs"));
 
         let parsed: OrchestratorMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            OrchestratorMessage::Run { mutant, tests } => {
+            OrchestratorMessage::Run { mutant, tests, timeout_secs } => {
                 assert_eq!(mutant, "my_lib.x_hello__irradiate_1");
                 assert_eq!(tests.len(), 1);
+                assert_eq!(timeout_secs, Some(120.0));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_orchestrator_message_serialization_no_timeout() {
+        // Run without timeout_secs: should not include the field in JSON (skip_serializing_if)
+        let msg = OrchestratorMessage::Run {
+            mutant: "mod.x_f__irradiate_1".to_string(),
+            tests: vec![],
+            timeout_secs: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("timeout_secs"), "None timeout_secs should be omitted from JSON");
+
+        // And deserializing old JSON (no timeout_secs field) should give None
+        let old_json = r#"{"type":"run","mutant":"mod.x_f__irradiate_1","tests":[]}"#;
+        let parsed: OrchestratorMessage = serde_json::from_str(old_json).unwrap();
+        match parsed {
+            OrchestratorMessage::Run { timeout_secs, .. } => {
+                assert_eq!(timeout_secs, None, "missing field should deserialize as None");
             }
             _ => panic!("expected Run"),
         }
