@@ -196,9 +196,8 @@ The worker pool now executes pre-collected items inside a long-lived pytest sess
 ### Recommended sequencing
 
 1. Tighten mutation correctness: move from substring-based application toward stable spans or structured rewriting.
-2. Build the content-addressable cache.
-3. Expand compatibility coverage for the warm-session worker and keep `--isolate` as the conservative fallback.
-4. Expand operator coverage after the foundation above is solid.
+2. Expand compatibility coverage for the warm-session worker and keep `--isolate` as the conservative fallback.
+3. Expand operator coverage after the foundation above is solid.
 
 ---
 
