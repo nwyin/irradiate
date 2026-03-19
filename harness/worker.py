@@ -80,11 +80,7 @@ class MutationWorkerPlugin:
         source_names = {name for name, entry in finder._cache.items() if entry}
         # Intersect with currently loaded modules; exclude irradiate_harness itself
         self._source_module_names = [
-            name
-            for name in source_names
-            if name in sys.modules
-            and name != "irradiate_harness"
-            and not name.startswith("irradiate_harness.")
+            name for name in source_names if name in sys.modules and name != "irradiate_harness" and not name.startswith("irradiate_harness.")
         ]
 
     def _snapshot_source_modules(self):
@@ -164,6 +160,7 @@ class MutationWorkerPlugin:
         is fully alive and all plugins are ready for test execution.
         """
         import irradiate_harness
+
         if not self.items:
             print("WARNING: No tests collected", file=sys.stderr)
 
