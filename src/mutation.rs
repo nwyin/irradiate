@@ -806,7 +806,27 @@ fn add_lambda_mutation_at(
     } else {
         "None"
     };
-    let replacement = full_text.replace(&body_text, replacement_body);
+    // Use a structural byte-offset splice instead of String::replace(), which would replace
+    // ALL occurrences of body_text in full_text — including any that appear in param names.
+    // Lambda params can never contain `:`, so the first `:` in the lambda text is always the
+    // colon separator between params and body.
+    let colon_pos = match full_text.find(':') {
+        Some(p) => p,
+        None => return, // malformed lambda; skip
+    };
+    let after_colon = &full_text[colon_pos + 1..];
+    let ws_len = after_colon.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+    let body_start = colon_pos + 1 + ws_len;
+    let body_end = body_start + body_text.len();
+    if body_end > full_text.len() {
+        return; // safety guard: malformed body offset
+    }
+    let replacement = format!(
+        "{}{}{}",
+        &full_text[..body_start],
+        replacement_body,
+        &full_text[body_end..]
+    );
     record_mutation(full_text, &replacement, "lambda_mutation", start, mutations);
 }
 
@@ -2455,5 +2475,115 @@ mod match_case_removal_tests {
                 "Case indentation must be preserved: {mutated:?}"
             );
         }
+    }
+
+    // --- lambda_mutation splice correctness tests ---
+
+    fn lambda_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "lambda_mutation")
+            .collect()
+    }
+
+    // INV-1: `lambda x: x if x else None` — body text contains `x` which also appears in
+    // params; the mutation must replace only the body, not the parameter.
+    #[test]
+    fn test_lambda_mutation_body_text_in_params() {
+        let source = "def foo():\n    f = lambda x: x\n";
+        let muts = lambda_mutations(source);
+        assert!(!muts.is_empty(), "should find a lambda mutation");
+        let m = &muts[0];
+        // The replacement must not corrupt the parameter list.
+        assert!(
+            m.replacement.contains("lambda x: None"),
+            "param `x` must be untouched; replacement was: {}",
+            m.replacement
+        );
+        // The old String::replace() bug would have produced "lambda None: None".
+        assert!(
+            !m.replacement.contains("lambda None"),
+            "param must not be replaced; replacement was: {}",
+            m.replacement
+        );
+    }
+
+    // INV-1 (extended): complex body that includes the param name multiple times
+    #[test]
+    fn test_lambda_mutation_complex_body_with_param_name() {
+        let source = "def foo():\n    f = lambda x: x if x else None\n";
+        let fms = collect_file_mutations(source);
+        let muts: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "lambda_mutation")
+            .collect();
+        assert!(!muts.is_empty(), "should find a lambda mutation");
+        let m = &muts[0];
+        // Body is `x if x else None` → replacement body is `None` (since body != "None").
+        // The param `x` must remain untouched.
+        assert!(
+            m.replacement.starts_with("lambda x:"),
+            "param `x` must be preserved; replacement was: {}",
+            m.replacement
+        );
+        assert!(
+            m.replacement.ends_with("None"),
+            "body should be replaced with None; replacement was: {}",
+            m.replacement
+        );
+    }
+
+    // INV-2: `lambda: 0` (no params) — body `0` → `None` via lambda mutation
+    #[test]
+    fn test_lambda_mutation_no_params() {
+        let source = "def foo():\n    f = lambda: 0\n";
+        let muts = lambda_mutations(source);
+        // Lambda body `0` is a number — lambda_mutation replaces it with `None`.
+        let lam_mut = muts.iter().find(|m| m.replacement.contains("lambda: None"));
+        assert!(
+            lam_mut.is_some(),
+            "lambda: 0 should produce lambda: None; got: {:?}",
+            muts.iter().map(|m| &m.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    // INV-3: applying any lambda mutation via apply_mutation() must produce parseable Python
+    #[test]
+    fn test_lambda_mutation_produces_parseable_python() {
+        let cases = [
+            "def foo():\n    f = lambda x: x\n",
+            "def foo():\n    f = lambda x: x if x else None\n",
+            "def foo():\n    f = lambda: 0\n",
+            "def foo():\n    f = lambda a, b: a + b\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "lambda_mutation") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "lambda mutation produced unparseable Python for input {:?}:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-4: `lambda: None` — body `None` → `0` (reverse direction)
+    #[test]
+    fn test_lambda_mutation_body_none_replaced_with_zero() {
+        let source = "def foo():\n    f = lambda: None\n";
+        let muts = lambda_mutations(source);
+        let lam_mut = muts.iter().find(|m| m.replacement.contains("lambda: 0"));
+        assert!(
+            lam_mut.is_some(),
+            "lambda: None should produce lambda: 0; got: {:?}",
+            muts.iter().map(|m| &m.replacement).collect::<Vec<_>>()
+        );
     }
 }
