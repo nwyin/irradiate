@@ -208,34 +208,23 @@ echo
 
 # ── Run mutmut (N children) ───────────────────────────────────────────────
 # mutmut 2.5.1 pinned — see header comment for apples-to-oranges context.
+# mutmut 2.5.1 is sequential (no --max-children). We prepend the bench venv
+# bin to PATH so mutmut's subprocess can find `python` for test execution.
 MUTMUT_PYTHON="$BENCH_DIR/.venv/bin/python"
+MUTMUT_PATH="$BENCH_DIR/.venv/bin:$PATH"
 if [ ! -x "$MUTMUT_PYTHON" ]; then
     echo "Warning: $MUTMUT_PYTHON not found — skipping mutmut benchmarks." >&2
     echo "  Run: bash bench/setup.sh" >&2
 else
-    CONFIG="mutmut_${NCPU}c"
-    echo "--- $CONFIG ---"
-    ( cd "$PROJECT_DIR" && warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children "$NCPU" )
-
-    for i in $(seq 1 "$RUNS"); do
-        (
-            cd "$PROJECT_DIR"
-            run_config "$CONFIG" "$i" \
-                "$MUTMUT_PYTHON" -m mutmut run --max-children "$NCPU"
-        )
-    done
-    echo
-
-    # ── Run mutmut (1 child) ──────────────────────────────────────────────
     CONFIG="mutmut_1c"
     echo "--- $CONFIG ---"
-    ( cd "$PROJECT_DIR" && warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children 1 )
+    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --no-progress )
 
     for i in $(seq 1 "$RUNS"); do
         (
             cd "$PROJECT_DIR"
-            run_config "$CONFIG" "$i" \
-                "$MUTMUT_PYTHON" -m mutmut run --max-children 1
+            PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
+                "$MUTMUT_PYTHON" -m mutmut run --no-progress
         )
     done
     echo
