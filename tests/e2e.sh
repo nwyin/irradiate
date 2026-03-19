@@ -73,6 +73,55 @@ if ! echo "$SHOW_OUTPUT" | grep -q "^[+-]"; then
 fi
 echo "  show command: OK"
 
+# Verify cache warms on a second identical run
+echo ""
+echo "--- Checking cache warm run ---"
+CACHE_WARM_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+echo "$CACHE_WARM_OUTPUT"
+CACHE_HITS=$(echo "$CACHE_WARM_OUTPUT" | grep -oE 'Cache hits: [0-9]+' | awk '{print $3}' | tail -1)
+if [ -z "${CACHE_HITS:-}" ] || [ "$CACHE_HITS" -le 0 ]; then
+    echo "FAIL: Expected warm run to report cache hits, got '${CACHE_HITS:-missing}'"
+    exit 1
+fi
+echo "  warm cache hits: OK ($CACHE_HITS)"
+
+# Verify changing a selected test file invalidates the cache
+echo ""
+echo "--- Checking cache invalidation on test file change ---"
+TEST_FILE="$FIXTURE/tests/test_simple.py"
+TEST_FILE_BAK="$(mktemp)"
+cp "$TEST_FILE" "$TEST_FILE_BAK"
+trap 'cp "$TEST_FILE_BAK" "$TEST_FILE" 2>/dev/null || true; rm -f "$TEST_FILE_BAK"' EXIT
+printf '\n# cache invalidation marker\n' >> "$TEST_FILE"
+INVALIDATE_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+echo "$INVALIDATE_OUTPUT"
+INVALIDATE_HITS=$(echo "$INVALIDATE_OUTPUT" | grep -oE 'Cache hits: [0-9]+' | awk '{print $3}' | tail -1)
+if [ -z "${INVALIDATE_HITS:-}" ] || [ "$INVALIDATE_HITS" -ne 0 ]; then
+    echo "FAIL: Expected test file change to invalidate cache hits, got '${INVALIDATE_HITS:-missing}'"
+    exit 1
+fi
+cp "$TEST_FILE_BAK" "$TEST_FILE"
+rm -f "$TEST_FILE_BAK"
+trap - EXIT
+echo "  cache invalidation on test change: OK"
+
+# Verify cache clean removes only cache state
+echo ""
+echo "--- Checking cache clean ---"
+( cd "$FIXTURE" && "$BINARY" cache clean 2>&1 )
+if [ -d "$FIXTURE/.irradiate/cache" ]; then
+    echo "FAIL: Expected cache clean to remove $FIXTURE/.irradiate/cache"
+    exit 1
+fi
+CACHE_COLD_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+echo "$CACHE_COLD_OUTPUT"
+CACHE_COLD_HITS=$(echo "$CACHE_COLD_OUTPUT" | grep -oE 'Cache hits: [0-9]+' | awk '{print $3}' | tail -1)
+if [ -z "${CACHE_COLD_HITS:-}" ] || [ "$CACHE_COLD_HITS" -ne 0 ]; then
+    echo "FAIL: Expected run after cache clean to be cold, got '${CACHE_COLD_HITS:-missing}' cache hits"
+    exit 1
+fi
+echo "  cache clean: OK"
+
 # Clean up
 rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 

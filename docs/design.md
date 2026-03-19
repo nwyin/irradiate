@@ -123,13 +123,13 @@ Everything else — parsing, mutation, orchestration, caching, I/O, CLI, TUI —
 
 mutmut caches results by file modification time: if the source is newer than the mutant file, regenerate. This is fragile — `touch` a file, lose all results. Rebasing drops results even if code didn't change. Results aren't shareable across developers or CI.
 
-irradiate uses content-addressable caching. Each mutation result is keyed by:
+irradiate uses content-addressable caching. The v1 local cache keys each mutation result by:
 
 ```
 cache_key = hash(
-    function_body_normalized,   # the function source, whitespace-normalized
-    mutation_operator_id,       # which operator produced this mutant
-    mutation_index,             # which application of that operator
+    irradiate_version,          # invalidates old entries when operators/runtime change
+    function_body_exact,        # exact function source for correctness-first v1
+    mutation_descriptor,        # operator + span + original + replacement
     test_set_hash,              # hash of the sorted test IDs that cover this function
     test_content_hash,          # hash of the test file contents
 )
@@ -137,14 +137,12 @@ cache_key = hash(
 
 If the key matches a previous result, skip the test run entirely. This survives:
 
-- **Reformatting** — whitespace-normalized function body means `black`/`ruff format` doesn't invalidate cache
 - **Rebasing** — if the function didn't change, the result holds
 - **Branch switching** — same code = same results regardless of branch
-- **CI** — upload cache artifacts, download on next run, skip already-tested mutants
 
 ### Cache storage
 
-Local cache lives in `.irradiate/cache/` as a directory of small files keyed by hash prefix (similar to git's object store). Optional remote cache via `--cache-url` for team/CI sharing — a simple HTTP GET/PUT interface against S3, GCS, or a shared filesystem.
+Local cache lives in `.irradiate/cache/` as a directory of small files keyed by hash prefix (similar to git's object store). `irradiate cache clean` removes only this directory. Remote/shared cache is follow-up work, not part of v1.
 
 ### Cache invalidation
 
@@ -386,5 +384,4 @@ Correctness is validated by running both tools against the same projects and dif
 **Cache correctness**: A bad hash function could cause false cache hits (reusing results for changed code). Mitigations:
 - Use SHA-256 for content hashing
 - Include the irradiate version in the cache key (operator changes invalidate cache)
-- `--no-cache` flag for debugging
 - Cache entries are never updated, only created — eliminates race conditions

@@ -12,19 +12,26 @@ cargo check && cargo clippy -- -D warnings && cargo test && bash tests/e2e.sh
 
 ## Content-addressable Cache
 
-Biggest remaining feature. Each mutation result keyed by:
+Local content-addressable cache is now implemented under `.irradiate/cache/`.
+
+The v1 key uses:
 
 ```
 cache_key = sha256(
-    function_body_normalized,
-    mutation_operator_id,
-    mutation_index,
+    irradiate_version,
+    function_body_exact,
+    mutation_descriptor,
     test_set_hash,
     test_content_hash,
 )
 ```
 
-Store in `.irradiate/cache/`. Check before dispatching to worker pool. Skip on hit. Optional `--no-cache` flag and `--cache-url` for remote (S3/GCS).
+The cache is checked before dispatching to either backend and can be cleared with `irradiate cache clean`.
+
+Remaining cache work is follow-up scope:
+- `--no-cache`
+- remote/shared cache
+- cache GC / pruning
 
 ## Worker Pool Hardening
 
@@ -199,10 +206,11 @@ The worker pool now executes pre-collected items inside a long-lived pytest sess
 
 | # | Item | Effort | Impact | Status |
 |---|------|--------|--------|--------|
-| 1 | Content-addressable cache | L | Big perf win on incremental runs | |
-| 2 | Mutation application correctness | L | Prevents incorrect source rewrites on repeated identical spans | |
-| 3 | Warm-session compatibility hardening | M | Better behavior on complex pytest/plugin ecosystems | |
-| ~~4~~ | ~~Direct test execution via hook-driven worker~~ | L | ~~The core performance win — 5-10× on real projects~~ | done |
-| ~~5~~ | ~~Worker pool hardening (respawn, memory, scheduling, timeouts)~~ | L | ~~Robustness at scale~~ | done |
-| ~~6~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
-| ~~7~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |
+| 1 | Mutation application correctness | L | Prevents incorrect source rewrites on repeated identical spans | |
+| 2 | Warm-session compatibility hardening | M | Better behavior on complex pytest/plugin ecosystems | |
+| 3 | Cache follow-ups (`--no-cache`, remote, GC) | M | Better operability beyond the local always-on cache | |
+| ~~4~~ | ~~Content-addressable cache~~ | L | ~~Big perf win on incremental runs~~ | done — local cache + `cache clean` |
+| ~~5~~ | ~~Direct test execution via hook-driven worker~~ | L | ~~The core performance win — 5-10× on real projects~~ | done |
+| ~~6~~ | ~~Worker pool hardening (respawn, memory, scheduling, timeouts)~~ | L | ~~Robustness at scale~~ | done |
+| ~~7~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
+| ~~8~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |

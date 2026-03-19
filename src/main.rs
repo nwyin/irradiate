@@ -69,6 +69,18 @@ enum Commands {
         /// Mutant name (e.g., module.x_func__irradiate_1)
         mutant_name: String,
     },
+
+    /// Manage local cache state
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Remove the local cache directory
+    Clean,
 }
 
 #[tokio::main]
@@ -125,5 +137,22 @@ async fn main() -> Result<()> {
         }
         Commands::Results { all } => irradiate::pipeline::results(all),
         Commands::Show { mutant_name } => irradiate::pipeline::show(&mutant_name),
+        Commands::Cache { command } => match command {
+            CacheCommands::Clean => {
+                let project_dir = std::env::current_dir()?;
+                if irradiate::cache::clean(&project_dir)? {
+                    eprintln!(
+                        "Removed local cache at {}",
+                        irradiate::cache::cache_dir(&project_dir).display()
+                    );
+                } else {
+                    eprintln!(
+                        "No local cache found at {}",
+                        irradiate::cache::cache_dir(&project_dir).display()
+                    );
+                }
+                Ok(())
+            }
+        },
     }
 }

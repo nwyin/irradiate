@@ -1,6 +1,7 @@
 //! File-level codegen: take a Python source file and produce the fully
 //! mutated version with all functions trampolined.
 
+use crate::cache::MutantCacheDescriptor;
 use crate::mutation::{collect_file_mutations, FunctionMutations};
 use crate::trampoline::{generate_trampoline, trampoline_impl, TrampolineOutput};
 
@@ -11,6 +12,8 @@ pub struct MutatedFile {
     pub source: String,
     /// List of mutant keys (e.g., "module.x_func__irradiate_1").
     pub mutant_names: Vec<String>,
+    /// Rich descriptors for each generated mutant.
+    pub descriptors: Vec<MutantCacheDescriptor>,
 }
 
 /// Generate the mutated version of a Python source file.
@@ -208,9 +211,30 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         }
     }
 
+    let descriptors: Vec<MutantCacheDescriptor> = function_mutations
+        .iter()
+        .zip(trampolines.iter())
+        .flat_map(|(fm, tp)| {
+            fm.mutations
+                .iter()
+                .zip(tp.mutant_keys.iter())
+                .map(|(mutation, mutant_name)| MutantCacheDescriptor {
+                    mutant_name: mutant_name.clone(),
+                    function_source: fm.source.clone(),
+                    operator: mutation.operator.to_string(),
+                    start: mutation.start,
+                    end: mutation.end,
+                    original: mutation.original.clone(),
+                    replacement: mutation.replacement.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
     Some(MutatedFile {
         source: output,
         mutant_names: all_mutant_names,
+        descriptors,
     })
 }
 
@@ -292,6 +316,17 @@ mod tests {
             !result.mutant_names.is_empty(),
             "Should produce mutant names"
         );
+        assert_eq!(
+            result.descriptors.len(),
+            result.mutant_names.len(),
+            "Should emit one cache descriptor per mutant"
+        );
+        assert_eq!(
+            result.descriptors[0].mutant_name, result.mutant_names[0],
+            "Descriptor keys must align with generated mutant names"
+        );
+        assert_eq!(result.descriptors[0].operator, "binop_swap");
+        assert_eq!(result.descriptors[0].function_source, source);
     }
 
     #[test]

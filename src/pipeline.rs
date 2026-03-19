@@ -1,5 +1,6 @@
 //! Full mutation testing pipeline: mutate → stats → validate → test → report.
 
+use crate::cache::{self, CacheCounts, MutantCacheDescriptor};
 use crate::codegen::mutate_file;
 use crate::harness;
 use crate::orchestrator::{run_worker_pool, PoolConfig};
@@ -42,6 +43,19 @@ struct FileMeta {
     durations_by_key: HashMap<String, f64>,
 }
 
+#[derive(Debug)]
+struct GenerationOutput {
+    names_by_module: HashMap<String, Vec<String>>,
+    descriptors_by_name: HashMap<String, MutantCacheDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledMutant {
+    descriptor: MutantCacheDescriptor,
+    work_item: WorkItem,
+    cache_key: Option<String>,
+}
+
 /// Run the full mutation testing pipeline.
 pub async fn run(config: RunConfig) -> Result<()> {
     let project_dir = std::env::current_dir()?;
@@ -50,32 +64,31 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Phase 1: Mutation generation
     eprintln!("Generating mutants...");
     let start = Instant::now();
-    let all_mutant_names =
+    let generation =
         generate_mutants(&config.paths_to_mutate, &mutants_dir, &config.do_not_mutate)?;
     let gen_time = start.elapsed();
     eprintln!(
         "  done in {:.0}ms ({} mutants across {} files)",
         gen_time.as_millis(),
-        all_mutant_names.values().map(|v| v.len()).sum::<usize>(),
-        all_mutant_names.len(),
+        generation
+            .names_by_module
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>(),
+        generation.names_by_module.len(),
     );
 
-    if all_mutant_names.is_empty() {
+    if generation.descriptors_by_name.is_empty() {
         eprintln!("No mutations found.");
         return Ok(());
     }
 
-    // Flatten to list of (mutant_name, source_file) for work dispatch
-    let mut all_mutants: Vec<(String, String)> = Vec::new();
-    for (file, names) in &all_mutant_names {
-        for name in names {
-            all_mutants.push((name.clone(), file.clone()));
-        }
-    }
+    let mut all_mutants: Vec<MutantCacheDescriptor> =
+        generation.descriptors_by_name.values().cloned().collect();
 
     // Apply filter if specific mutants requested
     if let Some(ref filter) = config.mutant_filter {
-        all_mutants.retain(|(name, _)| filter.iter().any(|f| name.contains(f)));
+        all_mutants.retain(|desc| filter.iter().any(|f| desc.mutant_name.contains(f)));
         if all_mutants.is_empty() {
             eprintln!("No mutants match the filter.");
             return Ok(());
@@ -143,9 +156,10 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let start = Instant::now();
 
     // Build work items
-    let work_items: Vec<WorkItem> = all_mutants
+    let work_items: Vec<ScheduledMutant> = all_mutants
         .iter()
-        .filter_map(|(mutant_name, _file)| {
+        .filter_map(|descriptor| {
+            let mutant_name = &descriptor.mutant_name;
             let test_ids = if let Some(ref stats) = test_stats {
                 // Extract the function key from mutant name: "module.x_func__irradiate_N" → "module.x_func"
                 let func_key = mutant_name
@@ -175,11 +189,15 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 .unwrap_or(0.0);
             let timeout_secs = compute_timeout(config.timeout_multiplier, estimated_secs);
 
-            Some(WorkItem {
-                mutant_name: mutant_name.clone(),
-                test_ids,
-                estimated_duration_secs: estimated_secs,
-                timeout_secs,
+            Some(ScheduledMutant {
+                descriptor: descriptor.clone(),
+                work_item: WorkItem {
+                    mutant_name: mutant_name.clone(),
+                    test_ids,
+                    estimated_duration_secs: estimated_secs,
+                    timeout_secs,
+                },
+                cache_key: None,
             })
         })
         .collect();
@@ -197,8 +215,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
         work_items
             .into_iter()
             .map(|mut item| {
-                if item.test_ids.is_empty() {
-                    item.test_ids = all_tests.clone();
+                if item.work_item.test_ids.is_empty() {
+                    item.work_item.test_ids = all_tests.clone();
                 }
                 item
             })
@@ -209,28 +227,55 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Handle uncovered mutants (exit_code 33)
     let mut results: Vec<MutantResult> = Vec::new();
-    let covered_work: Vec<WorkItem> = work_items
-        .into_iter()
-        .filter(|item| {
-            if item.test_ids.is_empty() {
+    let mut cache_counts = CacheCounts::default();
+    let mut resolved_test_paths: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut test_file_hashes: HashMap<PathBuf, String> = HashMap::new();
+    let mut covered_work: Vec<ScheduledMutant> = Vec::new();
+    for mut item in work_items {
+        if item.work_item.test_ids.is_empty() {
+            results.push(MutantResult {
+                mutant_name: item.work_item.mutant_name.clone(),
+                exit_code: 33,
+                duration: 0.0,
+                status: MutantStatus::NoTests,
+            });
+            continue;
+        }
+
+        item.cache_key = cache::build_cache_key(
+            &project_dir,
+            &item.descriptor,
+            &item.work_item.test_ids,
+            &mut resolved_test_paths,
+            &mut test_file_hashes,
+        )?;
+
+        if let Some(ref key) = item.cache_key {
+            if let Some(entry) = cache::load_entry(&project_dir, key)? {
+                cache_counts.hits += 1;
                 results.push(MutantResult {
-                    mutant_name: item.mutant_name.clone(),
-                    exit_code: 33,
-                    duration: 0.0,
-                    status: MutantStatus::NoTests,
+                    mutant_name: item.work_item.mutant_name.clone(),
+                    exit_code: entry.exit_code,
+                    duration: entry.duration,
+                    status: entry.status,
                 });
-                false
-            } else {
-                true
+                continue;
             }
-        })
-        .collect();
+            cache_counts.misses += 1;
+        }
+
+        covered_work.push(item);
+    }
 
     if !covered_work.is_empty() {
+        let execution_work: Vec<WorkItem> = covered_work
+            .iter()
+            .map(|item| item.work_item.clone())
+            .collect();
         let run_results = if config.isolate {
             run_isolated(
                 &config,
-                covered_work,
+                execution_work,
                 &harness_dir,
                 &mutants_dir,
                 test_stats.as_ref(),
@@ -249,8 +294,28 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 max_worker_memory_mb: config.max_worker_memory_mb,
                 ..Default::default()
             };
-            run_worker_pool(&pool_config, covered_work).await?
+            run_worker_pool(&pool_config, execution_work).await?
         };
+
+        let cache_keys_by_mutant: HashMap<String, String> = covered_work
+            .iter()
+            .filter_map(|item| {
+                item.cache_key
+                    .as_ref()
+                    .map(|key| (item.work_item.mutant_name.clone(), key.clone()))
+            })
+            .collect();
+        for result in &run_results {
+            if let Some(key) = cache_keys_by_mutant.get(&result.mutant_name) {
+                cache::store_entry(
+                    &project_dir,
+                    key,
+                    result.exit_code,
+                    result.duration,
+                    result.status,
+                )?;
+            }
+        }
         results.extend(run_results);
     }
 
@@ -258,10 +323,10 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Phase 5: Results
     // Write .meta files
-    write_meta_files(&mutants_dir, &all_mutant_names, &results)?;
+    write_meta_files(&mutants_dir, &generation.names_by_module, &results)?;
 
     // Print summary
-    print_summary(&results, test_time.as_secs_f64());
+    print_summary(&results, test_time.as_secs_f64(), cache_counts);
 
     Ok(())
 }
@@ -542,7 +607,7 @@ fn generate_mutants(
     paths_to_mutate: &Path,
     mutants_dir: &Path,
     do_not_mutate: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
+) -> Result<GenerationOutput> {
     // Clean mutants dir
     if mutants_dir.exists() {
         std::fs::remove_dir_all(mutants_dir)?;
@@ -573,7 +638,7 @@ fn generate_mutants(
 
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
-    type MutantEntry = Option<(String, Vec<String>)>;
+    type MutantEntry = Option<(String, Vec<String>, Vec<MutantCacheDescriptor>)>;
     let results: Vec<Result<MutantEntry>> = py_files
         .par_iter()
         .map(|py_file| -> Result<MutantEntry> {
@@ -618,7 +683,11 @@ fn generate_mutants(
                 let meta = FileMeta::default();
                 std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
 
-                Ok(Some((module_name, mutated.mutant_names)))
+                Ok(Some((
+                    module_name,
+                    mutated.mutant_names,
+                    mutated.descriptors,
+                )))
             } else {
                 // No mutations found, but copy the original file verbatim so
                 // the full package structure is present in mutants/.  Without
@@ -637,13 +706,20 @@ fn generate_mutants(
 
     // Merge results into HashMap (sequential — avoids mutex on hot path)
     let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+    let mut descriptors_by_name: HashMap<String, MutantCacheDescriptor> = HashMap::new();
     for result in results {
-        if let Some((module, names)) = result? {
+        if let Some((module, names, descriptors)) = result? {
+            for descriptor in descriptors {
+                descriptors_by_name.insert(descriptor.mutant_name.clone(), descriptor);
+            }
             all_names.insert(module, names);
         }
     }
 
-    Ok(all_names)
+    Ok(GenerationOutput {
+        names_by_module: all_names,
+        descriptors_by_name,
+    })
 }
 
 fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -864,7 +940,7 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn print_summary(results: &[MutantResult], elapsed_secs: f64) {
+fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: CacheCounts) {
     let mut killed = 0;
     let mut survived = 0;
     let mut no_tests = 0;
@@ -892,6 +968,8 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64) {
     eprintln!(
         "Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
     );
+    eprintln!("  Cache hits: {0}", cache_counts.hits);
+    eprintln!("  Cache misses: {0}", cache_counts.misses);
     eprintln!("  Killed:    {killed}");
     eprintln!("  Survived:  {survived}");
     if no_tests > 0 {
@@ -1661,7 +1739,7 @@ mod tests {
         let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[pattern]).unwrap();
 
         // config.py should NOT be in the mutant names (skipped)
-        for (module, _) in &result {
+        for module in result.names_by_module.keys() {
             assert!(
                 !module.contains("config"),
                 "config module must not produce mutants when do_not_mutate matches it"
@@ -1676,7 +1754,7 @@ mod tests {
 
         // core.py must still produce mutants
         assert!(
-            result.contains_key("core"),
+            result.names_by_module.contains_key("core"),
             "non-skipped file must still produce mutants"
         );
     }
@@ -1694,7 +1772,7 @@ mod tests {
 
         let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
         assert!(
-            !result.is_empty(),
+            !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
         );
     }
