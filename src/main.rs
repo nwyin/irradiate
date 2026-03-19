@@ -48,6 +48,10 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         worker_recycle_after: usize,
 
+        /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
+        #[arg(long, default_value_t = 0)]
+        max_worker_memory: usize,
+
         /// Run each mutant in a fresh subprocess (slower, better isolation)
         #[arg(long)]
         isolate: bool,
@@ -87,6 +91,7 @@ async fn main() -> Result<()> {
             covered_only,
             python,
             worker_recycle_after,
+            max_worker_memory,
             isolate,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
@@ -112,6 +117,7 @@ async fn main() -> Result<()> {
                     Some(mutant_names)
                 },
                 worker_recycle_after,
+                max_worker_memory_mb: max_worker_memory,
                 isolate,
                 do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
             })

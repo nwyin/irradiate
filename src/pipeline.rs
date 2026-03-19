@@ -25,6 +25,8 @@ pub struct RunConfig {
     pub mutant_filter: Option<Vec<String>>,
     /// Respawn workers after this many mutants (0 = disabled).
     pub worker_recycle_after: usize,
+    /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
+    pub max_worker_memory_mb: usize,
     /// Run each mutant in a fresh subprocess instead of the worker pool.
     /// Slower but provides perfect isolation — no pytest state can leak between mutants.
     pub isolate: bool,
@@ -244,6 +246,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 timeout_multiplier: config.timeout_multiplier,
                 pythonpath: pythonpath.clone(),
                 worker_recycle_after: config.worker_recycle_after,
+                max_worker_memory_mb: config.max_worker_memory_mb,
                 ..Default::default()
             };
             run_worker_pool(&pool_config, covered_work).await?

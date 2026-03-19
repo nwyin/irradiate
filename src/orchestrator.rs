@@ -36,6 +36,8 @@ pub struct PoolConfig {
     /// Respawn workers after this many mutants to prevent pytest state accumulation.
     /// Set to 0 to disable recycling.
     pub worker_recycle_after: usize,
+    /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
+    pub max_worker_memory_mb: usize,
 }
 
 impl Default for PoolConfig {
@@ -50,6 +52,7 @@ impl Default for PoolConfig {
             default_timeout: Duration::from_secs(30),
             pythonpath: String::new(),
             worker_recycle_after: 100,
+            max_worker_memory_mb: 0,
         }
     }
 }
@@ -264,6 +267,17 @@ fn spawn_worker_task(
     msg_tx
 }
 
+/// Sample the RSS (resident set size) of a process in kilobytes.
+/// Uses `ps -o rss= -p <pid>` which works on both macOS and Linux.
+async fn check_rss(pid: u32) -> Result<usize> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .await?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<usize>().map_err(|e| anyhow::anyhow!(e))
+}
+
 async fn dispatch_work(
     listener: UnixListener,
     mut processes: Vec<Child>,
@@ -292,10 +306,19 @@ async fn dispatch_work(
     // Starts at num_workers (initial workers already spawned before dispatch_work is called).
     let mut pending_accepts: usize = processes.len();
 
+    // PID tracking for memory monitoring
+    let mut worker_pids: HashMap<usize, u32> = HashMap::new();
+    // Workers flagged for recycling on next result (memory limit exceeded)
+    let mut workers_pending_memory_recycle: HashSet<usize> = HashSet::new();
+
     let recycle_after = config.worker_recycle_after;
+    let max_worker_memory_mb = config.max_worker_memory_mb;
     let accept_timeout = Duration::from_secs(30);
     let default_timeout = config.default_timeout;
     let timeout_multiplier = config.timeout_multiplier;
+
+    // Memory check interval (only active when a limit is set)
+    let mut memory_check = tokio::time::interval(Duration::from_secs(2));
 
     // Main dispatch loop — accepts initial worker connections and processes events
     loop {
@@ -384,6 +407,7 @@ async fn dispatch_work(
                                 match serde_json::from_str::<WorkerMessage>(line.trim()) {
                                     Ok(WorkerMessage::Ready { pid, .. }) => {
                                         info!("Worker {worker_id} (pid {pid}) connected and ready");
+                                        worker_pids.insert(worker_id, pid);
                                         let msg_tx = spawn_worker_task(
                                             worker_id,
                                             buf_reader.into_inner(),
@@ -440,13 +464,21 @@ async fn dispatch_work(
                         let count = worker_recycle_counts.entry(worker_id).or_insert(0);
                         *count += 1;
 
-                        if recycle_after > 0 && *count >= recycle_after && !work_queue.is_empty() {
+                        let memory_recycle = workers_pending_memory_recycle.remove(&worker_id);
+                        let count_recycle = recycle_after > 0 && *count >= recycle_after;
+
+                        if (count_recycle || memory_recycle) && !work_queue.is_empty() {
                             // Recycle: send shutdown, spawn a fresh replacement
-                            info!("Worker {worker_id}: recycling after {count} mutants");
+                            if memory_recycle {
+                                info!("Worker {worker_id}: recycling due to memory limit exceeded");
+                            } else {
+                                info!("Worker {worker_id}: recycling after {count} mutants");
+                            }
                             if let Some(sender) = worker_senders.remove(&worker_id) {
                                 let _ = sender.send(OrchestratorMessage::Shutdown).await;
                             }
                             worker_recycle_counts.remove(&worker_id);
+                            worker_pids.remove(&worker_id);
                             recycled_worker_ids.insert(worker_id);
 
                             let spawn_id = next_worker_id; // ID the replacement will be assigned on accept
@@ -484,6 +516,8 @@ async fn dispatch_work(
                         idle_workers.push(worker_id);
                     }
                     Some(WorkerEvent::Disconnected { worker_id }) => {
+                        worker_pids.remove(&worker_id);
+                        workers_pending_memory_recycle.remove(&worker_id);
                         if recycled_worker_ids.remove(&worker_id) {
                             // Expected: we asked this worker to shut down for recycling
                             debug!("Worker {worker_id}: recycled cleanly");
@@ -528,6 +562,30 @@ async fn dispatch_work(
                             });
                         }
                         break;
+                    }
+                }
+            }
+
+            // Periodic memory check: sample RSS for each worker and flag those over the limit
+            _ = memory_check.tick(), if max_worker_memory_mb > 0 => {
+                for (&worker_id, &pid) in &worker_pids {
+                    if workers_pending_memory_recycle.contains(&worker_id) {
+                        continue; // already flagged
+                    }
+                    match check_rss(pid).await {
+                        Ok(rss_kb) => {
+                            let rss_mb = rss_kb / 1024;
+                            if rss_mb > max_worker_memory_mb {
+                                warn!(
+                                    "Worker {worker_id} (pid {pid}) RSS {rss_mb}MB exceeds limit \
+                                     {max_worker_memory_mb}MB; scheduling recycle after current task"
+                                );
+                                workers_pending_memory_recycle.insert(worker_id);
+                            }
+                        }
+                        Err(_) => {
+                            // Process may have already exited; ignore
+                        }
                     }
                 }
             }
