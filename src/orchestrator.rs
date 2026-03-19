@@ -288,7 +288,10 @@ async fn dispatch_work(
 ) -> Result<Vec<MutantResult>> {
     let total_items = work_items.len();
     let mut results: Vec<MutantResult> = Vec::with_capacity(total_items);
-    let mut work_queue: Vec<WorkItem> = work_items.into_iter().rev().collect(); // reversed so we pop from the end
+    let mut work_queue: Vec<WorkItem> = prioritize_work_items(work_items)
+        .into_iter()
+        .rev()
+        .collect();
 
     // Channel for worker events
     let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(64);
@@ -603,4 +606,57 @@ async fn dispatch_work(
     }
 
     Ok(results)
+}
+
+fn prioritize_work_items(mut work_items: Vec<WorkItem>) -> Vec<WorkItem> {
+    work_items.sort_by(|a, b| {
+        b.estimated_duration_secs
+            .total_cmp(&a.estimated_duration_secs)
+            .then_with(|| a.mutant_name.cmp(&b.mutant_name))
+    });
+    work_items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work_item(mutant_name: &str, estimated_duration_secs: f64) -> WorkItem {
+        WorkItem {
+            mutant_name: mutant_name.to_string(),
+            test_ids: vec![],
+            estimated_duration_secs,
+            timeout_secs: 30.0,
+        }
+    }
+
+    #[test]
+    fn test_prioritize_work_items_longest_first() {
+        let items = vec![
+            work_item("m_mid", 2.0),
+            work_item("m_fast", 0.5),
+            work_item("m_slow", 10.0),
+        ];
+
+        let ordered = prioritize_work_items(items);
+        let names: Vec<&str> = ordered
+            .iter()
+            .map(|item| item.mutant_name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["m_slow", "m_mid", "m_fast"]);
+    }
+
+    #[test]
+    fn test_prioritize_work_items_tiebreaks_by_name() {
+        let items = vec![work_item("m_b", 1.0), work_item("m_a", 1.0)];
+
+        let ordered = prioritize_work_items(items);
+        let names: Vec<&str> = ordered
+            .iter()
+            .map(|item| item.mutant_name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["m_a", "m_b"]);
+    }
 }

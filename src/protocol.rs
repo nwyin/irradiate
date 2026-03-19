@@ -44,6 +44,9 @@ pub enum WorkerMessage {
 pub struct WorkItem {
     pub mutant_name: String,
     pub test_ids: Vec<String>,
+    /// Estimated baseline duration of the selected tests in seconds.
+    /// Used by the orchestrator to schedule longer mutants first.
+    pub estimated_duration_secs: f64,
     /// Per-mutant timeout in seconds (multiplier × estimated test duration, floored at MIN).
     pub timeout_secs: f64,
 }

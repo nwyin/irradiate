@@ -28,11 +28,14 @@ Store in `.irradiate/cache/`. Check before dispatching to worker pool. Skip on h
 
 ## Worker Pool Hardening
 
-- **Hot-accept after respawn**: respawned workers can't rejoin the accept loop (comment in `orchestrator.rs` line ~379).
-- **Memory monitoring**: respawn workers that exceed a configurable memory threshold.
-- **Scheduler improvements**: use collected test durations for ordering and per-mutant timeout budgets.
+This area is now largely complete for the current worker architecture:
 
-Note: `--isolate` mode and `--worker-recycle-after` are already implemented.
+- **Hot-accept after respawn**: replacement workers rejoin the accept loop correctly.
+- **Memory monitoring**: workers can be recycled when RSS exceeds a configurable threshold.
+- **Duration-aware scheduling**: collected test durations now feed both per-mutant timeout budgets and longest-first work ordering.
+- **Fallbacks**: `--isolate` and `--worker-recycle-after` are both implemented.
+
+Remaining work here is mostly empirical tuning and plugin-compatibility coverage rather than missing core mechanisms.
 
 ---
 
@@ -45,7 +48,7 @@ The harness now has two execution paths:
 - **Legacy path**: call `pytest.main(["-x", "--no-header", "-q"] + test_ids)` for every mutant. This re-invokes pytest's full startup sequence — argument parsing, plugin loading, test collection, fixture resolution — then runs the selected tests and exits.
 - **Fast path**: keep a pytest session alive inside the worker, collect once, then execute pre-collected items directly for each mutant.
 
-Today the fast path proves the performance model, but it currently does so by reaching into pytest internals (`_pytest.runner.runtestprotocol`, `_setupstate`, per-item report buffers). So the design question is no longer "should we have a direct execution path?" but "which fast execution architecture do we want to standardize and harden?"
+The fast path now uses pytest hook machinery for execution inside the long-lived worker session rather than importing `_pytest.runner.runtestprotocol` directly. The remaining design question is less about "can we avoid private pytest internals?" and more about how aggressively we want to harden compatibility and fallbacks around the warm-session model.
 
 ### Why this exists
 
@@ -120,7 +123,7 @@ Regardless of which fast architecture we standardize, the worker must handle:
 
 ### Risks
 
-- **Private pytest internals are a maintenance hazard**: the current fast path depends on underscored pytest APIs and internal state containers. Mitigation: move the primary implementation toward public hook surfaces where possible.
+- **Private pytest internals were a maintenance hazard**: the earlier prototype depended on underscored pytest APIs and internal state containers. Mitigation: the default fast path now uses pytest hooks instead, and future changes should keep private dependencies isolated and explicit.
 - **State leakage remains the core semantic risk for warm-session execution**: session fixtures, module globals, and plugin state survive between mutants. Mitigation: worker recycling (already implemented via `--worker-recycle-after`) and `--isolate`.
 - **Fork safety is the core semantic risk for snapshot/fork execution**: some plugins and runtimes behave poorly if pytest is forked after initialization. Mitigation: treat fork-snapshot as an explicit backend with compatibility testing, not as the only execution mode.
 - **Plugin compatibility remains a product concern either way**: some plugins assume one session = one run, others may assume no post-init fork. Mitigation: document incompatible plugins, keep multiple backends, and bias toward conservative fallbacks when behavior is unclear.
@@ -128,13 +131,12 @@ Regardless of which fast architecture we standardize, the worker must handle:
 
 ### Recommendation
 
-If we have to pick one fast architecture as the default product path, the best next step is:
+The project has now standardized on Option 1 as the default fast path:
 
-1. **Standardize on Option 1**: warm session + hook-driven execution
-2. Replace direct imports of `_pytest.runner.runtestprotocol` with pytest hook calls where feasible
-3. Treat worker recycling as part of the default correctness story, not just a debugging escape hatch
-4. Keep `--isolate` as the strongest fallback
-5. Consider Option 2 later as an experimental Unix-only backend if real-world suites show too much leakage under the warm-session model
+1. **Warm session + hook-driven execution** is the default architecture
+2. Worker recycling is part of the normal correctness story, not just a debugging escape hatch
+3. `--isolate` remains the strongest fallback
+4. Option 2 remains a later Unix-only experiment if real-world suites show too much leakage under the warm-session model
 
 Why this is the recommended default:
 
@@ -145,9 +147,9 @@ Why this is the recommended default:
 
 ### Phased approach
 
-1. **Phase 1 (done)**: `pytest.main()` per mutant. Correct but slow. Validates the pool architecture.
-2. **Phase 2 (prototype exists, needs hardening)**: direct execution on pre-collected items inside a long-lived worker session. This is the main performance win, but the current implementation still leans on private pytest internals.
-3. **Phase 3 (next)**: rework the fast path around pytest's hook machinery and tighten state-reset/reporting semantics so the default backend is not built around underscored imports.
+1. **Phase 1 (done)**: `pytest.main()` per mutant. Correct but slow. Validated the pool architecture.
+2. **Phase 2 (done, historical prototype)**: direct execution on pre-collected items inside a long-lived worker session proved the performance model.
+3. **Phase 3 (done)**: the fast path now runs through pytest's hook machinery and no longer depends on direct `_pytest.runner` imports.
 4. **Phase 4 (done)**: Worker recycling via `--worker-recycle-after`. Bounds state leakage.
 5. **Phase 5 (done)**: `--isolate` flag. Fresh subprocess per mutant for max correctness.
 6. **Phase 6 (optional, later)**: evaluate a Unix-only fork-snapshot backend as a middle ground between warm-session speed and `--isolate` correctness.
@@ -171,24 +173,25 @@ Architectural feedback recorded after the implementation reached end-to-end work
 
 The mutation engine uses text-based CST walking for discovery and applies mutations through text substitution. Repeated identical tokens inside one function can map to the wrong source slice.
 
-#### The worker pool doesn't yet realize its full performance potential
+#### Warm-session execution now exists, but compatibility remains the real risk
 
-Workers still call `pytest.main(test_args)` for every mutant. The pre-warmed pool saves Python interpreter startup (~50ms) but not pytest startup (~200ms). Moving to `runtestprotocol()` direct execution is the key remaining performance win.
+The worker pool now executes pre-collected items inside a long-lived pytest session through pytest's hook machinery. The main remaining risk in this area is not raw performance, but semantic leakage across mutants: session-scoped fixtures, mutable plugin state, and suites that assume one pytest session equals one logical run.
 
-#### Worker lifecycle hardening is partially done
+#### Worker lifecycle hardening is mostly done
 
 - `--isolate` mode works.
 - `--worker-recycle-after` bounds state leakage.
-- Timeouts are still coarse — no per-mutant timeout budgets from stats.
-- Respawned workers cannot rejoin the pool.
-- The scheduler does not yet use collected test durations for ordering.
+- Per-mutant timeout budgets are derived from collected test durations.
+- Respawned workers can rejoin the pool.
+- The scheduler now uses collected test durations for longest-first ordering.
+- Remaining concerns are empirical: compatibility testing, tuning recycle defaults, and deciding whether a fork-snapshot backend is worth the complexity.
 
 ### Recommended sequencing
 
 1. Tighten mutation correctness: move from substring-based application toward stable spans or structured rewriting.
-2. Make worker execution semantics more honest: move to `runtestprotocol()` direct execution.
-3. Use collected stats for actual scheduling and per-mutant timeout budgets.
-4. Expand operator coverage and cache only after the foundation above is solid.
+2. Build the content-addressable cache.
+3. Expand compatibility coverage for the warm-session worker and keep `--isolate` as the conservative fallback.
+4. Expand operator coverage after the foundation above is solid.
 
 ---
 
@@ -196,8 +199,10 @@ Workers still call `pytest.main(test_args)` for every mutant. The pre-warmed poo
 
 | # | Item | Effort | Impact | Status |
 |---|------|--------|--------|--------|
-| 1 | Direct test execution via `runtestprotocol()` | L | The core performance win — 5-10× on real projects | |
-| 2 | Content-addressable cache | L | Big perf win on incremental runs | |
-| 3 | Worker pool hardening (hot-accept, memory, scheduling) | L | Robustness at scale | |
-| ~~4~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
-| ~~5~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |
+| 1 | Content-addressable cache | L | Big perf win on incremental runs | |
+| 2 | Mutation application correctness | L | Prevents incorrect source rewrites on repeated identical spans | |
+| 3 | Warm-session compatibility hardening | M | Better behavior on complex pytest/plugin ecosystems | |
+| ~~4~~ | ~~Direct test execution via hook-driven worker~~ | L | ~~The core performance win — 5-10× on real projects~~ | done |
+| ~~5~~ | ~~Worker pool hardening (respawn, memory, scheduling, timeouts)~~ | L | ~~Robustness at scale~~ | done |
+| ~~6~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
+| ~~7~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |

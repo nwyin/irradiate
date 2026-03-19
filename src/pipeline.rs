@@ -173,13 +173,12 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 .as_ref()
                 .map(|s| s.estimated_duration(&test_ids))
                 .unwrap_or(0.0);
-            let timeout_secs = (config.timeout_multiplier * estimated_secs)
-                .max(config.timeout_multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
-                .max(MIN_ISOLATED_TIMEOUT_SECS);
+            let timeout_secs = compute_timeout(config.timeout_multiplier, estimated_secs);
 
             Some(WorkItem {
                 mutant_name: mutant_name.clone(),
                 test_ids,
+                estimated_duration_secs: estimated_secs,
                 timeout_secs,
             })
         })
@@ -413,9 +412,7 @@ async fn run_isolated(
         let estimated_secs = test_stats
             .map(|s| s.estimated_duration(&item.test_ids))
             .unwrap_or(0.0);
-        let timeout_secs = (config.timeout_multiplier * estimated_secs)
-            .max(config.timeout_multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
-            .max(MIN_ISOLATED_TIMEOUT_SECS);
+        let timeout_secs = compute_timeout(config.timeout_multiplier, estimated_secs);
         let timeout_duration = std::time::Duration::from_secs_f64(timeout_secs);
 
         let mut child = tokio::process::Command::new(&config.python)
@@ -785,6 +782,12 @@ fn discover_tests(
     Ok(tests)
 }
 
+fn compute_timeout(multiplier: f64, estimated_secs: f64) -> f64 {
+    (multiplier * estimated_secs)
+        .max(multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
+        .max(MIN_ISOLATED_TIMEOUT_SECS)
+}
+
 fn write_meta_files(
     mutants_dir: &Path,
     all_names: &HashMap<String, Vec<String>>,
@@ -968,12 +971,6 @@ mod tests {
     use super::*;
 
     // --- per-mutant timeout computation ---
-
-    fn compute_timeout(multiplier: f64, estimated_secs: f64) -> f64 {
-        (multiplier * estimated_secs)
-            .max(multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
-            .max(MIN_ISOLATED_TIMEOUT_SECS)
-    }
 
     #[test]
     fn test_per_mutant_timeout_formula_zero_duration() {
