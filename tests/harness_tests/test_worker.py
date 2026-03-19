@@ -149,7 +149,7 @@ def test_reports_indicate_failure_empty_list():
 
 
 def make_plugin():
-    return MutationWorkerPlugin(sock=MagicMock(), use_legacy=False)
+    return MutationWorkerPlugin(sock=MagicMock())
 
 
 def make_item(nodeid):

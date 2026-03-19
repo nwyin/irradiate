@@ -43,10 +43,10 @@ Remaining work here is mostly empirical tuning and plugin-compatibility coverage
 
 ### Current state
 
-The harness now has two execution paths:
+Today there are two user-visible execution modes:
 
-- **Legacy path**: call `pytest.main(["-x", "--no-header", "-q"] + test_ids)` for every mutant. This re-invokes pytest's full startup sequence — argument parsing, plugin loading, test collection, fixture resolution — then runs the selected tests and exits.
-- **Fast path**: keep a pytest session alive inside the worker, collect once, then execute pre-collected items directly for each mutant.
+- **Default worker-pool mode**: keep a pytest session alive inside each worker, collect once, then execute pre-collected items directly for each mutant.
+- **`--isolate` mode**: run each mutant in a fresh subprocess for maximum correctness at the cost of startup overhead.
 
 The fast path now uses pytest hook machinery for execution inside the long-lived worker session rather than importing `_pytest.runner.runtestprotocol` directly. The remaining design question is less about "can we avoid private pytest internals?" and more about how aggressively we want to harden compatibility and fallbacks around the warm-session model.
 

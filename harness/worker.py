@@ -44,9 +44,8 @@ class MutationWorkerPlugin:
     when pytest's runtest hooks are invoked for each mutant.
     """
 
-    def __init__(self, sock, use_legacy):
+    def __init__(self, sock):
         self.sock = sock
-        self.use_legacy = use_legacy
         self.buf = b""
         self.items = {}  # nodeid -> Item
         self.item_order = {}  # nodeid -> collection index
@@ -105,8 +104,6 @@ class MutationWorkerPlugin:
         is fully alive and all plugins are ready for test execution.
         """
         import irradiate_harness
-        import pytest
-
         if not self.items:
             print("WARNING: No tests collected", file=sys.stderr)
 
@@ -149,17 +146,10 @@ class MutationWorkerPlugin:
                         )
                         continue
 
-                    if self.use_legacy:
-                        # Legacy path: re-invokes full pytest machinery each time.
-                        # Enable with IRRADIATE_WORKER_LEGACY=1 to aid debugging.
-                        irradiate_harness.active_mutant = mutant_name
-                        test_args = ["-x", "--no-header", "-q", "-o", "pythonpath="] + test_ids
-                        run_exit_code = pytest.main(test_args)
-                    else:
-                        self._reset_run_state()
-                        self.current_run_mutant = mutant_name
-                        irradiate_harness.active_mutant = mutant_name
-                        run_exit_code = self._run_items_via_hooks(items_to_run)
+                    self._reset_run_state()
+                    self.current_run_mutant = mutant_name
+                    irradiate_harness.active_mutant = mutant_name
+                    run_exit_code = self._run_items_via_hooks(items_to_run)
 
                     duration = time.monotonic() - start
                     send_message(
@@ -204,7 +194,6 @@ class MutationWorkerPlugin:
 def main():  # pragma: no mutate
     socket_path = os.environ["IRRADIATE_SOCKET"]
     tests_dir = os.environ.get("IRRADIATE_TESTS_DIR", "tests")
-    use_legacy = os.environ.get("IRRADIATE_WORKER_LEGACY", "").strip() == "1"
 
     # Import irradiate_harness BEFORE pytest to install the MutantFinder import
     # hook. The hook intercepts imports of mutated modules from mutants/; it
@@ -220,7 +209,7 @@ def main():  # pragma: no mutate
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(socket_path)
 
-    plugin = MutationWorkerPlugin(sock, use_legacy)
+    plugin = MutationWorkerPlugin(sock)
 
     # Run pytest: collection happens, then our plugin intercepts the run loop
     # to process mutant assignments via IPC.
