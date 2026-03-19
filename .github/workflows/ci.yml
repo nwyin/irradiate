@@ -65,3 +65,23 @@ jobs:
 
       - name: Run e2e tests
         run: bash tests/e2e.sh
+
+      - name: Dogfood mutation score
+        run: |
+          cd tests/harness_tests
+          # venv is created by e2e.sh; install to be safe
+          if [ ! -d .venv ]; then uv venv --python 3.12 && uv pip install pytest; fi
+          ../../target/debug/irradiate run \
+            --paths-to-mutate ../../harness \
+            --tests-dir . \
+            --python .venv/bin/python3 \
+            --timeout-multiplier 5 \
+            --isolate 2>&1 | tee dogfood.txt || true
+          killed=$(grep -oP 'Killed:\s+\K\d+' dogfood.txt || echo 0)
+          total=$(grep -oP 'complete \(\K\d+' dogfood.txt || echo 0)
+          echo "Mutation score: ${killed} / ${total} mutants killed"
+          if [ "$total" -gt 0 ]; then
+            pct=$(( killed * 100 / total ))
+            echo "Score: ${pct}%"
+          fi
+          rm -rf mutants .irradiate
