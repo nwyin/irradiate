@@ -31,20 +31,27 @@ irradiate results
 irradiate show module.x_func__mutmut_1
 ```
 
+## What's different from mutmut
+
+| | mutmut | irradiate |
+|---|---|---|
+| **Startup cost** | `pytest.main()` per mutant (~200ms each) | Pre-warmed worker pool — pytest starts once, runs many |
+| **Cache** | mtime-based (breaks on rebase, touch, branch switch) | Content-addressable (SHA-256 of function body + tests + operator) |
+| **Orchestration** | Python multiprocessing | Rust + tokio async (no GIL, native signal/timeout handling) |
+| **Mutation dispatch** | `os.environ` lookup per call (syscall) | Module global lookup (dict access, no syscall) |
+| **Mutation generation** | Sequential Python (LibCST) | Parallel Rust (libcst crate + rayon) |
+| **Result I/O** | JSON write per mutant | Batched writes |
+| **Isolation** | Fork per mutant only | Default warm-session + `--isolate` flag for full subprocess isolation |
+| **Worker health** | — | Memory monitoring, automatic respawn, configurable recycling |
+| **Test selection** | Coverage-based | Coverage-based + duration-aware scheduling (longest-first ordering, per-mutant timeout budgets) |
+
 ## Status
 
-What works today:
-- Full mutation pipeline (parse → mutate → stats → validate → test → report)
-- Pre-warmed pytest worker pool with unix socket IPC
-- Table-driven operators (arithmetic, comparison, logical, bitwise, boolean, keyword, unary, string method swaps)
-- Procedural operators (numbers, strings, lambdas, assignments)
-- Stats-based test selection (only run tests that cover each function)
+Pre-alpha. The full pipeline works end-to-end on real projects (markupsafe, click).
 
 What's missing:
-- Content-addressable cache
 - TUI browser
 - `--test-command` fallback for non-pytest runners
-- Parallel mutation generation (rayon)
 - Remote/shared cache
 - Type checker integration
 - Lots of edge cases
