@@ -4,7 +4,8 @@ use irradiate::orchestrator::{run_worker_pool, PoolConfig};
 use irradiate::pipeline;
 use irradiate::protocol::{MutantStatus, WorkItem};
 use irradiate::stats;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -28,13 +29,33 @@ fn fixture_dir() -> PathBuf {
 /// Generate mutants on the fly from the fixture source, writing to a temp directory.
 /// Returns (TempDir handle, list of mutant keys).
 fn generate_test_mutants() -> (tempfile::TempDir, Vec<String>) {
-    let source = std::fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
+    let source = fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
     let mutated =
         codegen::mutate_file(&source, "simple_lib").expect("fixture should produce mutations");
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("simple_lib")).unwrap();
-    std::fs::write(tmp.path().join("simple_lib/__init__.py"), &mutated.source).unwrap();
+    fs::create_dir_all(tmp.path().join("simple_lib")).unwrap();
+    fs::write(tmp.path().join("simple_lib/__init__.py"), &mutated.source).unwrap();
+
+    (tmp, mutated.mutant_names)
+}
+
+fn generate_mutants_for_project(
+    project_dir: &Path,
+    source_rel_path: &str,
+    module_name: &str,
+) -> (tempfile::TempDir, Vec<String>) {
+    let source = fs::read_to_string(project_dir.join(source_rel_path)).unwrap();
+    let mutated =
+        codegen::mutate_file(&source, module_name).expect("fixture should produce mutations");
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join(module_name)).unwrap();
+    fs::write(
+        tmp.path().join(module_name).join("__init__.py"),
+        &mutated.source,
+    )
+    .unwrap();
 
     (tmp, mutated.mutant_names)
 }
@@ -291,6 +312,153 @@ async fn test_worker_pool_recycle_disabled() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, MutantStatus::Killed);
+}
+
+#[tokio::test]
+async fn test_worker_pool_repeated_runs_same_worker_cleanup() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: fixture.clone(),
+        mutants_dir: _tmp.path().to_path_buf(),
+        tests_dir: fixture.join("tests"),
+        timeout_multiplier: 10.0,
+        worker_recycle_after: 0,
+        ..Default::default()
+    };
+
+    let work_items = vec![
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            timeout_secs: 300.0,
+        },
+        WorkItem {
+            mutant_name: "simple_lib.x_nonexistent__irradiate_1".to_string(),
+            test_ids: vec![
+                "tests/test_simple.py::test_add".to_string(),
+                "tests/test_simple.py::test_is_positive".to_string(),
+                "tests/test_simple.py::test_greet".to_string(),
+            ],
+            timeout_secs: 300.0,
+        },
+    ];
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should complete with repeated runs on one worker");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].status, MutantStatus::Killed);
+    assert_eq!(
+        results[1].status,
+        MutantStatus::Survived,
+        "Second run on the same worker must not inherit the first run's failure state"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_pool_repeated_runs_teardown_module_fixture() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("src/stateful")).unwrap();
+    fs::create_dir_all(project.path().join("tests")).unwrap();
+
+    fs::write(
+        project.path().join("src/stateful/__init__.py"),
+        r#"STATE = []
+
+def mark():
+    STATE.append("x")
+    return len(STATE) == 1
+"#,
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("tests/test_stateful.py"),
+        r#"import pytest
+
+from stateful import STATE, mark
+
+
+@pytest.fixture(scope="module", autouse=True)
+def reset_state():
+    STATE.clear()
+    yield
+    STATE.clear()
+
+
+def test_mark_once():
+    assert mark() is True
+"#,
+    )
+    .unwrap();
+
+    let python = fixture_python();
+    let (_tmp, _) =
+        generate_mutants_for_project(project.path(), "src/stateful/__init__.py", "stateful");
+    let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let mutants_dir = _tmp.path().to_path_buf();
+    let test_stats =
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+            .expect("Temp project stats collection should succeed");
+    let test_id = test_stats
+        .duration_by_test
+        .keys()
+        .next()
+        .cloned()
+        .expect("Temp project should collect one test");
+    let mut candidate_test_ids = vec![test_id.clone()];
+    if let Some(stripped) = test_id.strip_prefix("tests/") {
+        candidate_test_ids.push(stripped.to_string());
+    } else {
+        candidate_test_ids.push(format!("tests/{test_id}"));
+    }
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: project.path().to_path_buf(),
+        mutants_dir,
+        tests_dir: project.path().join("tests"),
+        timeout_multiplier: 10.0,
+        pythonpath,
+        worker_recycle_after: 0,
+        ..Default::default()
+    };
+
+    let work_items = vec![
+        WorkItem {
+            mutant_name: "stateful.x_nonexistent__irradiate_1".to_string(),
+            test_ids: candidate_test_ids.clone(),
+            timeout_secs: 300.0,
+        },
+        WorkItem {
+            mutant_name: "stateful.x_nonexistent__irradiate_1".to_string(),
+            test_ids: candidate_test_ids,
+            timeout_secs: 300.0,
+        },
+    ];
+
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool should cleanly rerun module-scoped fixtures");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].status, MutantStatus::Survived);
+    assert_eq!(
+        results[1].status,
+        MutantStatus::Survived,
+        "Module-scoped fixture teardown must reset state between runs on one worker"
+    );
 }
 
 #[tokio::test]

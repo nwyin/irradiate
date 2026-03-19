@@ -1,16 +1,11 @@
-"""
-Tests for harness/worker.py — send_message, recv_message, reset_run_state.
-
-The IPC loop, main(), _force_teardown(), and MutationWorkerPlugin are not
-unit-testable without a full pytest session; they are excluded by design.
-"""
+"""Tests for harness/worker.py helper logic and plugin-owned run state."""
 
 import json
 import socket
 from unittest.mock import MagicMock
 
 # conftest.py inserts the repo root into sys.path so these imports resolve
-from harness.worker import recv_message, reset_run_state, send_message
+from harness.worker import MutationWorkerPlugin, recv_message, reports_indicate_failure, send_message
 
 
 # ---------------------------------------------------------------------------
@@ -126,37 +121,96 @@ def test_recv_message_connection_closed_partial_buf():
 
 
 # ---------------------------------------------------------------------------
-# reset_run_state
+# report classification
 # ---------------------------------------------------------------------------
 
 
-def test_reset_run_state_clears_report_sections():
-    """reset_run_state clears _report_sections on each item (INV-2)."""
-    item1 = MagicMock()
-    item1._report_sections = [("stdout", "some output"), ("stderr", "error")]
-    item2 = MagicMock()
-    item2._report_sections = [("stdout", "more output")]
+def test_reports_indicate_failure_false_when_all_reports_pass():
+    report_a = MagicMock(failed=False)
+    report_b = MagicMock(failed=False)
 
-    reset_run_state([item1, item2])
-
-    assert item1._report_sections == []
-    assert item2._report_sections == []
+    assert reports_indicate_failure([report_a, report_b]) is False
 
 
-def test_reset_run_state_tolerates_missing_report_sections():
-    """reset_run_state must not crash if an item lacks _report_sections."""
-    item = MagicMock(spec=[])  # no attributes at all
-    reset_run_state([item])  # must not raise
+def test_reports_indicate_failure_true_when_any_report_fails():
+    report_a = MagicMock(failed=False)
+    report_b = MagicMock(failed=True)
+
+    assert reports_indicate_failure([report_a, report_b]) is True
 
 
-def test_reset_run_state_empty_list():
-    """reset_run_state is a no-op on an empty item list."""
-    reset_run_state([])  # must not raise
+def test_reports_indicate_failure_empty_list():
+    assert reports_indicate_failure([]) is False
 
 
-def test_reset_run_state_already_empty():
-    """reset_run_state on items with empty _report_sections is idempotent."""
+# ---------------------------------------------------------------------------
+# MutationWorkerPlugin helper state
+# ---------------------------------------------------------------------------
+
+
+def make_plugin():
+    return MutationWorkerPlugin(sock=MagicMock(), use_legacy=False)
+
+
+def make_item(nodeid):
     item = MagicMock()
-    item._report_sections = []
-    reset_run_state([item])
-    assert item._report_sections == []
+    item.nodeid = nodeid
+    return item
+
+
+def test_prepare_items_sorts_by_collection_order():
+    plugin = make_plugin()
+    plugin.items = {
+        "tests/test_mod.py::test_b": make_item("tests/test_mod.py::test_b"),
+        "tests/test_mod.py::test_a": make_item("tests/test_mod.py::test_a"),
+    }
+    plugin.item_order = {
+        "tests/test_mod.py::test_a": 0,
+        "tests/test_mod.py::test_b": 1,
+    }
+
+    items = plugin._prepare_items(["tests/test_mod.py::test_b", "tests/test_mod.py::test_a"])
+
+    assert [item.nodeid for item in items] == [
+        "tests/test_mod.py::test_a",
+        "tests/test_mod.py::test_b",
+    ]
+
+
+def test_prepare_items_skips_unknown_nodeids():
+    plugin = make_plugin()
+    plugin.items = {"tests/test_mod.py::test_a": make_item("tests/test_mod.py::test_a")}
+    plugin.item_order = {"tests/test_mod.py::test_a": 0}
+
+    items = plugin._prepare_items(["tests/test_mod.py::test_missing", "tests/test_mod.py::test_a"])
+
+    assert [item.nodeid for item in items] == ["tests/test_mod.py::test_a"]
+
+
+def test_pytest_runtest_logreport_records_only_active_item():
+    plugin = make_plugin()
+    plugin.current_run_mutant = "mod.x_func__irradiate_1"
+    plugin.current_item_nodeid = "tests/test_mod.py::test_a"
+
+    report_a = MagicMock(nodeid="tests/test_mod.py::test_a")
+    report_b = MagicMock(nodeid="tests/test_mod.py::test_b")
+
+    plugin.pytest_runtest_logreport(report_a)
+    plugin.pytest_runtest_logreport(report_b)
+
+    assert plugin.current_run_reports == [report_a]
+
+
+def test_reset_run_state_clears_plugin_fields():
+    plugin = make_plugin()
+    plugin.current_run_mutant = "mod.x_func__irradiate_1"
+    plugin.current_run_nodeids = {"tests/test_mod.py::test_a"}
+    plugin.current_item_nodeid = "tests/test_mod.py::test_a"
+    plugin.current_run_reports = [MagicMock()]
+
+    plugin._reset_run_state()
+
+    assert plugin.current_run_mutant is None
+    assert plugin.current_run_nodeids == set()
+    assert plugin.current_item_nodeid is None
+    assert plugin.current_run_reports == []

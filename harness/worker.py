@@ -3,7 +3,8 @@ irradiate pytest worker — connects to the orchestrator over a unix socket,
 receives mutant assignments, runs pytest items directly, reports results.
 
 Architecture: the IPC loop runs inside pytest_runtestloop so that all pytest
-plugins are properly initialized for direct item execution via runtestprotocol.
+plugins are fully initialized when the worker executes selected items via
+pytest's hook machinery.
 """
 
 import json
@@ -29,72 +30,9 @@ def recv_message(sock, buf):
     return json.loads(line.decode("utf-8")), buf
 
 
-def run_items_directly(items, fail_fast=True):
-    """
-    Run pre-collected pytest items directly using pytest's internal runner API.
-
-    Must be called from within an active pytest session (i.e. from pytest_runtestloop)
-    so that the session's stash and all plugin state are fully initialized.
-
-    Returns:
-        0 = all tests passed (mutant survived)
-        1 = at least one test failed/errored (mutant killed)
-    """
-    from _pytest.runner import runtestprotocol
-
-    failed = False
-    for i, item in enumerate(items):
-        # Pass nextitem so within-run module-scoped fixtures are not redundantly
-        # torn down between tests. The last item gets nextitem=None to force full
-        # teardown, leaving the session clean for the next mutant run.
-        nextitem = items[i + 1] if i + 1 < len(items) else None
-
-        try:
-            reports = runtestprotocol(item, nextitem=nextitem, log=True)
-        except SystemExit as exc:
-            return int(exc.code) if isinstance(exc.code, int) else 1
-        except BaseException:
-            failed = True
-            if fail_fast:
-                _force_teardown(item)
-                break
-            continue
-
-        for report in reports:
-            if report.failed:
-                failed = True
-                break
-
-        if failed and fail_fast:
-            # Ensure module/session-scoped fixtures are torn down so the next
-            # mutant run starts with a clean fixture state.
-            _force_teardown(item)
-            break
-
-    return 1 if failed else 0
-
-
-def _force_teardown(item):  # pragma: no mutate
-    """Force teardown of all active fixtures on the session's setup state."""
-    try:
-        state = item.session._setupstate
-        # pytest 7+ exposes teardown_all(); older versions use teardown_with_finalize(None)
-        if hasattr(state, "teardown_all"):
-            state.teardown_all()
-        elif hasattr(state, "teardown_with_finalize"):
-            state.teardown_with_finalize(None)
-    except Exception:
-        pass
-
-
-def reset_run_state(items):
-    """
-    Reset per-item state that accumulated during a mutant run so the next run
-    starts clean (INV-2: no stdout/stderr pollution between runs).
-    """
-    for item in items:
-        if hasattr(item, "_report_sections"):
-            item._report_sections.clear()
+def reports_indicate_failure(reports):
+    """Return True if any pytest report represents a failed/error outcome."""
+    return any(getattr(report, "failed", False) for report in reports)
 
 
 class MutationWorkerPlugin:
@@ -103,7 +41,7 @@ class MutationWorkerPlugin:
 
     By running the IPC dispatch loop inside pytest_runtestloop, we ensure
     the session is fully initialized (stash keys set, capture manager active)
-    when runtestprotocol is called for each mutant.
+    when pytest's runtest hooks are invoked for each mutant.
     """
 
     def __init__(self, sock, use_legacy):
@@ -111,10 +49,53 @@ class MutationWorkerPlugin:
         self.use_legacy = use_legacy
         self.buf = b""
         self.items = {}  # nodeid -> Item
+        self.item_order = {}  # nodeid -> collection index
+        self.current_run_mutant = None
+        self.current_run_nodeids = set()
+        self.current_item_nodeid = None
+        self.current_run_reports = []
 
     def pytest_collection_finish(self, session):
-        for item in session.items:
+        for index, item in enumerate(session.items):
             self.items[item.nodeid] = item
+            self.item_order[item.nodeid] = index
+
+    def _reset_run_state(self):
+        self.current_run_mutant = None
+        self.current_run_nodeids = set()
+        self.current_item_nodeid = None
+        self.current_run_reports = []
+
+    def _prepare_items(self, test_ids):
+        items = [self.items[tid] for tid in test_ids if tid in self.items]
+        items.sort(key=lambda item: self.item_order.get(item.nodeid, sys.maxsize))
+        return items
+
+    def _run_items_via_hooks(self, items):
+        self.current_run_nodeids = {item.nodeid for item in items}
+
+        for item in items:
+            self.current_item_nodeid = item.nodeid
+            start_idx = len(self.current_run_reports)
+
+            # Safety-first phase: treat each item as a teardown boundary. This
+            # avoids relying on private setup state when a mutant is killed.
+            item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
+
+            item_reports = self.current_run_reports[start_idx:]
+            if reports_indicate_failure(item_reports):
+                return 1
+
+        return 0
+
+    def pytest_runtest_logreport(self, report):
+        if self.current_run_mutant is None:
+            return
+        if self.current_item_nodeid is None:
+            return
+        if report.nodeid != self.current_item_nodeid:
+            return
+        self.current_run_reports.append(report)
 
     def pytest_runtestloop(self, session) -> bool:
         """
@@ -151,11 +132,10 @@ class MutationWorkerPlugin:
                 mutant_name = msg["mutant"]
                 test_ids = msg["tests"]
 
-                irradiate_harness.active_mutant = mutant_name
                 start = time.monotonic()
 
                 try:
-                    items_to_run = [self.items[tid] for tid in test_ids if tid in self.items]
+                    items_to_run = self._prepare_items(test_ids)
 
                     if not items_to_run:
                         send_message(
@@ -167,19 +147,19 @@ class MutationWorkerPlugin:
                                 "duration": 0.0,
                             },
                         )
-                        irradiate_harness.active_mutant = None
                         continue
 
                     if self.use_legacy:
                         # Legacy path: re-invokes full pytest machinery each time.
                         # Enable with IRRADIATE_WORKER_LEGACY=1 to aid debugging.
+                        irradiate_harness.active_mutant = mutant_name
                         test_args = ["-x", "--no-header", "-q", "-o", "pythonpath="] + test_ids
                         run_exit_code = pytest.main(test_args)
                     else:
-                        # Fast path: run pre-collected items directly within this session.
-                        run_exit_code = run_items_directly(items_to_run, fail_fast=True)
-                        # Reset per-item state between runs (INV-2)
-                        reset_run_state(items_to_run)
+                        self._reset_run_state()
+                        self.current_run_mutant = mutant_name
+                        irradiate_harness.active_mutant = mutant_name
+                        run_exit_code = self._run_items_via_hooks(items_to_run)
 
                     duration = time.monotonic() - start
                     send_message(
@@ -191,7 +171,19 @@ class MutationWorkerPlugin:
                             "duration": duration,
                         },
                     )
-                except Exception:
+                except SystemExit as exc:
+                    duration = time.monotonic() - start
+                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+                    send_message(
+                        self.sock,
+                        {
+                            "type": "result",
+                            "mutant": mutant_name,
+                            "exit_code": exit_code,
+                            "duration": duration,
+                        },
+                    )
+                except BaseException:
                     duration = time.monotonic() - start
                     send_message(
                         self.sock,
@@ -203,6 +195,7 @@ class MutationWorkerPlugin:
                         },
                     )
                 finally:
+                    self._reset_run_state()
                     irradiate_harness.active_mutant = None
 
         return True  # Signal to pytest that we handled the run loop
