@@ -50,7 +50,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Phase 1: Mutation generation
     eprintln!("Generating mutants...");
     let start = Instant::now();
-    let all_mutant_names = generate_mutants(&config.paths_to_mutate, &mutants_dir, &config.do_not_mutate)?;
+    let all_mutant_names =
+        generate_mutants(&config.paths_to_mutate, &mutants_dir, &config.do_not_mutate)?;
     let gen_time = start.elapsed();
     eprintln!(
         "  done in {:.0}ms ({} mutants across {} files)",
@@ -515,9 +516,7 @@ fn glob_match_segs(path: &[&str], pattern: &[&str]) -> bool {
             }
             false
         }
-        ([ph, pt @ ..], [pp, prest @ ..]) => {
-            glob_match_seg(ph, pp) && glob_match_segs(pt, prest)
-        }
+        ([ph, pt @ ..], [pp, prest @ ..]) => glob_match_seg(ph, pp) && glob_match_segs(pt, prest),
     }
 }
 
@@ -595,7 +594,10 @@ fn generate_mutants(
             if !do_not_mutate.is_empty() {
                 let rel_for_filter = py_file.strip_prefix(&cwd).unwrap_or(py_file);
                 let rel_filter_str = rel_for_filter.to_string_lossy().replace('\\', "/");
-                if do_not_mutate.iter().any(|pat| path_matches_glob(&rel_filter_str, pat)) {
+                if do_not_mutate
+                    .iter()
+                    .any(|pat| path_matches_glob(&rel_filter_str, pat))
+                {
                     // Copy original for package integrity but skip mutation generation.
                     let dest = mutants_dir.join(rel_path);
                     if let Some(parent) = dest.parent() {
@@ -979,7 +981,10 @@ mod tests {
         // INV: timeout >= multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS when estimated=0.
         // multiplier(10) * DEFAULT(30) = 300, which dominates
         let timeout = compute_timeout(10.0, 0.0);
-        assert!((timeout - 300.0).abs() < 1e-9, "expected 300.0, got {timeout}");
+        assert!(
+            (timeout - 300.0).abs() < 1e-9,
+            "expected 300.0, got {timeout}"
+        );
         assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
     }
 
@@ -988,7 +993,10 @@ mod tests {
         // When estimated duration exceeds the default, multiplier×estimated wins.
         // multiplier(10) * estimated(60) = 600 > multiplier * DEFAULT (300)
         let timeout = compute_timeout(10.0, 60.0);
-        assert!((timeout - 600.0).abs() < 1e-9, "expected 600.0, got {timeout}");
+        assert!(
+            (timeout - 600.0).abs() < 1e-9,
+            "expected 600.0, got {timeout}"
+        );
     }
 
     #[test]
@@ -996,7 +1004,10 @@ mod tests {
         // With multiplier=1 and tiny suite, DEFAULT dominates over tiny estimated.
         // multiplier(1) * DEFAULT(30) = 30 >> 0.001; 30 >= MIN(10)
         let timeout = compute_timeout(1.0, 0.001);
-        assert!((timeout - 30.0).abs() < 1e-9, "expected 30.0, got {timeout}");
+        assert!(
+            (timeout - 30.0).abs() < 1e-9,
+            "expected 30.0, got {timeout}"
+        );
         assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
     }
 
@@ -1685,6 +1696,9 @@ mod tests {
         .unwrap();
 
         let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
-        assert!(!result.is_empty(), "empty do_not_mutate list must not skip any files");
+        assert!(
+            !result.is_empty(),
+            "empty do_not_mutate list must not skip any files"
+        );
     }
 }

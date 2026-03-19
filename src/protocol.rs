@@ -102,7 +102,11 @@ mod tests {
 
         let parsed: OrchestratorMessage = serde_json::from_str(&json).unwrap();
         match parsed {
-            OrchestratorMessage::Run { mutant, tests, timeout_secs } => {
+            OrchestratorMessage::Run {
+                mutant,
+                tests,
+                timeout_secs,
+            } => {
                 assert_eq!(mutant, "my_lib.x_hello__irradiate_1");
                 assert_eq!(tests.len(), 1);
                 assert_eq!(timeout_secs, Some(120.0));
@@ -120,14 +124,20 @@ mod tests {
             timeout_secs: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("timeout_secs"), "None timeout_secs should be omitted from JSON");
+        assert!(
+            !json.contains("timeout_secs"),
+            "None timeout_secs should be omitted from JSON"
+        );
 
         // And deserializing old JSON (no timeout_secs field) should give None
         let old_json = r#"{"type":"run","mutant":"mod.x_f__irradiate_1","tests":[]}"#;
         let parsed: OrchestratorMessage = serde_json::from_str(old_json).unwrap();
         match parsed {
             OrchestratorMessage::Run { timeout_secs, .. } => {
-                assert_eq!(timeout_secs, None, "missing field should deserialize as None");
+                assert_eq!(
+                    timeout_secs, None,
+                    "missing field should deserialize as None"
+                );
             }
             _ => panic!("expected Run"),
         }

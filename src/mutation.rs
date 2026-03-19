@@ -1097,14 +1097,13 @@ fn find_case_line_starts(
     let mut case_indent_len: Option<usize> = None;
 
     while result.len() < n_cases && pos < source.len() {
-        let line_end = source[pos..].find('\n').map_or(source.len(), |p| pos + p + 1);
+        let line_end = source[pos..]
+            .find('\n')
+            .map_or(source.len(), |p| pos + p + 1);
         let line = &source[pos..line_end];
 
         if !line.trim().is_empty() {
-            let line_indent = line.len()
-                - line
-                    .trim_start_matches([' ', '\t'])
-                    .len();
+            let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
 
             if line_indent <= match_indent_len {
                 // Exited the match block without finding all cases.
@@ -1140,14 +1139,13 @@ fn find_block_end(source: &str, from: usize, block_indent_len: usize) -> usize {
     let mut pos = from;
 
     while pos < source.len() {
-        let line_end = source[pos..].find('\n').map_or(source.len(), |p| pos + p + 1);
+        let line_end = source[pos..]
+            .find('\n')
+            .map_or(source.len(), |p| pos + p + 1);
         let line = &source[pos..line_end];
 
         if !line.trim().is_empty() {
-            let line_indent = line.len()
-                - line
-                    .trim_start_matches([' ', '\t'])
-                    .len();
+            let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
             if line_indent <= block_indent_len {
                 return pos;
             }
@@ -1158,7 +1156,6 @@ fn find_block_end(source: &str, from: usize, block_indent_len: usize) -> usize {
 
     source.len()
 }
-
 
 // --- Utility ---
 
@@ -1452,7 +1449,11 @@ mod tests {
     fn test_method_swap_ljust_rjust() {
         let source = "def foo(s):\n    return s.ljust(10)\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "ljust");
         assert_eq!(m.replacement, "rjust");
     }
@@ -1461,7 +1462,11 @@ mod tests {
     fn test_method_swap_rjust_ljust() {
         let source = "def foo(s):\n    return s.rjust(10)\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "rjust");
         assert_eq!(m.replacement, "ljust");
     }
@@ -1470,7 +1475,11 @@ mod tests {
     fn test_method_swap_index_rindex() {
         let source = "def foo(s):\n    return s.index('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "index");
         assert_eq!(m.replacement, "rindex");
     }
@@ -1479,7 +1488,11 @@ mod tests {
     fn test_method_swap_rindex_index() {
         let source = "def foo(s):\n    return s.rindex('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "rindex");
         assert_eq!(m.replacement, "index");
     }
@@ -1488,7 +1501,11 @@ mod tests {
     fn test_method_swap_removeprefix_removesuffix() {
         let source = "def foo(s):\n    return s.removeprefix('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "removeprefix");
         assert_eq!(m.replacement, "removesuffix");
     }
@@ -1497,7 +1514,11 @@ mod tests {
     fn test_method_swap_removesuffix_removeprefix() {
         let source = "def foo(s):\n    return s.removesuffix('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "removesuffix");
         assert_eq!(m.replacement, "removeprefix");
     }
@@ -1506,7 +1527,11 @@ mod tests {
     fn test_method_swap_partition_rpartition() {
         let source = "def foo(s):\n    return s.partition('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "partition");
         assert_eq!(m.replacement, "rpartition");
     }
@@ -1515,7 +1540,11 @@ mod tests {
     fn test_method_swap_rpartition_partition() {
         let source = "def foo(s):\n    return s.rpartition('x')\n";
         let fms = collect_file_mutations(source);
-        let m = fms[0].mutations.iter().find(|m| m.operator == "method_swap").unwrap();
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .unwrap();
         assert_eq!(m.original, "rpartition");
         assert_eq!(m.replacement, "partition");
     }
@@ -1730,11 +1759,27 @@ mod tests {
         let source = "def foo(a, b):\n    f(a, b)\n";
         let muts = arg_removal_mutations(source);
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
-        assert_eq!(muts.len(), 4, "f(a, b) must produce 4 arg_removal mutations; got: {replacements:?}");
-        assert!(replacements.iter().any(|r| r.contains("f(None, b)")), "missing f(None, b)");
-        assert!(replacements.iter().any(|r| r.contains("f(a, None)")), "missing f(a, None)");
-        assert!(replacements.iter().any(|r| r.contains("f(b)")), "missing f(b)");
-        assert!(replacements.iter().any(|r| r.contains("f(a)")), "missing f(a)");
+        assert_eq!(
+            muts.len(),
+            4,
+            "f(a, b) must produce 4 arg_removal mutations; got: {replacements:?}"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None, b)")),
+            "missing f(None, b)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, None)")),
+            "missing f(a, None)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(b)")),
+            "missing f(b)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a)")),
+            "missing f(a)"
+        );
     }
 
     // INV-2: f(a) → 1 mutation: replace with None (no removal)
@@ -1742,8 +1787,15 @@ mod tests {
     fn test_arg_removal_single_arg() {
         let source = "def foo(a):\n    f(a)\n";
         let muts = arg_removal_mutations(source);
-        assert_eq!(muts.len(), 1, "f(a) must produce exactly 1 arg_removal mutation");
-        assert!(muts[0].replacement.contains("f(None)"), "should produce f(None)");
+        assert_eq!(
+            muts.len(),
+            1,
+            "f(a) must produce exactly 1 arg_removal mutation"
+        );
+        assert!(
+            muts[0].replacement.contains("f(None)"),
+            "should produce f(None)"
+        );
     }
 
     // INV-3: f(*args) → 0 arg_removal mutations
@@ -1751,7 +1803,10 @@ mod tests {
     fn test_arg_removal_star_args_skipped() {
         let source = "def foo(args):\n    f(*args)\n";
         let muts = arg_removal_mutations(source);
-        assert!(muts.is_empty(), "f(*args) must produce 0 arg_removal mutations");
+        assert!(
+            muts.is_empty(),
+            "f(*args) must produce 0 arg_removal mutations"
+        );
     }
 
     // INV-4: f(**kwargs) → 0 arg_removal mutations
@@ -1759,7 +1814,10 @@ mod tests {
     fn test_arg_removal_double_star_kwargs_skipped() {
         let source = "def foo(kwargs):\n    f(**kwargs)\n";
         let muts = arg_removal_mutations(source);
-        assert!(muts.is_empty(), "f(**kwargs) must produce 0 arg_removal mutations");
+        assert!(
+            muts.is_empty(),
+            "f(**kwargs) must produce 0 arg_removal mutations"
+        );
     }
 
     // INV-5: f(None) → 0 arg_removal mutations (already None, only arg so no removal)
@@ -1767,7 +1825,10 @@ mod tests {
     fn test_arg_removal_already_none_single() {
         let source = "def foo():\n    f(None)\n";
         let muts = arg_removal_mutations(source);
-        assert!(muts.is_empty(), "f(None) single arg must produce 0 arg_removal mutations");
+        assert!(
+            muts.is_empty(),
+            "f(None) single arg must produce 0 arg_removal mutations"
+        );
     }
 
     // INV-6: f() → 0 arg_removal mutations
@@ -1784,11 +1845,27 @@ mod tests {
         let source = "def foo(a):\n    f(a, b=2)\n";
         let muts = arg_removal_mutations(source);
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
-        assert_eq!(muts.len(), 4, "f(a, b=2) must produce 4 arg_removal mutations; got: {replacements:?}");
-        assert!(replacements.iter().any(|r| r.contains("f(None, b=2)")), "missing f(None, b=2)");
-        assert!(replacements.iter().any(|r| r.contains("f(a, b=None)")), "missing f(a, b=None)");
-        assert!(replacements.iter().any(|r| r.contains("f(b=2)")), "missing f(b=2)");
-        assert!(replacements.iter().any(|r| r.contains("f(a)")), "missing f(a)");
+        assert_eq!(
+            muts.len(),
+            4,
+            "f(a, b=2) must produce 4 arg_removal mutations; got: {replacements:?}"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None, b=2)")),
+            "missing f(None, b=2)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, b=None)")),
+            "missing f(a, b=None)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(b=2)")),
+            "missing f(b=2)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a)")),
+            "missing f(a)"
+        );
     }
 
     // Three-arg call: f(a, b, c) → 6 mutations (replace each × 3 + remove each × 3)
@@ -1797,15 +1874,37 @@ mod tests {
         let source = "def foo(a, b, c):\n    f(a, b, c)\n";
         let muts = arg_removal_mutations(source);
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
-        assert_eq!(muts.len(), 6, "f(a, b, c) must produce 6 arg_removal mutations; got: {replacements:?}");
+        assert_eq!(
+            muts.len(),
+            6,
+            "f(a, b, c) must produce 6 arg_removal mutations; got: {replacements:?}"
+        );
         // replace mutations
-        assert!(replacements.iter().any(|r| r.contains("f(None, b, c)")), "missing f(None, b, c)");
-        assert!(replacements.iter().any(|r| r.contains("f(a, None, c)")), "missing f(a, None, c)");
-        assert!(replacements.iter().any(|r| r.contains("f(a, b, None)")), "missing f(a, b, None)");
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None, b, c)")),
+            "missing f(None, b, c)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, None, c)")),
+            "missing f(a, None, c)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, b, None)")),
+            "missing f(a, b, None)"
+        );
         // removal mutations
-        assert!(replacements.iter().any(|r| r.contains("f(b, c)")), "missing f(b, c) — remove first");
-        assert!(replacements.iter().any(|r| r.contains("f(a, c)")), "missing f(a, c) — remove middle");
-        assert!(replacements.iter().any(|r| r.contains("f(a, b)")), "missing f(a, b) — remove last");
+        assert!(
+            replacements.iter().any(|r| r.contains("f(b, c)")),
+            "missing f(b, c) — remove first"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, c)")),
+            "missing f(a, c) — remove middle"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(a, b)")),
+            "missing f(a, b) — remove last"
+        );
     }
 
     // None arg in multi-arg call: removal is generated even though replace is skipped
@@ -1816,10 +1915,23 @@ mod tests {
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
         // arg 0 (None): no replace (already None), but remove → f(b)
         // arg 1 (b): replace → f(None, None), remove → f(None)
-        assert_eq!(muts.len(), 3, "f(None, b) must produce 3 arg_removal mutations; got: {replacements:?}");
-        assert!(replacements.iter().any(|r| r.contains("f(b)")), "missing f(b)");
-        assert!(replacements.iter().any(|r| r.contains("f(None, None)")), "missing f(None, None)");
-        assert!(replacements.iter().any(|r| r.contains("f(None)")), "missing f(None)");
+        assert_eq!(
+            muts.len(),
+            3,
+            "f(None, b) must produce 3 arg_removal mutations; got: {replacements:?}"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(b)")),
+            "missing f(b)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None, None)")),
+            "missing f(None, None)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None)")),
+            "missing f(None)"
+        );
     }
 
     // INV-8: All generated arg_removal mutations produce syntactically valid Python
@@ -1833,7 +1945,9 @@ mod tests {
             assert!(
                 parse_module(&mutated, None).is_ok(),
                 "arg_removal mutation '{}' → '{}' produced unparseable Python:\n{}",
-                m.original, m.replacement, mutated
+                m.original,
+                m.replacement,
+                mutated
             );
         }
     }
@@ -1849,9 +1963,19 @@ mod tests {
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
         // arg 0 produces: replace → f(None, *args), remove → f(*args)
         // arg 1 (*args): skipped entirely
-        assert_eq!(muts.len(), 2, "f(a, *args) must produce 2 arg_removal mutations; got: {replacements:?}");
-        assert!(replacements.iter().any(|r| r.contains("f(None, *args)")), "missing f(None, *args)");
-        assert!(replacements.iter().any(|r| r.contains("f(*args)")), "missing f(*args)");
+        assert_eq!(
+            muts.len(),
+            2,
+            "f(a, *args) must produce 2 arg_removal mutations; got: {replacements:?}"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(None, *args)")),
+            "missing f(None, *args)"
+        );
+        assert!(
+            replacements.iter().any(|r| r.contains("f(*args)")),
+            "missing f(*args)"
+        );
     }
 
     // --- annotation skip tests ---
@@ -1870,7 +1994,10 @@ mod tests {
             .iter()
             .filter(|m| m.original == "int" || m.original == "str")
             .collect();
-        assert!(ann_muts.is_empty(), "type annotations must not produce mutations");
+        assert!(
+            ann_muts.is_empty(),
+            "type annotations must not produce mutations"
+        );
     }
 
     // INV-2: Variable annotation (AnnAssign) produces 0 mutations on the annotation.
@@ -1881,10 +2008,19 @@ mod tests {
         let fms = collect_file_mutations(source);
         let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
         let int_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "int").collect();
-        assert!(int_muts.is_empty(), "annotation 'int' must not produce mutations");
+        assert!(
+            int_muts.is_empty(),
+            "annotation 'int' must not produce mutations"
+        );
         // The value 5 should produce a number mutation.
-        let num_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "number_mutation").collect();
-        assert!(!num_muts.is_empty(), "value '5' in annotation assignment should still be mutated");
+        let num_muts: Vec<_> = all_muts
+            .iter()
+            .filter(|m| m.operator == "number_mutation")
+            .collect();
+        assert!(
+            !num_muts.is_empty(),
+            "value '5' in annotation assignment should still be mutated"
+        );
     }
 
     // INV-3: Pure type annotation (no value) produces 0 mutations.
@@ -1895,7 +2031,10 @@ mod tests {
         let fms = collect_file_mutations(source);
         let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
         let int_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "int").collect();
-        assert!(int_muts.is_empty(), "pure annotation 'x: int' must produce 0 mutations on int");
+        assert!(
+            int_muts.is_empty(),
+            "pure annotation 'x: int' must produce 0 mutations on int"
+        );
     }
 
     // INV-4: Generic annotation like List[int] produces 0 mutations.
@@ -1906,7 +2045,10 @@ mod tests {
         let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
         // The annotation `list` is a Name, but should not produce mutations.
         let list_muts: Vec<_> = all_muts.iter().filter(|m| m.original == "list").collect();
-        assert!(list_muts.is_empty(), "annotation 'list' must not produce mutations");
+        assert!(
+            list_muts.is_empty(),
+            "annotation 'list' must not produce mutations"
+        );
     }
 
     // --- NEVER_MUTATE_FUNCTION_CALLS tests ---
@@ -1917,7 +2059,10 @@ mod tests {
         let source = "def foo(x):\n    return len(x)\n";
         let fms = collect_file_mutations(source);
         // len(x) should produce 0 mutations total (no arg_removal, no method_swap, x not visited).
-        assert!(fms.is_empty() || fms[0].mutations.is_empty(), "len(x) must produce 0 mutations");
+        assert!(
+            fms.is_empty() || fms[0].mutations.is_empty(),
+            "len(x) must produce 0 mutations"
+        );
     }
 
     // INV-6: isinstance(x, int) produces 0 mutations.
@@ -1925,7 +2070,10 @@ mod tests {
     fn test_isinstance_call_not_mutated() {
         let source = "def foo(x):\n    return isinstance(x, int)\n";
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty() || fms[0].mutations.is_empty(), "isinstance(x, int) must produce 0 mutations");
+        assert!(
+            fms.is_empty() || fms[0].mutations.is_empty(),
+            "isinstance(x, int) must produce 0 mutations"
+        );
     }
 
     // INV-7: Regular calls are still mutated (len/isinstance skip is not a general rule).
@@ -1935,7 +2083,10 @@ mod tests {
         let fms = collect_file_mutations(source);
         // list(x) — arg x produces arg_removal mutation (replace with None)
         let all_muts: Vec<_> = fms.iter().flat_map(|fm| fm.mutations.iter()).collect();
-        assert!(!all_muts.is_empty(), "regular calls like list(x) must still produce mutations");
+        assert!(
+            !all_muts.is_empty(),
+            "regular calls like list(x) must still produce mutations"
+        );
     }
 
     // INV-8: len() inside a larger expression doesn't block other mutations.
@@ -1949,7 +2100,10 @@ mod tests {
             .flat_map(|fm| fm.mutations.iter())
             .filter(|m| m.operator == "binop_swap")
             .collect();
-        assert!(!binops.is_empty(), "binop + should still produce a mutation even when len() is present");
+        assert!(
+            !binops.is_empty(),
+            "binop + should still produce a mutation even when len() is present"
+        );
     }
 }
 
@@ -2157,7 +2311,11 @@ mod match_case_removal_tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         let fm = &fms[0];
-        for m in fm.mutations.iter().filter(|m| m.operator == "match_case_removal") {
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+        {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
                 parse_module(&mutated, None).is_ok(),
@@ -2193,19 +2351,25 @@ mod match_case_removal_tests {
 
         // One mutant drops "quit" branch
         assert!(
-            mutants.iter().any(|s| !s.contains("\"quit\"") && s.contains("\"hello\"") && s.contains("case _")),
+            mutants.iter().any(|s| !s.contains("\"quit\"")
+                && s.contains("\"hello\"")
+                && s.contains("case _")),
             "One mutant should remove 'quit' case while keeping 'hello' and '_'"
         );
 
         // One mutant drops "hello" branch
         assert!(
-            mutants.iter().any(|s| s.contains("\"quit\"") && !s.contains("\"hello\"") && s.contains("case _")),
+            mutants.iter().any(|s| s.contains("\"quit\"")
+                && !s.contains("\"hello\"")
+                && s.contains("case _")),
             "One mutant should remove 'hello' case while keeping 'quit' and '_'"
         );
 
         // One mutant drops wildcard branch
         assert!(
-            mutants.iter().any(|s| s.contains("\"quit\"") && s.contains("\"hello\"") && !s.contains("case _")),
+            mutants.iter().any(|s| s.contains("\"quit\"")
+                && s.contains("\"hello\"")
+                && !s.contains("case _")),
             "One mutant should remove '_' case while keeping 'quit' and 'hello'"
         );
     }
@@ -2249,7 +2413,11 @@ mod match_case_removal_tests {
         );
         let fms = collect_file_mutations(source);
         let fm = &fms[0];
-        for m in fm.mutations.iter().filter(|m| m.operator == "match_case_removal") {
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+        {
             let slice = &fm.source[m.start..m.end];
             assert_eq!(
                 slice, m.original,
