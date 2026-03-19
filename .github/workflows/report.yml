@@ -38,6 +38,9 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Set up fixture venv
+        run: cd tests/fixtures/simple_project && uv venv --python 3.12 --clear && uv pip install pytest
+
       - name: Run tests
         run: cargo test
 

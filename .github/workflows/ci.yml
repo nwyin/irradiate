@@ -43,7 +43,7 @@ jobs:
             ${{ runner.os }}-venv-
 
       - name: Set up fixture venv
-        run: cd tests/fixtures/simple_project && uv venv --python 3.12 && uv pip install pytest
+        run: cd tests/fixtures/simple_project && uv venv --python 3.12 --clear && uv pip install pytest
 
       - name: cargo check + clippy
         run: cargo check && cargo clippy -- -D warnings
