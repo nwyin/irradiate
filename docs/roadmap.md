@@ -34,26 +34,6 @@ Store in `.irradiate/cache/`. Check before dispatching to worker pool. Skip on h
 
 Note: `--isolate` mode and `--worker-recycle-after` are already implemented.
 
-## Skip Rule Gaps (in progress)
-
-- Type annotations, `len()`/`isinstance()` skipping, and `do_not_mutate` enforcement — currently being implemented.
-- `# pragma: no mutate` collected but not enforced per-expression by line number — only per-function.
-
-## Static Analysis Artifacts
-
-Generate artifacts for human reviewers:
-
-```
-docs/artifacts/
-├── module-deps.svg       # Rust module dependency graph
-├── call-stack.svg        # Binary call graph (top-level entry points)
-├── dep-graph.svg         # Crate dependency graph
-├── worker-cfg.svg        # Python worker control flow
-└── README.md             # How to regenerate these
-```
-
-Regenerate on major refactors. Don't automate in CI — these are for human review during design discussions.
-
 ---
 
 ## Design Decision: Worker Execution Model
@@ -120,7 +100,7 @@ Architectural feedback recorded after the implementation reached end-to-end work
 
 #### Mutation application is the biggest correctness risk
 
-The mutation engine uses text-based CST walking for discovery and applies mutations through text substitution. Repeated identical tokens inside one function can map to the wrong source slice, and `# pragma: no mutate` is not yet enforced at expression granularity.
+The mutation engine uses text-based CST walking for discovery and applies mutations through text substitution. Repeated identical tokens inside one function can map to the wrong source slice.
 
 #### The worker pool doesn't yet realize its full performance potential
 
@@ -149,6 +129,6 @@ Workers still call `pytest.main(test_args)` for every mutant. The pre-warmed poo
 |---|------|--------|--------|--------|
 | 1 | Direct test execution via `runtestprotocol()` | L | The core performance win — 5-10× on real projects | |
 | 2 | Content-addressable cache | L | Big perf win on incremental runs | |
-| 3 | Skip rule gaps (pragma per-expression) | S | Correctness — fewer false-positive mutants | in progress |
-| 4 | Worker pool hardening (hot-accept, memory, scheduling) | L | Robustness at scale | |
-| 5 | Static analysis artifacts | S | Aids contributors and reviewers | |
+| 3 | Worker pool hardening (hot-accept, memory, scheduling) | L | Robustness at scale | |
+| ~~4~~ | ~~Skip rule gaps~~ | S | ~~Correctness~~ | done — per-line pragma, type annotations, len/isinstance, do_not_mutate all implemented |
+| ~~5~~ | ~~Static analysis artifacts~~ | S | ~~Aids contributors~~ | done — `docs/artifacts/` |
