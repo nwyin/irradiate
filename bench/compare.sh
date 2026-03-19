@@ -218,13 +218,13 @@ if [ ! -x "$MUTMUT_PYTHON" ]; then
 else
     CONFIG="mutmut_1c"
     echo "--- $CONFIG ---"
-    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --no-progress )
+    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run )
 
     for i in $(seq 1 "$RUNS"); do
         (
             cd "$PROJECT_DIR"
             PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
-                "$MUTMUT_PYTHON" -m mutmut run --no-progress
+                "$MUTMUT_PYTHON" -m mutmut run
         )
     done
     echo

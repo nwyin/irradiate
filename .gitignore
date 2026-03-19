@@ -31,6 +31,7 @@ tests/vendor_repos/
 .DS_Store
 *.swp
 *.swo
+watch_*
 
 # IDE
 .idea/
@@ -47,6 +48,13 @@ fuzz/target/
 bench/results/
 bench/.venv/
 bench/corpora/
+bench/targets/*/.mutmut-cache
+
+# Generated docs artifacts
+docs/artifacts/
 
 # Generated report
 /report/
+
+# uv
+uv.lock

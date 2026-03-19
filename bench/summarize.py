@@ -156,12 +156,16 @@ def parse_mutmut_output(stdout_path: Path, stderr_path: Path) -> RunMetrics:
     """
     Parse mutmut stdout/stderr for mutant stats.
 
-    mutmut stdout contains:
-        "87/87  🎉 52 🫥 0  ⏰ 0  🤔 0  🙁 23  🔇 0  🧙 0"
+    mutmut stdout contains a progress line with emoji-delimited counts:
+        "87/87  [party] 52 [dotted_face] 0  [alarm] 0  [thinking] 0  [frown] 23  [mute] 0  [mage] 0"
         "4.00 mutations/second"
 
     The stats line may appear multiple times (progress updates); use last occurrence.
     """
+    # Mutmut uses emoji markers in its output; match via Unicode escapes
+    _KILLED = "\U0001F389"    # party popper
+    _SURVIVED = "\U0001F641"  # slightly frowning face
+
     metrics = RunMetrics()
 
     # Try stdout first, then stderr (mutmut may write to either)
@@ -170,16 +174,16 @@ def parse_mutmut_output(stdout_path: Path, stderr_path: Path) -> RunMetrics:
             continue
         text = path.read_text(errors="replace")
 
-        # Stats summary line: "X/Y  🎉 K ..."
+        # Stats summary line: "X/Y  [party] K ..."
         # The pattern: digits/digits followed by emoji counts
-        for m in re.finditer(r"(\d+)/(\d+)\s+🎉\s*(\d+)", text):
+        for m in re.finditer(rf"(\d+)/(\d+)\s+{_KILLED}\s*(\d+)", text):
             total = int(m.group(2))
             killed = int(m.group(3))
             metrics.total_mutants = total
             metrics.killed = killed
 
-        # Survived: "🙁 N"
-        for m in re.finditer(r"🙁\s*(\d+)", text):
+        # Survived: "[frown] N"
+        for m in re.finditer(rf"{_SURVIVED}\s*(\d+)", text):
             metrics.survived = int(m.group(1))
 
         # Mutations/sec: "N.NN mutations/second"
