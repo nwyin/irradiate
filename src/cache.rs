@@ -107,6 +107,50 @@ pub fn store_entry(
     Ok(())
 }
 
+/// Force-overwrite a cache entry regardless of whether it already exists.
+///
+/// Used by the verification phase when a warm-session survivor is confirmed killed
+/// in isolate mode — the stale Survived entry must be replaced with the correct
+/// Killed result so that subsequent runs (which may hit the cache) get the right answer.
+pub fn force_update_entry(
+    project_dir: &Path,
+    key: &str,
+    exit_code: i32,
+    duration: f64,
+    status: MutantStatus,
+) -> Result<()> {
+    let path = cache_entry_path(project_dir, key);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    let entry = CacheEntry {
+        schema_version: CACHE_SCHEMA_VERSION,
+        exit_code,
+        duration,
+        status,
+    };
+    let data = serde_json::to_vec_pretty(&entry)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = path.with_extension(format!("tmp-force-{}-{nanos}", std::process::id()));
+    fs::write(&tmp_path, data)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+
+    fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "Failed to move cache entry into place: {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 pub fn build_cache_key(
     project_dir: &Path,
     descriptor: &MutantCacheDescriptor,
@@ -469,6 +513,36 @@ mod tests {
         assert_eq!(loaded.exit_code, 1);
         assert_eq!(loaded.duration, 0.42);
         assert_eq!(loaded.status, MutantStatus::Killed);
+    }
+
+    #[test]
+    fn test_force_update_entry_overwrites_existing() {
+        // INV-4: force_update_entry must overwrite even if entry exists.
+        // This is used by verification to correct false negatives.
+        let tmp = tempfile::tempdir().unwrap();
+        store_entry(tmp.path(), "abcdef", 0, 1.0, MutantStatus::Survived).unwrap();
+
+        // Verify initial state
+        let before = load_entry(tmp.path(), "abcdef").unwrap().unwrap();
+        assert_eq!(before.status, MutantStatus::Survived);
+
+        // Force-update to Killed
+        force_update_entry(tmp.path(), "abcdef", 1, 0.5, MutantStatus::Killed).unwrap();
+
+        let after = load_entry(tmp.path(), "abcdef").unwrap().unwrap();
+        assert_eq!(after.status, MutantStatus::Killed);
+        assert_eq!(after.exit_code, 1);
+    }
+
+    #[test]
+    fn test_force_update_entry_creates_if_absent() {
+        // force_update_entry must also work when no entry exists yet.
+        let tmp = tempfile::tempdir().unwrap();
+        force_update_entry(tmp.path(), "newkey", 1, 0.3, MutantStatus::Killed).unwrap();
+
+        let loaded = load_entry(tmp.path(), "newkey").unwrap().unwrap();
+        assert_eq!(loaded.status, MutantStatus::Killed);
+        assert_eq!(loaded.exit_code, 1);
     }
 
     #[test]

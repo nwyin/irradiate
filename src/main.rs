@@ -55,6 +55,11 @@ enum Commands {
         /// Run each mutant in a fresh subprocess (slower, better isolation)
         #[arg(long)]
         isolate: bool,
+
+        /// After the main run, re-test survived mutants in isolate mode to detect
+        /// false negatives from warm-session state leakage. No-op when --isolate is set.
+        #[arg(long)]
+        verify_survivors: bool,
     },
 
     /// Display mutation testing results
@@ -105,6 +110,7 @@ async fn main() -> Result<()> {
             worker_recycle_after,
             max_worker_memory,
             isolate,
+            verify_survivors,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -131,6 +137,7 @@ async fn main() -> Result<()> {
                 worker_recycle_after,
                 max_worker_memory_mb: max_worker_memory,
                 isolate,
+                verify_survivors,
                 do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
             })
             .await
