@@ -1,6 +1,6 @@
 # irradiate — Roadmap
 
-Status as of 2026-03-18. The core pipeline is complete and working on real-world projects (markupsafe, click, my_lib, synth). This document tracks remaining work.
+Status as of 2026-03-19. The core pipeline is complete and working on real-world projects (markupsafe, click, my_lib, synth). This document tracks remaining work.
 
 ## Verification
 
@@ -9,16 +9,6 @@ cargo check && cargo clippy -- -D warnings && cargo test && bash tests/e2e.sh
 ```
 
 ---
-
-## Missing Operators
-
-Table-driven, quick to add:
-
-| Operator | Type | Notes |
-|----------|------|-------|
-| String method swaps | Table | `.lower()↔.upper()`, `.lstrip()↔.rstrip()`, `.find()↔.rfind()` |
-| Argument removal | Procedural | Remove each arg, replace with `None`. Need to inspect arg count, generate N variants. |
-| Match case removal | Procedural | Drop each `case` branch from `match` statements. Python 3.10+. |
 
 ## Content-addressable Cache
 
@@ -44,19 +34,10 @@ Store in `.irradiate/cache/`. Check before dispatching to worker pool. Skip on h
 
 Note: `--isolate` mode and `--worker-recycle-after` are already implemented.
 
-## Skip Rule Gaps
+## Skip Rule Gaps (in progress)
 
-- Type annotations not skipped (should never mutate hints).
-- `len()` / `isinstance()` calls not skipped (mutations rarely produce useful signal).
+- Type annotations, `len()`/`isinstance()` skipping, and `do_not_mutate` enforcement — currently being implemented.
 - `# pragma: no mutate` collected but not enforced per-expression by line number — only per-function.
-
-## Dogfooding: Mutation Testing irradiate Itself
-
-Use irradiate to mutation-test its own Python harness files (`harness/__init__.py`, `worker.py`, `stats_plugin.py`):
-
-- Run `irradiate run` from the repo root with `--paths-to-mutate harness/`.
-- Write dedicated pytest tests for the harness if coverage is weak.
-- Track mutation score over time — add to CI as a quality gate once stable.
 
 ## Static Analysis Artifacts
 
@@ -164,13 +145,10 @@ Workers still call `pytest.main(test_args)` for every mutant. The pre-warmed poo
 
 ## Priority Order
 
-| # | Item | Effort | Impact |
-|---|------|--------|--------|
-| 1 | Direct test execution via `runtestprotocol()` | L | The core performance win — 5-10× on real projects |
-| 2 | Content-addressable cache | L | Big perf win on incremental runs |
-| 3 | String method swap operators | S | More mutants, quick table addition |
-| 4 | Skip rule gaps (type hints, pragma per-expression) | S | Correctness — fewer false-positive mutants |
-| 5 | Worker pool hardening (hot-accept, memory, scheduling) | L | Robustness at scale |
-| 6 | Argument removal / match case operators | M | More complete operator coverage |
-| 7 | Dogfooding (mutation testing own harness) | M | Quality gate, validates harness correctness |
-| 8 | Static analysis artifacts | S | Aids contributors and reviewers |
+| # | Item | Effort | Impact | Status |
+|---|------|--------|--------|--------|
+| 1 | Direct test execution via `runtestprotocol()` | L | The core performance win — 5-10× on real projects | |
+| 2 | Content-addressable cache | L | Big perf win on incremental runs | |
+| 3 | Skip rule gaps (pragma per-expression) | S | Correctness — fewer false-positive mutants | in progress |
+| 4 | Worker pool hardening (hot-accept, memory, scheduling) | L | Robustness at scale | |
+| 5 | Static analysis artifacts | S | Aids contributors and reviewers | |
