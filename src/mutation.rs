@@ -837,24 +837,19 @@ fn add_assignment_mutation_at(
     mutations: &mut Vec<Mutation>,
 ) {
     let value_text = codegen_node(&assign.value);
-    let replacement = if value_text.trim() == "None" {
-        " \"\"".to_string()
-    } else {
-        " None".to_string()
-    };
-    // Replace just the value portion: find the `=` and substitute everything after it.
-    let new_full = if let Some(eq_pos) = assign_text.find('=') {
-        format!("{}={replacement}", &assign_text[..eq_pos])
-    } else {
+    let replacement = if value_text.trim() == "None" { "\"\"" } else { "None" };
+    // Find the start of the value by summing the codegen lengths of all AssignTarget nodes.
+    // Each AssignTarget codegen is: {target}{whitespace_before_equal}={whitespace_after_equal},
+    // so the value always begins immediately after the last target. This is safer than
+    // assign_text.find('='), which returns the wrong position for chained assignments like
+    // `a = b = c` (would match the first `=`, silently dropping `b` as a target), and also
+    // mismatches `=` inside string literals (`d['=']`) or `==` comparisons in the value.
+    let targets_len: usize = assign.targets.iter().map(|t| codegen_node(t).len()).sum();
+    if targets_len > assign_text.len() {
         return;
-    };
-    record_mutation(
-        assign_text,
-        &new_full,
-        "assignment_mutation",
-        start,
-        mutations,
-    );
+    }
+    let new_full = format!("{}{}", &assign_text[..targets_len], replacement);
+    record_mutation(assign_text, &new_full, "assignment_mutation", start, mutations);
 }
 
 /// AugAssign operator swap: += → -=, etc.
@@ -2654,6 +2649,140 @@ mod match_case_removal_tests {
             lam_mut.is_some(),
             "lambda: None should produce lambda: 0; got: {:?}",
             muts.iter().map(|m| &m.replacement).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod assignment_mutation_tests {
+    use super::*;
+
+    fn assignment_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "assignment_mutation")
+            .collect()
+    }
+
+    fn assignment_mutants(source: &str) -> Vec<String> {
+        let fms = collect_file_mutations(source);
+        let fm = fms.into_iter().next().expect("should have mutations");
+        fm.mutations
+            .iter()
+            .filter(|m| m.operator == "assignment_mutation")
+            .map(|m| apply_mutation(&fm.source, m))
+            .collect()
+    }
+
+    // INV-1: `x = y == z` — value contains `==`; first `=` in text is still the assignment `=`.
+    // The mutation must produce `x = None`, not a truncated result from matching `=` inside `==`.
+    #[test]
+    fn test_assignment_value_with_comparison() {
+        let source = "def foo(y, z):\n    x = y == z\n";
+        let muts = assignment_mutations(source);
+        assert_eq!(muts.len(), 1, "should find one assignment mutation");
+        // m.replacement is the full replaced span text
+        assert_eq!(
+            muts[0].replacement, "x = None",
+            "replacement should be 'x = None'; got {:?}",
+            muts[0].replacement
+        );
+        let mutants = assignment_mutants(source);
+        assert_eq!(mutants.len(), 1);
+        assert!(
+            mutants[0].contains("x = None"),
+            "mutated source should contain 'x = None'; got:\n{}",
+            mutants[0]
+        );
+    }
+
+    // INV-2: `x = d['=']` — value contains a string literal with `=`; must not confuse the splitter.
+    #[test]
+    fn test_assignment_value_with_eq_in_string() {
+        let source = "def foo(d):\n    x = d['=']\n";
+        let mutants = assignment_mutants(source);
+        assert_eq!(mutants.len(), 1);
+        assert!(
+            mutants[0].contains("x = None"),
+            "mutated source should contain 'x = None'; got:\n{}",
+            mutants[0]
+        );
+    }
+
+    // INV-3: `a = b = c` — chained assignment has two targets.
+    // The mutation must replace the value `c` with `None`, preserving both targets: `a = b = None`.
+    // The old find('=') approach would produce `a = None`, silently dropping `b` as a target.
+    #[test]
+    fn test_chained_assignment_preserves_all_targets() {
+        let source = "def foo(c):\n    a = b = c\n";
+        let mutants = assignment_mutants(source);
+        assert_eq!(mutants.len(), 1, "chained assignment should produce exactly one assignment mutation");
+        assert!(
+            mutants[0].contains("a = b = None"),
+            "chained assignment must produce 'a = b = None' (both targets preserved); got:\n{}",
+            mutants[0]
+        );
+    }
+
+    // INV-4: `a, b = 1, 2` — tuple unpacking (single AssignTarget with a Tuple target).
+    // The mutation must produce `a, b = None`.
+    #[test]
+    fn test_tuple_unpacking_assignment() {
+        let source = "def foo():\n    a, b = 1, 2\n";
+        let mutants = assignment_mutants(source);
+        assert_eq!(mutants.len(), 1, "tuple unpacking should produce one assignment mutation");
+        assert!(
+            mutants[0].contains("a, b = None"),
+            "tuple unpacking assignment must produce 'a, b = None'; got:\n{}",
+            mutants[0]
+        );
+    }
+
+    // INV-5: All assignment mutations produce syntactically valid Python.
+    #[test]
+    fn test_all_assignment_mutations_produce_valid_python() {
+        let sources = [
+            "def foo(y, z):\n    x = y == z\n",
+            "def foo(d):\n    x = d['=']\n",
+            "def foo(c):\n    a = b = c\n",
+            "def foo():\n    a, b = 1, 2\n",
+            "def foo():\n    x = 1\n",
+            "def foo():\n    x = None\n",
+        ];
+        for source in &sources {
+            let fms = collect_file_mutations(source);
+            if let Some(fm) = fms.first() {
+                for m in fm.mutations.iter().filter(|m| m.operator == "assignment_mutation") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "assignment_mutation on {:?} produced unparseable Python:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-6: `x = None` — when the current value is already None, mutate to `""`.
+    #[test]
+    fn test_assignment_none_to_empty_string() {
+        let source = "def foo():\n    x = None\n";
+        let muts = assignment_mutations(source);
+        assert_eq!(muts.len(), 1);
+        // m.replacement is the full replaced span text
+        assert_eq!(
+            muts[0].replacement, "x = \"\"",
+            "when value is None, full replacement must be 'x = \"\"'; got {:?}",
+            muts[0].replacement
+        );
+        let mutants = assignment_mutants(source);
+        assert!(
+            mutants[0].contains("x = \"\""),
+            "must produce 'x = \"\"'; got:\n{}",
+            mutants[0]
         );
     }
 }
