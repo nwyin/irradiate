@@ -1031,8 +1031,14 @@ fn add_arg_removal_mutations(
 /// Generate one mutation per case in a match statement, each removing one case block.
 ///
 /// Strategy: locate the match keyword in func_source using text search from cursor_before,
-/// then find each case block by scanning lines at the expected indentation level.
-/// This avoids relying on libcst codegen which uses relative (not absolute) indentation.
+/// then locate each case using its CST-derived pattern text as a search anchor, advancing
+/// a sub-cursor through the match body. This is consistent with the cursor-based approach
+/// used by all other operators and eliminates the indentation-scanning approach.
+///
+/// Note: libcst codegen uses relative indentation (`state.add_indent()`), so calling
+/// `codegen_node(match_stmt)` standalone would strip the leading indent.  We therefore
+/// keep the subject-text search for the match header and use pattern-text anchors for
+/// individual cases, both of which are indent-independent.
 fn add_match_case_removal_mutations(
     match_stmt: &cst::Match,
     source: &str,
@@ -1062,15 +1068,19 @@ fn add_match_case_removal_mutations(
         None => return,
     };
 
-    // Locate each case block start by scanning lines in the match body.
-    let case_line_starts =
-        match find_case_line_starts(source, match_header_end, match_indent_len, n_cases) {
-            Some(v) => v,
-            None => return,
-        };
-
     // Find where the match block ends (first non-blank line at <= match_indent_len, or source end).
     let match_end = find_block_end(source, match_header_end, match_indent_len);
+
+    // Locate each case block start using the CST pattern text as the search anchor.
+    let case_line_starts = match find_case_starts_by_pattern(
+        source,
+        match_header_end,
+        match_end,
+        &match_stmt.cases,
+    ) {
+        Some(v) => v,
+        None => return,
+    };
 
     // The full original text of the match statement (including its leading indentation).
     let match_original = &source[match_line_start..match_end];
@@ -1100,57 +1110,62 @@ fn add_match_case_removal_mutations(
     }
 }
 
-/// Find the byte offsets of `n_cases` case block lines within a match body.
+/// Find the line-start byte offsets of each case in a match statement body,
+/// using CST-derived case header text as the search anchor.
 ///
-/// Scans lines forward from `from`, tracking the indentation level of the first
-/// non-blank line (which must be a `case` line). Subsequent `case` lines at the
-/// same indentation are recorded. Lines at deeper indentation are skipped (they
-/// are case bodies, potentially including nested match statements). If a non-blank
-/// line at ≤ match_indent_len is encountered before finding all cases, returns None.
-fn find_case_line_starts(
+/// For each case, constructs the exact `case <pattern>:` (or `case <pattern> if <guard>:`)
+/// header text using the whitespace values stored in the CST nodes, then searches forward
+/// from a sub-cursor within `[from, match_end)`.
+///
+/// Candidate matches are validated by checking that only whitespace precedes the `case`
+/// keyword on that line — this skips false matches inside string literals or comments.
+///
+/// Returns `None` if any case cannot be located.
+fn find_case_starts_by_pattern<'a>(
     source: &str,
     from: usize,
-    match_indent_len: usize,
-    n_cases: usize,
+    match_end: usize,
+    cases: &[cst::MatchCase<'a>],
 ) -> Option<Vec<usize>> {
     let mut result = Vec::new();
-    let mut pos = from;
-    // The indentation of case lines (match_indent + one level); set from the first case found.
-    let mut case_indent_len: Option<usize> = None;
+    let mut sub_cursor = from;
 
-    while result.len() < n_cases && pos < source.len() {
-        let line_end = source[pos..]
-            .find('\n')
-            .map_or(source.len(), |p| pos + p + 1);
-        let line = &source[pos..line_end];
+    for case in cases {
+        // Build the exact case header anchor from CST-stored whitespace fields.
+        // SimpleWhitespace is a newtype wrapper: `.0` gives the raw &str.
+        let ws = case.whitespace_after_case.0;
+        let pattern_text = codegen_node(&case.pattern);
+        let ws_bc = case.whitespace_before_colon.0;
+        let case_anchor = if let Some(guard) = &case.guard {
+            let ws_bi = case.whitespace_before_if.0;
+            let ws_ai = case.whitespace_after_if.0;
+            let guard_text = codegen_node(guard);
+            format!("case{ws}{pattern_text}{ws_bi}if{ws_ai}{guard_text}{ws_bc}:")
+        } else {
+            format!("case{ws}{pattern_text}{ws_bc}:")
+        };
 
-        if !line.trim().is_empty() {
-            let line_indent = line.len() - line.trim_start_matches([' ', '\t']).len();
-
-            if line_indent <= match_indent_len {
-                // Exited the match block without finding all cases.
-                return None;
+        // Search for the anchor, skipping any false match not at a line start
+        // (e.g. the anchor text appearing inside a string literal or comment).
+        let mut search_from = sub_cursor;
+        let case_line_start = loop {
+            let needle_pos = source[search_from..match_end].find(&case_anchor)?;
+            let abs_needle = search_from + needle_pos;
+            let line_start = source[..abs_needle].rfind('\n').map_or(0, |p| p + 1);
+            // Validate: only whitespace between the line start and the "case" keyword.
+            let prefix = &source[line_start..abs_needle];
+            if prefix.chars().all(|c| c == ' ' || c == '\t') {
+                sub_cursor = abs_needle + case_anchor.len();
+                break line_start;
             }
+            // False match — skip past it and retry.
+            search_from = abs_needle + 1;
+        };
 
-            let target = *case_indent_len.get_or_insert(line_indent);
-
-            if line_indent == target {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("case ") || trimmed.starts_with("case\t") {
-                    result.push(pos);
-                }
-            }
-            // Lines at deeper indent are case bodies (or nested match cases) — skip.
-        }
-
-        pos = line_end;
+        result.push(case_line_start);
     }
 
-    if result.len() == n_cases {
-        Some(result)
-    } else {
-        None
-    }
+    Some(result)
 }
 
 /// Find the byte offset where a block indented deeper than `block_indent_len` ends.
@@ -2650,6 +2665,98 @@ mod match_case_removal_tests {
             "lambda: None should produce lambda: 0; got: {:?}",
             muts.iter().map(|m| &m.replacement).collect::<Vec<_>>()
         );
+    }
+
+    // INV-9: String literal containing `match x:` in a preceding statement does not
+    // confuse the match-header search — only the real match generates case removals.
+    #[test]
+    fn test_preceding_string_with_match_pattern() {
+        let source = concat!(
+            "def foo(x):\n",
+            "    s = \"match x:\"\n", // string literal looks like a match header
+            "    match x:\n",
+            "        case 1:\n",
+            "            return 1\n",
+            "        case 2:\n",
+            "            return 2\n",
+        );
+        let muts = match_case_mutations(source);
+        // Only the real match (2 cases) should produce mutations.
+        assert_eq!(
+            muts.len(),
+            2,
+            "Preceding string with 'match x:' must not generate extra mutations; got: {muts:?}"
+        );
+    }
+
+    // INV-10: Case body containing `case _:` in a comment does not produce a false match
+    // when searching for the next case — the real second case is still correctly found.
+    #[test]
+    fn test_case_keyword_in_comment_not_matched() {
+        let source = concat!(
+            "def foo(cmd):\n",
+            "    match cmd:\n",
+            "        case \"a\":\n",
+            "            # TODO: case _: should also handle fallback\n",
+            "            return 0\n",
+            "        case _:\n",
+            "            return 1\n",
+        );
+        let muts = match_case_mutations(source);
+        assert_eq!(
+            muts.len(),
+            2,
+            "Comment containing 'case _:' must not produce a false match; got: {muts:?}"
+        );
+        // Each mutation must produce valid Python.
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+        {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "Removing case produced invalid Python:\n{mutated}"
+            );
+        }
+    }
+
+    // INV-11: Match with guarded cases (case x if cond:) correctly locates case starts.
+    #[test]
+    fn test_guarded_cases() {
+        let source = concat!(
+            "def foo(x):\n",
+            "    match x:\n",
+            "        case 1 if x > 0:\n",
+            "            return 1\n",
+            "        case 2 if x > 0:\n",
+            "            return 2\n",
+            "        case _:\n",
+            "            return 3\n",
+        );
+        let muts = match_case_mutations(source);
+        assert_eq!(
+            muts.len(),
+            3,
+            "Guarded cases must each generate a removal mutation; got: {muts:?}"
+        );
+        // All mutants must parse.
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "match_case_removal")
+        {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "Removing guarded case produced invalid Python:\n{mutated}"
+            );
+        }
     }
 }
 
