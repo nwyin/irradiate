@@ -821,16 +821,24 @@ fn collect_expr_mutations(
             }
         }
         Expression::Name(name) => {
-            add_name_mutation_at(name, expr_start, mutations);
+            // When wrapped in grouping parens, expr_start points at `(`.
+            // Search forward for the actual token to get its true position.
+            let token_start = find_token_start(source, expr_start, name.value);
+            add_name_mutation_at(name, token_start, mutations);
         }
         Expression::Integer(int) => {
-            add_number_mutation_at(int, expr_start, mutations);
+            let token_start = find_token_start(source, expr_start, int.value);
+            add_number_mutation_at(int, token_start, mutations);
         }
         Expression::Float(float) => {
-            add_float_mutation_at(float, expr_start, mutations);
+            let token_start = find_token_start(source, expr_start, float.value);
+            add_float_mutation_at(float, token_start, mutations);
         }
         Expression::SimpleString(s) => {
-            add_string_mutation_at(s, expr_start, mutations);
+            // expr_start points at the opening `(` when lpar is non-empty.
+            // Search forward for the string token to find its true position.
+            let token_start = find_token_start(source, expr_start, s.value);
+            add_string_mutation_at(s, token_start, mutations);
         }
         Expression::Call(call) => {
             // Skip calls to builtins that should never be mutated (len, isinstance, etc.).
@@ -1806,6 +1814,21 @@ fn codegen_node<'a>(node: &impl Codegen<'a>) -> String {
     let mut state = CodegenState::default();
     node.codegen(&mut state);
     state.tokens
+}
+
+/// Find the byte offset in `source[from..]` where `token` first appears.
+///
+/// Used to locate a leaf token (string literal, number, name) within a parenthesized
+/// expression: `find_expr_span` returns `expr_start` pointing at the opening `(`, but
+/// mutation helpers need the position of the actual token.  Since lpar/rpar whitespace
+/// can span multiple lines with indentation, we cannot reliably compute the offset from
+/// `codegen_node` (which uses a fresh, zero-indent `CodegenState`).  Instead we search
+/// forward for the exact token text.
+///
+/// Falls back to `from` if `token` is not found — should never happen with a valid CST,
+/// but avoids a panic.
+fn find_token_start(source: &str, from: usize, token: &str) -> usize {
+    source[from..].find(token).map(|p| from + p).unwrap_or(from)
 }
 
 /// Find `codegen_text` in `source[cursor..]` with whitespace flexibility.
@@ -6397,6 +6420,126 @@ mod statement_deletion_tests {
                 m.operator
             );
         }
+    }
+
+    // --- Parenthesized string literal tests (lpar/rpar offset bug) ---
+
+    /// INV-1: source[start..end] == original for a parenthesized SimpleString.
+    ///
+    /// Regression test: before the fix, expr_start pointed at the opening `(`
+    /// while original was just the string token, so the splice was wrong.
+    #[test]
+    fn test_parenthesized_string_span_correctness() {
+        let source = "def f():\n    return (\n        \"hello\"\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+                let span_text = &fms[0].source[m.start..m.end];
+                assert_eq!(
+                    span_text, m.original,
+                    "INV-1 violated for operator {}: span [{},{}) = {:?}, original = {:?}",
+                    m.operator, m.start, m.end, span_text, m.original
+                );
+            }
+        }
+    }
+
+    /// INV-2: apply_mutation on a parenthesized string produces valid Python.
+    #[test]
+    fn test_parenthesized_string_parseable() {
+        let source = "def f():\n    return (\n        \"hello\"\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+                let mutated = apply_mutation(&fms[0].source, m);
+                assert!(
+                    parse_module(&mutated, None).is_ok(),
+                    "operator {} produced unparseable output:\n{}",
+                    m.operator,
+                    mutated
+                );
+            }
+        }
+    }
+
+    /// Triggering scenario: parenthesized string as a dict value.
+    /// httpx pattern: `ClientState.CLOSED: (\n    "Cannot reopen..."\n)`
+    #[test]
+    fn test_parenthesized_string_in_dict_value() {
+        let source = "def f():\n    return {\n        \"key\": (\n            \"Cannot reopen a client\"\n        ),\n    }\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let string_muts: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying")
+            .collect();
+        assert!(!string_muts.is_empty(), "Expected string mutations for parenthesized dict value");
+        for m in &string_muts {
+            // INV-1: span correctness
+            let span_text = &fms[0].source[m.start..m.end];
+            assert_eq!(span_text, m.original, "INV-1 violated for operator {}", m.operator);
+            // INV-2: produces valid Python
+            let mutated = apply_mutation(&fms[0].source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "operator {} produced unparseable output:\n{}",
+                m.operator,
+                mutated
+            );
+        }
+    }
+
+    /// Bare string (no parens) must still work — regression guard.
+    #[test]
+    fn test_bare_string_span_correctness_regression() {
+        let source = "def f():\n    x = \"hello world\"\n    return x\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+                let span_text = &fms[0].source[m.start..m.end];
+                assert_eq!(span_text, m.original, "Regression: bare string span wrong for operator {}", m.operator);
+            }
+        }
+    }
+
+    /// Parenthesized byte-string (prefix `b`).
+    #[test]
+    fn test_parenthesized_bytestring_span_correctness() {
+        let source = "def f():\n    return (\n        b\"bytes\"\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+                let span_text = &fms[0].source[m.start..m.end];
+                assert_eq!(span_text, m.original, "INV-1 violated for b-string in parens");
+                let mutated = apply_mutation(&fms[0].source, m);
+                assert!(
+                    parse_module(&mutated, None).is_ok(),
+                    "operator {} produced unparseable output:\n{}",
+                    m.operator,
+                    mutated
+                );
+            }
+        }
+    }
+
+    /// INV-3: Parenthesized string produces same number of mutations as bare string.
+    #[test]
+    fn test_parenthesized_string_same_mutation_count() {
+        let bare = "def f():\n    return \"hello\"\n";
+        let parens = "def f():\n    return (\n        \"hello\"\n    )\n";
+        let bare_fms = collect_file_mutations(bare);
+        let parens_fms = collect_file_mutations(parens);
+        let bare_count = bare_fms[0].mutations.iter().filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying").count();
+        let parens_count = parens_fms[0].mutations.iter().filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying").count();
+        assert_eq!(
+            bare_count, parens_count,
+            "INV-3: parenthesized string should produce same mutation count as bare string"
+        );
     }
 
     #[test]
