@@ -405,7 +405,17 @@ fn collect_small_statement_mutations(
     match stmt {
         SmallStatement::Return(ret) => {
             if let Some(ref val) = ret.value {
+                // Pre-find return text before recursing so we have the start position.
+                let ret_text = codegen_node(ret);
+                let ret_start = source[*cursor..].find(&ret_text).map(|p| *cursor + p);
+
                 collect_expr_mutations(val, source, cursor, mutations, ignored);
+
+                // Return value mutation: `return x → return None` or `return None → return ""`
+                if let Some(start) = ret_start {
+                    let val_text = codegen_node(val);
+                    add_return_value_mutation(&val_text, &ret_text, start, mutations);
+                }
             }
         }
         SmallStatement::Expr(e) => {
@@ -879,6 +889,38 @@ fn add_assignment_mutation_at(
     }
     let new_full = format!("{}{}", &assign_text[..targets_len], replacement);
     record_mutation(assign_text, &new_full, "assignment_mutation", start, mutations);
+}
+
+/// Return value mutation: `return x → return None` or `return None → return ""`.
+///
+/// The mutation span covers only the value portion of the return statement, not the
+/// `return` keyword itself.  `val_text` is `codegen_node(val)`, `ret_text` is
+/// `codegen_node(ret)` (the full "return <value>" text), and `ret_start` is the byte
+/// offset of the return statement in the function source.
+fn add_return_value_mutation(
+    val_text: &str,
+    ret_text: &str,
+    ret_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let replacement = if val_text.trim() == "None" { "\"\"" } else { "None" };
+
+    // Locate the value within ret_text by skipping "return" + whitespace.
+    let return_kw_len = "return".len();
+    if ret_text.len() <= return_kw_len {
+        return; // malformed
+    }
+    let after_return = &ret_text[return_kw_len..];
+    let ws_len = after_return.len() - after_return.trim_start().len();
+    let val_offset = return_kw_len + ws_len;
+
+    // Safety: verify the value fits within the return text.
+    if val_offset + val_text.len() > ret_text.len() {
+        return;
+    }
+
+    let val_start = ret_start + val_offset;
+    record_mutation(val_text, replacement, "return_value", val_start, mutations);
 }
 
 /// AugAssign operator swap: += → -=, etc.
@@ -3677,5 +3719,130 @@ mod keyword_swap_tests {
             // end in bounds
             assert!(m.end <= fm.source.len(), "end must be <= source length");
         }
+    }
+}
+
+#[cfg(test)]
+mod return_value_tests {
+    use super::*;
+
+    fn return_value_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "return_value")
+            .collect()
+    }
+
+    // INV-1: `return a + b` → mutation replaces "a + b" with "None"
+    #[test]
+    fn test_return_expr_to_none() {
+        let source = "def f(a, b):\n    return a + b\n";
+        let muts = return_value_mutations(source);
+        assert_eq!(muts.len(), 1, "return expr must produce exactly 1 return_value mutation");
+        assert_eq!(muts[0].replacement, "None");
+        assert_eq!(muts[0].original, "a + b");
+    }
+
+    // INV-2: `return None` → mutation replaces "None" with `""`
+    #[test]
+    fn test_return_none_to_empty_string() {
+        let source = "def f():\n    return None\n";
+        let muts = return_value_mutations(source);
+        assert_eq!(muts.len(), 1, "return None must produce exactly 1 return_value mutation");
+        assert_eq!(muts[0].replacement, "\"\"");
+        assert_eq!(muts[0].original, "None");
+    }
+
+    // INV-3: `return 42` → mutation replaces "42" with "None"
+    #[test]
+    fn test_return_constant_to_none() {
+        let source = "def f():\n    return 42\n";
+        let muts = return_value_mutations(source);
+        assert_eq!(muts.len(), 1, "return 42 must produce exactly 1 return_value mutation");
+        assert_eq!(muts[0].replacement, "None");
+        assert_eq!(muts[0].original, "42");
+    }
+
+    // INV-4: `return "hello"` → mutation replaces `"hello"` with "None"
+    #[test]
+    fn test_return_string_to_none() {
+        let source = "def f():\n    return \"hello\"\n";
+        let muts = return_value_mutations(source);
+        assert_eq!(muts.len(), 1, "return string must produce exactly 1 return_value mutation");
+        assert_eq!(muts[0].replacement, "None");
+        assert_eq!(muts[0].original, "\"hello\"");
+    }
+
+    // INV-5: bare `return` (no value) → no return_value mutation
+    #[test]
+    fn test_bare_return_no_mutation() {
+        // bare return needs something else to produce a mutation so the function is collected
+        let source = "def f(a, b):\n    if a > b:\n        return\n    return a + b\n";
+        let muts = return_value_mutations(source);
+        // Should get exactly one return_value mutation (from `return a + b`), not from bare `return`
+        assert_eq!(muts.len(), 1, "bare return must not emit a return_value mutation");
+        assert_eq!(muts[0].original, "a + b");
+    }
+
+    // INV-6: `return a + b` → produces BOTH return_value AND binop_swap mutations
+    #[test]
+    fn test_return_value_coexists_with_binop() {
+        let source = "def f(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let rv: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "return_value").collect();
+        let binop: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert!(!rv.is_empty(), "must have return_value mutation");
+        assert!(!binop.is_empty(), "must also have binop_swap mutation");
+    }
+
+    // INV-7: All return_value mutations produce syntactically valid Python
+    #[test]
+    fn test_return_value_parseable() {
+        let cases = [
+            "def f(a, b):\n    return a + b\n",
+            "def f():\n    return None\n",
+            "def f():\n    return 42\n",
+            "def f():\n    return \"hello\"\n",
+            "def f(a, b):\n    return a and b\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "return_value") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "return_value mutation '{}' → '{}' produced unparseable Python:\n{}",
+                        m.original,
+                        m.replacement,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-8: Mutation span covers only the value, not the `return` keyword
+    #[test]
+    fn test_return_value_span_correctness() {
+        let source = "def f(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let m = fm.mutations.iter().find(|m| m.operator == "return_value").unwrap();
+
+        // The span text must equal the original
+        assert_eq!(&fm.source[m.start..m.end], m.original.as_str());
+
+        // The span must NOT include "return"
+        let before_span = &fm.source[..m.start];
+        assert!(
+            before_span.ends_with("return "),
+            "the text before the value span must end with 'return ', got: {:?}",
+            before_span
+        );
     }
 }

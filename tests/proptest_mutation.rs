@@ -329,6 +329,26 @@ fn arg_removal_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// Generate Python functions with various return expressions.
+///
+/// Covers: expression with binary operator, integer constant, None literal, string literal,
+/// and boolean expression — exercising `add_return_value_mutation` for all value types.
+fn return_value_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["binop", "constant", "none", "string_lit", "boolop"]);
+    let op = arith_ops();
+    let v1 = int_vals();
+    let v2 = int_vals();
+
+    (kind, op, v1, v2).prop_map(|(kind, op, v1, v2)| match kind {
+        "binop" => format!("def f(x):\n    return x {op} {v1}\n"),
+        "constant" => format!("def f():\n    return {v1}\n"),
+        "none" => "def f():\n    return None\n".to_string(),
+        "string_lit" => format!("def f():\n    return \"{v1}\"\n"),
+        "boolop" => format!("def f(a, b):\n    return a {op} {v2}\n"),
+        _ => unreachable!(),
+    })
+}
+
 /// Helper: check all core invariants for a set of FunctionMutations.
 ///
 /// Used by tests that only need to verify offsets/content, not generator status.
@@ -997,6 +1017,66 @@ proptest! {
             arg_removal_count >= 2,
             "2-arg call must produce at least 2 arg_removal mutations, got {}; source:\n{source}",
             arg_removal_count
+        );
+    }
+
+    // --- Return value tests ---
+
+    /// Return value sources satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches offset bugs in `add_return_value_mutation` — the value span must be
+    /// byte-exact within the function source and the original text must match the slice.
+    #[test]
+    fn return_value_all_invariants(source in return_value_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Return value sources produce at least one return_value mutation.
+    ///
+    /// Guards against the return_value arm being silently skipped: all variants in
+    /// `return_value_strategy()` have a non-bare return, so at least one mutation must fire.
+    #[test]
+    fn return_value_has_mutations(source in return_value_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "return_value")
+            .count();
+        prop_assert!(
+            total > 0,
+            "return value source must produce at least one return_value mutation; source:\n{}",
+            source
+        );
+    }
+
+    /// INV-extra: return with a non-None value always produces exactly 1 return_value mutation.
+    ///
+    /// Each return statement has at most one value, so there must be exactly one return_value
+    /// mutation per return-with-value.  More would indicate a double-emit bug.
+    #[test]
+    fn return_value_non_none_exactly_one(source in return_value_strategy()) {
+        // Skip the `none` variant (returns None, which is still mutated — just to "")
+        // but this test focuses on non-None values where replacement is "None".
+        let fms = collect_file_mutations(&source);
+        let rv_to_none: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "return_value" && m.replacement == "None")
+            .count();
+        let rv_to_empty: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "return_value" && m.replacement == "\"\"")
+            .count();
+        // There must be exactly one return_value mutation total (one return per function).
+        let total_rv = rv_to_none + rv_to_empty;
+        prop_assert_eq!(
+            total_rv,
+            1usize,
+            "single return-with-value must produce exactly 1 return_value mutation; source:\n{}",
+            source
         );
     }
 }
