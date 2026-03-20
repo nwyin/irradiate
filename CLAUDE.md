@@ -94,11 +94,9 @@ irradiate/
 ├── vendor/
 │   └── mutmut/             # reference implementation (git clone, not modified)
 └── docs/
-    ├── design.md           # architecture and design doc
-    └── roadmap.md          # gaps, decisions, and priority order
+    └── design.md           # architecture, design rationale, and execution model
 ```
 
 ## Design docs
 
 - `docs/design.md` — full architecture and design rationale
-- `docs/roadmap.md` — current gaps, design decisions, and priority order

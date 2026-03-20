@@ -2,7 +2,7 @@
 
 Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).
 
-> This document describes the target architecture and design direction. For current gaps, design decisions, and follow-up work, see `docs/roadmap.md`.
+> This document describes the architecture and design direction. Remaining work is tracked in GitHub issues.
 
 ## Why
 
@@ -363,25 +363,49 @@ Correctness is validated by running both tools against the same projects and dif
 - Real-world projects for stress testing: a Django app, a data pipeline, a CLI tool
 - For each: run mutmut, run irradiate, diff the mutant names and exit codes
 
+## Worker execution model
+
+Two user-visible execution modes:
+
+- **Default worker-pool mode** (warm session + hook-driven execution): keep a pytest session alive inside each worker, collect once, then execute pre-collected items via pytest's hook machinery (`pytest_runtest_protocol`, `pytest_runtest_logreport`) for each mutant. This is closest to how `pytest-xdist` workers behave.
+- **`--isolate` mode**: run each mutant in a fresh subprocess for maximum correctness at the cost of startup overhead.
+
+### Why warm sessions
+
+On a typical project with 200ms pytest startup and 1000 mutants:
+- **Subprocess per mutant**: 1000 × 200ms = 200 seconds of pure startup overhead
+- **Warm session**: 1 × 200ms + 1000 × (test time only) ≈ 200ms + test time
+- For fast tests (50ms each), this is the difference between 250s and 50s — a 5× speedup
+
+### State isolation in warm sessions
+
+Three layers of defense against state leakage:
+
+1. **Module state snapshot/restore**: between mutant runs, the worker snapshots `vars()` of all source-under-test modules and restores them after each run. Warning registries are also cleared.
+2. **Session-fixture detection + auto-tuned recycling**: when session-scoped fixtures are detected, the orchestrator reduces the recycling interval (100 → 20). Workers are recycled via `--worker-recycle-after`.
+3. **`--verify-survivors`**: after warm-session testing, re-tests all survived mutants in `--isolate` mode. Result discrepancies are corrected and the cache is updated.
+
+Residual risk: deep mutations to mutable module-level objects (dict/list contents) are not caught by shallow snapshot/restore. Selective `importlib.reload()` is tracked as future work (GitHub #7).
+
+### Future option: fork-snapshot backend
+
+A Unix-only alternative: `fork()` a child per mutant from a warm collected parent. The parent never accumulates post-run state. Not implemented — warm-session + recycling + verify-survivors has been sufficient. Would revisit if real-world suites show too much leakage.
+
 ## Risks and mitigations
 
-**Test state leakage in worker pool**: Reusing a pytest process means global state from one test run could affect the next. Mitigations:
-- Respawn workers every N mutants (configurable, default 100)
-- `--isolate` flag falls back to one-shot workers (subprocess per mutant)
-- `-x` fail-fast means most runs touch minimal state
-- Workers can optionally create fresh pytest sessions between runs (more overhead, better isolation)
+**Test state leakage in worker pool**: Mitigated by module snapshot/restore, auto-tuned recycling, and `--verify-survivors`. See "State isolation in warm sessions" above.
 
 **libcst Rust crate gaps**: The Rust crate may not cover all Python syntax that the Python LibCST handles. Mitigations:
 - Fall back to copying files unchanged when parsing fails (same as mutmut)
 - Track which syntax constructs cause parse failures, file issues upstream
 - The libcst Rust crate is the same parser that powers the Python LibCST — it's actively maintained and handles Python 3.0-3.14
 
-**pytest internal state accumulation**: Fixtures and plugins may accumulate state across runs within a single worker. Mitigations:
-- Reset session state between runs
-- Monitor worker memory usage, respawn if it grows beyond a threshold
-- Document known incompatible pytest plugins
+**Plugin compatibility**: Some pytest plugins assume one session = one logical run, or accumulate mutable state. Mitigations:
+- Worker recycling bounds accumulation
+- `--isolate` as a fallback for incompatible suites
+- Systematic plugin compatibility testing planned (GitHub #11)
 
-**Cache correctness**: A bad hash function could cause false cache hits (reusing results for changed code). Mitigations:
+**Cache correctness**: A bad hash function could cause false cache hits. Mitigations:
 - Use SHA-256 for content hashing
 - Include the irradiate version in the cache key (operator changes invalidate cache)
 - Cache entries are never updated, only created — eliminates race conditions
