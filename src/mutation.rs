@@ -4988,4 +4988,116 @@ mod exception_type_tests {
             "source slice must equal mutation original"
         );
     }
+
+    #[test]
+    fn test_bare_then_typed_handler() {
+        // Bare except in one try block, typed except in a separate try block.
+        // The bare except cursor advance must not discard the typed handler in the second block.
+        // Since each try block calls add_exception_type_mutations independently, the cursor for
+        // the second block (cursor_before_2) is derived from the structural cursor after the
+        // first block. Exactly 1 exception_type mutation (on ValueError) must be emitted.
+        let source = concat!(
+            "def f(x):\n",
+            "    try:\n",
+            "        return x + 1\n",
+            "    except:\n",
+            "        pass\n",
+            "    try:\n",
+            "        return x + 2\n",
+            "    except ValueError:\n",
+            "        return 0\n",
+        );
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "exactly one exception_type mutation expected (from the second try block)");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "ValueError");
+        assert_eq!(&fm.source[m.start..m.end], "ValueError");
+    }
+
+    #[test]
+    fn test_two_typed_handlers() {
+        // Two typed handlers in the same try block — one for ValueError, one for TypeError.
+        // Each must produce an independent exception_type mutation.
+        let source = concat!(
+            "def f(x):\n",
+            "    try:\n",
+            "        return x + 1\n",
+            "    except ValueError:\n",
+            "        return 0\n",
+            "    except TypeError:\n",
+            "        return -1\n",
+        );
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "exactly two exception_type mutations expected");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"ValueError"), "ValueError must be mutated");
+        assert!(originals.contains(&"TypeError"), "TypeError must be mutated");
+        // Each mutation must point to a distinct position in the source.
+        assert_ne!(pairs[0].1.start, pairs[1].1.start, "mutations must target different source positions");
+        for (fm, m) in &pairs {
+            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+        }
+    }
+
+    #[test]
+    fn test_three_handlers_mixed() {
+        // Three typed handlers — ValueError, TypeError, Exception.
+        // Exception is already the broadest type and must be skipped.
+        // Exactly 2 exception_type mutations must be emitted (for ValueError and TypeError).
+        let source = concat!(
+            "def f(x):\n",
+            "    try:\n",
+            "        return x\n",
+            "    except ValueError:\n",
+            "        return 1\n",
+            "    except TypeError:\n",
+            "        return 2\n",
+            "    except Exception:\n",
+            "        return 3\n",
+        );
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "Exception handler must be skipped; exactly 2 mutations expected");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"ValueError"), "ValueError must be mutated");
+        assert!(originals.contains(&"TypeError"), "TypeError must be mutated");
+        assert!(!originals.contains(&"Exception"), "Exception must not be mutated");
+        // Mutations must target distinct, increasing positions (cursor advances forward).
+        assert!(
+            pairs[0].1.start < pairs[1].1.start,
+            "mutations must be ordered by source position"
+        );
+        for (fm, m) in &pairs {
+            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+        }
+    }
+
+    #[test]
+    fn test_duplicate_handlers_distinct_positions() {
+        // Two handlers of the same exception type in the same try block.
+        // Python allows this (the second is unreachable); libcst parses it fine.
+        // The sub-cursor must advance PAST the first handler before searching for the second,
+        // so both mutations must point to distinct positions.
+        // Regression: if cursor goes backward after the first handler, it re-finds the first
+        // handler for the second — both mutations collapse to the same span.
+        let source = concat!(
+            "def f(x):\n",
+            "    try:\n",
+            "        return x + 1\n",
+            "    except ValueError:\n",
+            "        return 0\n",
+            "    except ValueError:\n",
+            "        return -1\n",
+        );
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "two exception_type mutations expected (one per handler)");
+        // The two mutations must point to different byte offsets in the source.
+        assert_ne!(
+            pairs[0].1.start,
+            pairs[1].1.start,
+            "cursor must advance past first handler before searching for second (distinct positions required)"
+        );
+        for (fm, m) in &pairs {
+            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+        }
+    }
 }
