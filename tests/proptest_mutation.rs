@@ -244,7 +244,40 @@ const METHOD_SWAP_KEYS: &[&str] = &[
     "lower", "upper", "lstrip", "rstrip", "find", "rfind",
     "ljust", "rjust", "index", "rindex",
     "removeprefix", "removesuffix", "partition", "rpartition",
+    // split/rsplit are conditional — only appear when maxsplit is present.
+    "split", "rsplit",
 ];
+
+/// Generate Python source with split/rsplit calls.
+///
+/// Covers three arg-count variants:
+/// - 2 positional args (separator + maxsplit literal): must produce a method_swap mutation.
+/// - 1 positional arg (separator only): must NOT produce a method_swap mutation.
+/// - 1 positional arg + maxsplit kwarg: must produce a method_swap mutation.
+///
+/// The `no_swap` variant (1 positional arg) is the critical negative case: without maxsplit,
+/// split and rsplit return the same result, so swapping them is not a meaningful mutation.
+fn split_swap_strategy() -> impl Strategy<Value = (String, bool)> {
+    let method = prop::sample::select(vec!["split", "rsplit"]);
+    let kind = prop::sample::select(vec!["two_pos_args", "one_pos_arg", "maxsplit_kwarg"]);
+    let sep = prop::sample::select(vec!["\",\"", "\" \"", "\":\""]);
+
+    (method, kind, sep).prop_map(|(method, kind, sep)| match kind {
+        // 2 positional args → condition met → must produce a method_swap mutation.
+        "two_pos_args" => (
+            format!("def f(s):\n    return s.{method}({sep}, 1)\n"),
+            true,
+        ),
+        // 1 positional arg only → condition not met → must NOT produce a method_swap mutation.
+        "one_pos_arg" => (format!("def f(s):\n    return s.{method}({sep})\n"), false),
+        // maxsplit kwarg → condition met → must produce a method_swap mutation.
+        "maxsplit_kwarg" => (
+            format!("def f(s):\n    return s.{method}({sep}, maxsplit=1)\n"),
+            true,
+        ),
+        _ => unreachable!(),
+    })
+}
 
 /// Generate Python source containing lambda expressions inside function bodies.
 ///
@@ -1183,5 +1216,72 @@ proptest! {
             "each loop with a single break/continue must produce exactly 1 keyword_swap mutation; source:\n{}",
             source
         );
+    }
+
+    // --- Conditional split/rsplit swap tests ---
+
+    /// INV: split/rsplit with maxsplit involved satisfies all core invariants (INV-2..5)
+    /// AND the structural invariant: method_swap span is preceded by `.`.
+    ///
+    /// The conditional check (2 positional args or maxsplit kwarg) must produce a
+    /// method_swap mutation with a correctly computed byte offset.  If the offset
+    /// calculation reuses a text heuristic instead of the structural rfind('.'),
+    /// a source like `split.split(",", 1)` (object == method name) would produce
+    /// the wrong span.
+    #[test]
+    fn split_swap_all_invariants((source, _should_swap) in split_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+        for fm in &fms {
+            for m in &fm.mutations {
+                if m.operator == "method_swap" && (m.original == "split" || m.original == "rsplit") {
+                    prop_assert!(
+                        m.start > 0,
+                        "method_swap start ({}) must be > 0; source={:?}",
+                        m.start,
+                        source
+                    );
+                    prop_assert_eq!(
+                        fm.source.as_bytes()[m.start - 1],
+                        b'.',
+                        "method_swap for split/rsplit at offset {} must be preceded by '.'; source={:?}",
+                        m.start,
+                        source
+                    );
+                }
+            }
+        }
+    }
+
+    /// INV-extra: split/rsplit with <2 positional args and no maxsplit kwarg produces
+    /// 0 method_swap mutations — the conditional guard must suppress the swap.
+    ///
+    /// Without maxsplit, `s.split(",")` and `s.rsplit(",")` return the same result,
+    /// so swapping them is not a meaningful mutation.  A missing guard would produce
+    /// a spurious mutation that never kills any test.
+    #[test]
+    fn split_no_maxsplit_produces_no_method_swap((source, should_swap) in split_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let swap_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| {
+                m.operator == "method_swap" && (m.original == "split" || m.original == "rsplit")
+            })
+            .count();
+
+        if should_swap {
+            prop_assert!(
+                swap_count >= 1,
+                "split/rsplit with maxsplit must produce at least 1 method_swap mutation; source:\n{}",
+                source
+            );
+        } else {
+            prop_assert_eq!(
+                swap_count, 0,
+                "split/rsplit without maxsplit must produce 0 method_swap mutations; source:\n{}",
+                source
+            );
+        }
     }
 }

@@ -1140,6 +1140,11 @@ static METHOD_SWAPS: &[(&str, &str)] = &[
     ("rpartition", "partition"),
 ];
 
+/// Conditional method swaps: split ↔ rsplit, but only when a maxsplit argument is present.
+/// Without maxsplit, split and rsplit produce identical results, so swapping them is not
+/// a meaningful mutation.
+static CONDITIONAL_METHOD_SWAPS: &[(&str, &str)] = &[("split", "rsplit"), ("rsplit", "split")];
+
 fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec<Mutation>) {
     if let Expression::Attribute(attr) = &*call.func {
         let method_text = codegen_node(&attr.attr);
@@ -1158,6 +1163,29 @@ fn add_method_mutations(call: &cst::Call, expr_start: usize, mutations: &mut Vec
                 let leading_ws = after_dot.len() - after_dot.trim_start().len();
                 let method_start = dot_pos + 1 + leading_ws;
                 record_mutation(from, to, "method_swap", expr_start + method_start, mutations);
+                break;
+            }
+        }
+
+        // Conditional split ↔ rsplit: only swap when maxsplit is involved.
+        // split(",") and rsplit(",") always produce the same result, so swapping them is
+        // only a meaningful mutation when a maxsplit argument is present.
+        for &(from, to) in CONDITIONAL_METHOD_SWAPS {
+            if method_trimmed == from {
+                let positional_count = call.args.iter().filter(|a| a.keyword.is_none()).count();
+                let has_maxsplit_kwarg = call
+                    .args
+                    .iter()
+                    .any(|a| a.keyword.as_ref().is_some_and(|kw| kw.value == "maxsplit"));
+                if positional_count == 2 || has_maxsplit_kwarg {
+                    let func_text = codegen_node(&*call.func);
+                    let dot_pos =
+                        func_text.rfind('.').expect("Attribute node always contains a dot");
+                    let after_dot = &func_text[dot_pos + 1..];
+                    let leading_ws = after_dot.len() - after_dot.trim_start().len();
+                    let method_start = dot_pos + 1 + leading_ws;
+                    record_mutation(from, to, "method_swap", expr_start + method_start, mutations);
+                }
                 break;
             }
         }
@@ -4136,5 +4164,152 @@ mod return_value_tests {
             "the text before the value span must end with 'return ', got: {:?}",
             before_span
         );
+    }
+}
+
+// --- Conditional split/rsplit method swap tests ---
+#[cfg(test)]
+mod split_swap_tests {
+    use super::*;
+
+    #[test]
+    fn test_split_with_maxsplit_mutated() {
+        let source = "def foo(s):\n    return s.split(\",\", 1)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .expect("split with 2 positional args must produce a method_swap mutation");
+        assert_eq!(m.original, "split");
+        assert_eq!(m.replacement, "rsplit");
+    }
+
+    #[test]
+    fn test_rsplit_with_maxsplit_mutated() {
+        let source = "def foo(s):\n    return s.rsplit(\",\", 1)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .expect("rsplit with 2 positional args must produce a method_swap mutation");
+        assert_eq!(m.original, "rsplit");
+        assert_eq!(m.replacement, "split");
+    }
+
+    #[test]
+    fn test_split_with_maxsplit_kwarg() {
+        let source = "def foo(s):\n    return s.split(\",\", maxsplit=1)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .expect("split with maxsplit kwarg must produce a method_swap mutation");
+        assert_eq!(m.original, "split");
+        assert_eq!(m.replacement, "rsplit");
+    }
+
+    #[test]
+    fn test_rsplit_with_maxsplit_kwarg() {
+        let source = "def foo(s):\n    return s.rsplit(\",\", maxsplit=1)\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "method_swap")
+            .expect("rsplit with maxsplit kwarg must produce a method_swap mutation");
+        assert_eq!(m.original, "rsplit");
+        assert_eq!(m.replacement, "split");
+    }
+
+    // INV: split/rsplit with exactly 1 positional arg and no maxsplit kwarg must NOT produce
+    // a method_swap mutation — without maxsplit the two calls are semantically identical.
+    #[test]
+    fn test_split_one_arg_not_mutated() {
+        let source = "def foo(s):\n    return s.split(\",\")\n";
+        let fms = collect_file_mutations(source);
+        let method_muts: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "method_swap")
+            .collect();
+        assert!(method_muts.is_empty(), "split with 1 arg must not produce a method_swap mutation");
+    }
+
+    #[test]
+    fn test_split_no_args_not_mutated() {
+        let source = "def foo(s):\n    return s.split()\n";
+        let fms = collect_file_mutations(source);
+        let method_muts: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "method_swap")
+            .collect();
+        assert!(method_muts.is_empty(), "split with no args must not produce a method_swap mutation");
+    }
+
+    // INV: split/rsplit mutation span is structurally correct — character before start is '.'.
+    #[test]
+    fn test_split_swap_span_correctness() {
+        let cases = [
+            "def foo(s):\n    return s.split(\",\", 1)\n",
+            "def foo(s):\n    return s.rsplit(\",\", 1)\n",
+            "def foo(s):\n    return s.split(\",\", maxsplit=1)\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in &fm.mutations {
+                    if m.operator == "method_swap" && (m.original == "split" || m.original == "rsplit") {
+                        assert_eq!(
+                            &fm.source[m.start..m.end],
+                            m.original,
+                            "span must cover the method name in {:?}",
+                            source
+                        );
+                        assert!(m.start > 0, "method_swap start must be > 0");
+                        assert_eq!(
+                            fm.source.as_bytes()[m.start - 1],
+                            b'.',
+                            "character before method span must be a dot in {:?}",
+                            source
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // INV: apply_mutation on a split/rsplit swap produces syntactically valid Python
+    // (i.e., only the method name changes, all parens and args are preserved).
+    #[test]
+    fn test_split_swap_parseable() {
+        let cases = [
+            ("def foo(s):\n    return s.split(\",\", 1)\n", "split", "rsplit"),
+            ("def foo(s):\n    return s.rsplit(\",\", 1)\n", "rsplit", "split"),
+        ];
+        for (source, original, replacement) in &cases {
+            let fms = collect_file_mutations(source);
+            let m = fms[0]
+                .mutations
+                .iter()
+                .find(|m| m.operator == "method_swap" && m.original == *original)
+                .expect("must find method_swap mutation");
+            let mutated = apply_mutation(&fms[0].source, m);
+            assert!(
+                mutated.contains(replacement),
+                "mutated source must contain replacement method name {:?}: got {:?}",
+                replacement,
+                mutated
+            );
+            // The parens and arguments must still be present.
+            assert!(
+                mutated.contains("(\",\", 1)"),
+                "mutated source must preserve call arguments: got {:?}",
+                mutated
+            );
+        }
     }
 }
