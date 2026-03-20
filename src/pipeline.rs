@@ -137,7 +137,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
         &pythonpath,
         &mutants_dir,
         &config.tests_dir,
-    )?;
+    )
+    .await?;
     eprintln!("  done");
 
     eprintln!("Running forced-fail validation...");
@@ -147,7 +148,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
         &pythonpath,
         &mutants_dir,
         &config.tests_dir,
-    )?;
+    )
+    .await?;
     eprintln!("  done");
 
     // Phase 4: Mutation testing
@@ -217,7 +219,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &pythonpath,
             &mutants_dir,
             &config.tests_dir,
-        )?;
+        )
+        .await?;
         work_items
             .into_iter()
             .map(|mut item| {
@@ -526,6 +529,11 @@ const DEFAULT_SUBPROCESS_TIMEOUT_SECS: f64 = 30.0;
 /// If the estimated test duration is sub-second we must not let the multiplied timeout
 /// drop below this floor, or every mutant will time out before pytest even collects.
 const MIN_ISOLATED_TIMEOUT_SECS: f64 = 10.0;
+
+/// Timeout (seconds) for validation subprocess calls (validate_clean_run, validate_fail_run,
+/// discover_tests). If pytest hangs during validation, the pipeline would block indefinitely
+/// without this ceiling.
+const VALIDATION_TIMEOUT_SECS: u64 = 120;
 
 /// Run each mutant in a fresh subprocess, sequentially.
 ///
@@ -846,14 +854,14 @@ fn path_to_module(rel_path: &Path) -> String {
     s.strip_suffix(".__init__").unwrap_or(&s).to_string()
 }
 
-fn validate_clean_run(
+async fn validate_clean_run(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<()> {
-    let output = std::process::Command::new(python)
+    let mut child = tokio::process::Command::new(python)
         .arg("-m")
         .arg("pytest")
         .arg("-x")
@@ -864,26 +872,65 @@ fn validate_clean_run(
         .env("PYTHONPATH", pythonpath)
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .current_dir(project_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("Failed to run clean test")?;
 
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Collect I/O in background tasks so we can still kill child on timeout.
+    // (wait_with_output() moves child, making kill() impossible after timeout.)
+    let stdout_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stdout.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+            buf
+        })
+    };
+    let stderr_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+            buf
+        })
+    };
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => bail!("Clean test validation subprocess error: {e}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("Clean test validation timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
+        }
+    };
+
+    if !status.success() {
+        let stdout_bytes = stdout_task.await.unwrap_or_default();
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         bail!("Clean test run failed:\n{stdout}\n{stderr}");
     }
 
     Ok(())
 }
 
-fn validate_fail_run(
+async fn validate_fail_run(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<()> {
-    let output = std::process::Command::new(python)
+    let mut child = tokio::process::Command::new(python)
         .arg("-m")
         .arg("pytest")
         .arg("-x")
@@ -895,27 +942,73 @@ fn validate_fail_run(
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_ACTIVE_MUTANT", "fail")
         .current_dir(project_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("Failed to run forced-fail validation")?;
 
-    if output.status.success() {
-        bail!(
-            "Forced-fail validation failed: tests passed when they should have failed. \
-             The trampoline may not be wired correctly."
-        );
-    }
+    // Collect I/O in background tasks so we can still kill child on timeout.
+    let stdout_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stdout.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+            buf
+        })
+    };
+    let stderr_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+            buf
+        })
+    };
 
-    Ok(())
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => bail!("Forced-fail validation subprocess error: {e}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("Forced-fail validation timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
+        }
+    };
+
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let exit_code = status.code().unwrap_or(-1);
+    match exit_code {
+        0 => bail!(
+            "Forced-fail validation failed: tests passed when they should have failed.\n\
+             The trampoline may not be wired correctly.\n\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        ),
+        5 => bail!(
+            "Forced-fail validation failed: no tests were collected (exit code 5).\n\
+             This does not confirm the trampoline is wired — the test suite may be empty or misconfigured.\n\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        ),
+        _ => Ok(()), // 1, 2, etc. — tests failed, which is what we want
+    }
 }
 
-fn discover_tests(
+async fn discover_tests(
     python: &Path,
     project_dir: &Path,
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<Vec<String>> {
-    let output = std::process::Command::new(python)
+    let mut child = tokio::process::Command::new(python)
         .arg("-m")
         .arg("pytest")
         .arg("--collect-only")
@@ -926,10 +1019,47 @@ fn discover_tests(
         .env("PYTHONPATH", pythonpath)
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .current_dir(project_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("Failed to collect tests")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Collect stdout in background task so we can still kill child on timeout.
+    let stdout_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stdout.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+            buf
+        })
+    };
+    // Drain stderr to avoid blocking the subprocess on a full pipe buffer.
+    let _stderr_task = {
+        use tokio::io::AsyncReadExt;
+        let mut stream = child.stderr.take().unwrap();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.ok();
+        })
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(_status)) => {}
+        Ok(Err(e)) => bail!("Test discovery subprocess error: {e}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("Test discovery timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
+        }
+    }
+
+    let stdout_bytes = stdout_task.await.unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let tests: Vec<String> = stdout
         .lines()
         .filter(|line| line.contains("::"))
@@ -2021,15 +2151,15 @@ mod tests {
     }
 
     /// INV-4: validate_clean_run returns Ok when all tests pass.
-    #[test]
-    fn test_validate_clean_run_passing_project() {
+    #[tokio::test]
+    async fn test_validate_clean_run_passing_project() {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
         let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests");
+        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
             result.is_ok(),
             "Clean project should pass validate_clean_run: {result:?}"
@@ -2037,8 +2167,8 @@ mod tests {
     }
 
     /// validate_clean_run returns Err when any test fails.
-    #[test]
-    fn test_validate_clean_run_fails_for_failing_tests() {
+    #[tokio::test]
+    async fn test_validate_clean_run_fails_for_failing_tests() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
         std::fs::write(
@@ -2053,22 +2183,22 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
             result.is_err(),
             "Project with failing tests should return Err from validate_clean_run"
         );
     }
 
-    /// INV: validate_fail_run returns Ok when the harness correctly makes tests fail
+    /// INV-3: validate_fail_run returns Ok when the harness correctly makes tests fail
     /// under IRRADIATE_ACTIVE_MUTANT=fail. This confirms the trampoline is wired.
     ///
     /// The `fail` sentinel is checked inside the generated trampoline code, which lives
     /// in the mutants dir. We must generate real mutants first so the import hook finds
     /// the trampoline; an empty mutants dir would leave the original source in place and
     /// the fail check would never run (tests would pass, causing validate_fail_run to Err).
-    #[test]
-    fn test_validate_fail_run_harness_kills_tests() {
+    #[tokio::test]
+    async fn test_validate_fail_run_harness_kills_tests() {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
@@ -2079,78 +2209,92 @@ mod tests {
         generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[])
             .expect("mutant generation should succeed for fixture");
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests");
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
             result.is_ok(),
             "validate_fail_run should succeed (harness must cause failure under active_mutant='fail'): {result:?}"
         );
     }
 
-    /// INV-1: validate_fail_run returns Err when mutants_dir is empty (no trampoline code).
+    /// INV-1: validate_fail_run returns Err when pytest exits 0 (tests passed — broken trampoline).
     ///
-    /// Without generated trampoline code in mutants/, the import hook finds nothing and
-    /// Python loads the original source. The `active_mutant="fail"` sentinel never fires
-    /// because no trampoline checks it, so tests pass normally — validate_fail_run must
-    /// catch this and return Err.
-    #[test]
-    fn test_validate_fail_run_bails_without_trampoline() {
+    /// With an empty mutants dir, the trampoline `if active == 'fail': raise …` code is never
+    /// imported, so tests pass normally. Exit code 0 means the trampoline isn't wired.
+    #[tokio::test]
+    async fn test_validate_fail_run_errors_on_exit_code_0() {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
         let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        // Empty mutants dir — no trampoline code, so tests will pass under active_mutant=fail
+        let tmp_mutants = tempfile::tempdir().unwrap();
 
-        // Empty mutants dir — no trampoline code generated.
-        let empty_mutants = tempfile::tempdir().unwrap();
-
-        let result = validate_fail_run(&python, &fixture, &pythonpath, empty_mutants.path(), "tests");
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
             result.is_err(),
-            "validate_fail_run must return Err when no trampoline is present (tests would pass)"
+            "Empty mutants dir means tests pass → should Err (exit code 0 detected)"
         );
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("trampoline") || err_msg.contains("wired"),
-            "Error should mention trampoline or wiring: {err_msg}"
+            msg.contains("tests passed when they should have failed"),
+            "Error should mention trampoline not wired: {msg}"
         );
     }
 
-    /// Documents exit-code-5 behavior: pytest exits 5 (no tests collected) when the test
-    /// directory is empty. Currently validate_fail_run treats any non-zero exit as success
-    /// (trampoline fired), so this returns Ok(()). This test pins the current semantics —
-    /// if exit-code semantics are tightened later, update this test accordingly.
-    #[test]
-    fn test_validate_fail_run_bails_with_no_test_files() {
+    /// INV-2: validate_fail_run returns Err when pytest exits 5 (no tests collected).
+    ///
+    /// Exit code 5 does NOT confirm the trampoline works — it just means no tests ran.
+    #[tokio::test]
+    async fn test_validate_fail_run_errors_on_exit_code_5() {
+        // Create a project with no test files — pytest will exit 5
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join("src")).unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
-        // Write a trivial source file so generate_mutants has something to process.
-        std::fs::write(
-            project.path().join("src/trivial.py"),
-            "def add(a, b):\n    return a + b\n",
-        )
-        .unwrap();
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &project.path().join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
-        generate_mutants(&project.path().join("src"), tmp_mutants.path(), &[])
-            .expect("mutant generation should succeed");
 
-        // tests/ is empty — pytest exits 5 (no tests collected). Any non-zero exit
-        // currently counts as "tests failed → trampoline wired → Ok".
-        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
-            result.is_ok(),
-            "With no tests, pytest exits 5 (non-zero), which currently counts as Ok: {result:?}"
+            result.is_err(),
+            "No tests collected (exit 5) should Err, not silently succeed"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no tests were collected") || msg.contains("exit code 5"),
+            "Error should mention no tests collected: {msg}"
+        );
+    }
+
+    /// INV-5: validate_fail_run error messages include subprocess stdout/stderr.
+    ///
+    /// When the trampoline is broken (exit 0), the error must include pytest output
+    /// so the user can diagnose why tests passed.
+    #[tokio::test]
+    async fn test_validate_fail_run_error_includes_subprocess_output() {
+        let fixture = subprocess_fixture_dir();
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        // Empty mutants dir — tests pass, exit 0
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        // The error must include the stdout/stderr sections so users can diagnose the issue
+        assert!(
+            msg.contains("stdout:") && msg.contains("stderr:"),
+            "Error should include stdout/stderr for diagnostics: {msg}"
         );
     }
 
     /// INV-2: validate_clean_run error messages include subprocess stdout/stderr so
     /// failures are actionable. Pytest output (e.g. 'assert False') must appear in
     /// the returned Err.
-    #[test]
-    fn test_validate_clean_run_includes_output_on_failure() {
+    #[tokio::test]
+    async fn test_validate_clean_run_includes_output_on_failure() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
         std::fs::write(
@@ -2164,7 +2308,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(result.is_err(), "Failing test should cause validate_clean_run to return Err");
 
         let err_msg = format!("{:?}", result.unwrap_err());
@@ -2176,8 +2320,8 @@ mod tests {
 
     /// INV-4: discover_tests returns non-empty list of valid pytest node IDs for a
     /// project that has tests.
-    #[test]
-    fn test_discover_tests_finds_test_ids() {
+    #[tokio::test]
+    async fn test_discover_tests_finds_test_ids() {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
@@ -2185,6 +2329,7 @@ mod tests {
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests")
+            .await
             .expect("discover_tests should not fail for a valid project");
 
         assert!(!tests.is_empty(), "Should find at least one test");
@@ -2203,8 +2348,8 @@ mod tests {
     }
 
     /// discover_tests returns an empty list when there are no test files.
-    #[test]
-    fn test_discover_tests_no_tests() {
+    #[tokio::test]
+    async fn test_discover_tests_no_tests() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("empty_tests")).unwrap();
 
@@ -2220,11 +2365,22 @@ mod tests {
             tmp_mutants.path(),
             "empty_tests",
         )
+        .await
         .expect("discover_tests should not fail for empty test dir");
 
         assert!(
             tests.is_empty(),
             "Empty test dir should produce no test IDs, got: {tests:?}"
+        );
+    }
+
+    /// VALIDATION_TIMEOUT_SECS is a reasonable ceiling (>0, ≤600).
+    #[test]
+    fn test_validation_timeout_constant_is_reasonable() {
+        assert!(VALIDATION_TIMEOUT_SECS > 0, "timeout must be positive");
+        assert!(
+            VALIDATION_TIMEOUT_SECS <= 600,
+            "timeout should not exceed 10 minutes: {VALIDATION_TIMEOUT_SECS}"
         );
     }
 
