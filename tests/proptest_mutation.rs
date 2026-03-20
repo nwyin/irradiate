@@ -383,6 +383,41 @@ fn return_value_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// Generate Python functions with typed `except` handlers (non-Exception types).
+///
+/// Used to verify `add_exception_type_mutations` produces exactly one exception_type
+/// mutation per handler for all typed exception kinds: simple name, tuple, and `as`-binding.
+fn exception_handler_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec![
+        "single_typed",
+        "tuple_type",
+        "with_as",
+        "exception_base",
+        "bare",
+    ]);
+    let op = arith_ops();
+    let v1 = int_vals();
+
+    (kind, op, v1).prop_map(|(kind, op, v1)| match kind {
+        "single_typed" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except ValueError:\n        return {v1}\n"
+        ),
+        "tuple_type" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except (TypeError, ValueError):\n        return {v1}\n"
+        ),
+        "with_as" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except ValueError as e:\n        return {v1}\n"
+        ),
+        "exception_base" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except Exception:\n        return {v1}\n"
+        ),
+        "bare" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except:\n        return {v1}\n"
+        ),
+        _ => unreachable!(),
+    })
+}
+
 /// Generate function signatures with various default value types.
 ///
 /// Covers the main branches of `compute_default_replacement`:
@@ -404,6 +439,51 @@ fn default_arg_strategy() -> impl Strategy<Value = String> {
         "bool_false" => "def f(x=False):\n    return x\n".to_string(),
         "string" => format!("def f(x=\"{str_content}\"):\n    return x\n"),
         _ => unreachable!(),
+    })
+}
+
+/// Generate functions with typed `except` handlers that are NOT `Exception`.
+///
+/// Subset of `exception_handler_strategy` where the handler type is always non-Exception,
+/// so exactly one exception_type mutation must be produced.
+fn exception_typed_handler_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["single_typed", "tuple_type", "with_as"]);
+    let op = arith_ops();
+    let v1 = int_vals();
+
+    (kind, op, v1).prop_map(|(kind, op, v1)| match kind {
+        "single_typed" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except ValueError:\n        return {v1}\n"
+        ),
+        "tuple_type" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except (TypeError, ValueError):\n        return {v1}\n"
+        ),
+        "with_as" => format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except ValueError as e:\n        return {v1}\n"
+        ),
+        _ => unreachable!(),
+    })
+}
+
+/// Generate functions with bare `except:` handlers.
+fn exception_bare_handler_strategy() -> impl Strategy<Value = String> {
+    let op = arith_ops();
+    let v1 = int_vals();
+    (op, v1).prop_map(|(op, v1)| {
+        format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except:\n        return {v1}\n"
+        )
+    })
+}
+
+/// Generate functions with `except Exception:` handlers.
+fn exception_base_handler_strategy() -> impl Strategy<Value = String> {
+    let op = arith_ops();
+    let v1 = int_vals();
+    (op, v1).prop_map(|(op, v1)| {
+        format!(
+            "def f(x):\n    try:\n        return x {op} {v1}\n    except Exception:\n        return {v1}\n"
+        )
     })
 }
 
@@ -1107,6 +1187,18 @@ proptest! {
         assert_core_invariants!(fms);
     }
 
+    // --- Exception type mutation tests ---
+
+    /// Exception handler sources satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches byte-offset bugs in `add_exception_type_mutations`: the mutation span must
+    /// cover exactly the type expression text and nothing else (not `except`, not `:`, not `as`).
+    #[test]
+    fn exception_handler_all_invariants(source in exception_handler_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
     // --- dict_kwarg tests ---
 
     /// dict_kwarg sources satisfy all core invariants (INV-2..5).
@@ -1138,6 +1230,25 @@ proptest! {
         );
     }
 
+    /// A typed `except` handler produces exactly one `exception_type` mutation.
+    ///
+    /// INV-extra: each non-Exception typed handler must produce exactly 1 broadening mutation.
+    /// Zero would mean the operator is silently skipped; more than one would be a duplicate bug.
+    #[test]
+    fn exception_handler_typed_produces_one_mutation(source in exception_typed_handler_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "exception_type")
+            .count();
+        prop_assert_eq!(
+            count, 1,
+            "typed except handler must produce exactly 1 exception_type mutation; source:\n{}",
+            source
+        );
+    }
+
     /// INV-extra: return with a non-None value always produces exactly 1 return_value mutation.
     ///
     /// Each return statement has at most one value, so there must be exactly one return_value
@@ -1163,6 +1274,24 @@ proptest! {
             total_rv,
             1usize,
             "single return-with-value must produce exactly 1 return_value mutation; source:\n{}",
+            source
+        );
+    }
+
+    /// A bare `except:` handler produces zero `exception_type` mutations.
+    ///
+    /// INV-extra: bare except has no type field — broadening is not applicable.
+    #[test]
+    fn exception_handler_bare_produces_no_mutation(source in exception_bare_handler_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "exception_type")
+            .count();
+        prop_assert_eq!(
+            count, 0,
+            "bare except must produce 0 exception_type mutations; source:\n{}",
             source
         );
     }
@@ -1227,6 +1356,26 @@ proptest! {
             dict_kwarg_count, n_kwargs,
             "N kwargs must produce N dict_kwarg mutations, got {}; source:\n{}",
             dict_kwarg_count, source
+        );
+    }
+
+    /// `except Exception:` handlers produce zero `exception_type` mutations.
+    ///
+    /// Exception is already the broadest type — broadening it further is a no-op mutation.
+    #[test]
+    fn exception_handler_exception_base_produces_no_mutation(
+        source in exception_base_handler_strategy(),
+    ) {
+        let fms = collect_file_mutations(&source);
+        let count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "exception_type")
+            .count();
+        prop_assert_eq!(
+            count, 0,
+            "except Exception must produce 0 exception_type mutations; source:\n{}",
+            source
         );
     }
 }

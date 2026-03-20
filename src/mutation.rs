@@ -540,6 +540,7 @@ fn collect_statement_mutations(
                 collect_suite_mutations(&w.body, source, cursor, mutations, ignored);
             }
             CompoundStatement::Try(t) => {
+                let cursor_before = *cursor;
                 collect_suite_mutations(&t.body, source, cursor, mutations, ignored);
                 for handler in &t.handlers {
                     collect_suite_mutations(&handler.body, source, cursor, mutations, ignored);
@@ -547,6 +548,8 @@ fn collect_statement_mutations(
                 if let Some(ref fin) = t.finalbody {
                     collect_suite_mutations(&fin.body, source, cursor, mutations, ignored);
                 }
+                // Exception type broadening: except ValueError → except Exception
+                add_exception_type_mutations(&t.handlers, source, cursor_before, mutations);
             }
             CompoundStatement::Match(m) => {
                 // Save cursor before any recursion so we can find the match statement start.
@@ -1507,6 +1510,60 @@ fn find_block_end(source: &str, from: usize, block_indent_len: usize) -> usize {
     }
 
     source.len()
+}
+
+// --- Exception type mutations ---
+
+/// Generate exception type broadening mutations for all typed handlers in a try statement.
+///
+/// For each `except SomeException:` handler, emits a mutation that replaces the exception
+/// type with `Exception` (the broadest base class). Bare `except:` handlers and handlers
+/// already using `Exception` are skipped.
+///
+/// Byte offset computation: for each handler, we construct the exact `except<ws><type>` text
+/// using the CST-stored `whitespace_after_except` field and search forward from `cursor_before`
+/// (which is at or before the try block in the function source). A sub-cursor advances through
+/// each handler header so that repeated handler types (e.g. two `except ValueError:`) are
+/// located at their correct respective positions.
+fn add_exception_type_mutations<'a>(
+    handlers: &[cst::ExceptHandler<'a>],
+    source: &str,
+    cursor_before: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let mut search_from = cursor_before;
+
+    for handler in handlers {
+        let type_expr = match &handler.r#type {
+            Some(t) => t,
+            None => {
+                // Bare `except:` — no type to broaden. Advance past this handler's keyword.
+                if let Some(pos) = source[search_from..].find("except:") {
+                    search_from += pos + "except:".len();
+                }
+                continue;
+            }
+        };
+
+        let type_text = codegen_node(type_expr);
+        let ws = handler.whitespace_after_except.0;
+        let pattern = format!("except{ws}{type_text}");
+
+        let pos = match source[search_from..].find(&pattern) {
+            Some(p) => search_from + p,
+            None => continue,
+        };
+        // Advance sub-cursor past this handler header so the next handler search starts here.
+        search_from = pos + pattern.len();
+
+        if type_text.trim() == "Exception" {
+            // Already broadest — skip mutation.
+            continue;
+        }
+
+        let type_start = pos + "except".len() + ws.len();
+        record_mutation(&type_text, "Exception", "exception_type", type_start, mutations);
+    }
 }
 
 // --- Utility ---
@@ -4650,5 +4707,142 @@ mod dict_kwarg_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod exception_type_tests {
+    use super::*;
+
+    fn exception_type_mutations_for(source: &str) -> Vec<(FunctionMutations, Mutation)> {
+        collect_file_mutations(source)
+            .into_iter()
+            .flat_map(|fm| {
+                let pairs: Vec<_> = fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "exception_type")
+                    .map(|m| (fm.clone(), m.clone()))
+                    .collect();
+                pairs
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_except_valueerror_to_exception() {
+        let source = "def f():\n    try:\n        pass\n    except ValueError:\n        pass\n";
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one exception_type mutation expected");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "ValueError");
+        assert_eq!(m.replacement, "Exception");
+        assert_eq!(&fm.source[m.start..m.end], "ValueError");
+    }
+
+    #[test]
+    fn test_except_tuple_to_exception() {
+        let source =
+            "def f():\n    try:\n        pass\n    except (TypeError, ValueError):\n        pass\n";
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one exception_type mutation expected for tuple type");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "(TypeError, ValueError)");
+        assert_eq!(m.replacement, "Exception");
+        assert_eq!(&fm.source[m.start..m.end], "(TypeError, ValueError)");
+    }
+
+    #[test]
+    fn test_except_exception_no_mutation() {
+        // `except Exception:` is already the broadest type — no mutation should be emitted.
+        let source = "def f():\n    try:\n        pass\n    except Exception:\n        pass\n";
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 0, "except Exception must not produce an exception_type mutation");
+    }
+
+    #[test]
+    fn test_bare_except_no_mutation() {
+        // Bare `except:` has no type field — nothing to broaden.
+        let source = "def f():\n    try:\n        pass\n    except:\n        pass\n";
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 0, "bare except must not produce an exception_type mutation");
+    }
+
+    #[test]
+    fn test_except_with_as_binding() {
+        // `except ValueError as e:` — mutation targets only the type, not the `as e` binding.
+        let source =
+            "def f():\n    try:\n        pass\n    except ValueError as e:\n        pass\n";
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one exception_type mutation expected");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "ValueError");
+        assert_eq!(m.replacement, "Exception");
+        assert_eq!(&fm.source[m.start..m.end], "ValueError");
+        // The character immediately after the type span must be a space (before `as`).
+        assert_eq!(
+            fm.source.as_bytes()[m.end],
+            b' ',
+            "char after type span must be space (before 'as')"
+        );
+    }
+
+    #[test]
+    fn test_multiple_handlers() {
+        // One mutation per typed handler; both TypeError and ValueError should be mutated.
+        let source = concat!(
+            "def f():\n",
+            "    try:\n",
+            "        pass\n",
+            "    except TypeError:\n",
+            "        pass\n",
+            "    except ValueError:\n",
+            "        pass\n",
+        );
+        let pairs = exception_type_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "two typed handlers must produce two exception_type mutations");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"TypeError"), "TypeError handler must be mutated");
+        assert!(originals.contains(&"ValueError"), "ValueError handler must be mutated");
+    }
+
+    #[test]
+    fn test_exception_type_parseable() {
+        // After mutation, the function source must still parse as valid Python.
+        let source =
+            "def f():\n    try:\n        pass\n    except ValueError:\n        pass\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let exc_m = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "exception_type")
+            .expect("must have an exception_type mutation");
+        let mutated = apply_mutation(&fm.source, exc_m);
+        assert!(
+            parse_module(&mutated, None).is_ok(),
+            "mutated source must be parseable: {mutated}"
+        );
+    }
+
+    #[test]
+    fn test_exception_type_span_correctness() {
+        // INV-3: fm.source[m.start..m.end] must equal m.original for exception_type mutations.
+        let source =
+            "def f():\n    try:\n        pass\n    except ValueError:\n        pass\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let exc_m = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "exception_type")
+            .expect("must have an exception_type mutation");
+        assert_eq!(
+            &fm.source[exc_m.start..exc_m.end],
+            exc_m.original.as_str(),
+            "source slice must equal mutation original"
+        );
     }
 }
