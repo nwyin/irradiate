@@ -2086,6 +2086,94 @@ mod tests {
         );
     }
 
+    /// INV-1: validate_fail_run returns Err when mutants_dir is empty (no trampoline code).
+    ///
+    /// Without generated trampoline code in mutants/, the import hook finds nothing and
+    /// Python loads the original source. The `active_mutant="fail"` sentinel never fires
+    /// because no trampoline checks it, so tests pass normally — validate_fail_run must
+    /// catch this and return Err.
+    #[test]
+    fn test_validate_fail_run_bails_without_trampoline() {
+        let fixture = subprocess_fixture_dir();
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+
+        // Empty mutants dir — no trampoline code generated.
+        let empty_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_fail_run(&python, &fixture, &pythonpath, empty_mutants.path(), "tests");
+        assert!(
+            result.is_err(),
+            "validate_fail_run must return Err when no trampoline is present (tests would pass)"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("trampoline") || err_msg.contains("wired"),
+            "Error should mention trampoline or wiring: {err_msg}"
+        );
+    }
+
+    /// Documents exit-code-5 behavior: pytest exits 5 (no tests collected) when the test
+    /// directory is empty. Currently validate_fail_run treats any non-zero exit as success
+    /// (trampoline fired), so this returns Ok(()). This test pins the current semantics —
+    /// if exit-code semantics are tightened later, update this test accordingly.
+    #[test]
+    fn test_validate_fail_run_bails_with_no_test_files() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        // Write a trivial source file so generate_mutants has something to process.
+        std::fs::write(
+            project.path().join("src/trivial.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &project.path().join("src"));
+        let tmp_mutants = tempfile::tempdir().unwrap();
+        generate_mutants(&project.path().join("src"), tmp_mutants.path(), &[])
+            .expect("mutant generation should succeed");
+
+        // tests/ is empty — pytest exits 5 (no tests collected). Any non-zero exit
+        // currently counts as "tests failed → trampoline wired → Ok".
+        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        assert!(
+            result.is_ok(),
+            "With no tests, pytest exits 5 (non-zero), which currently counts as Ok: {result:?}"
+        );
+    }
+
+    /// INV-2: validate_clean_run error messages include subprocess stdout/stderr so
+    /// failures are actionable. Pytest output (e.g. 'assert False') must appear in
+    /// the returned Err.
+    #[test]
+    fn test_validate_clean_run_includes_output_on_failure() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        std::fs::write(
+            project.path().join("tests/test_bad.py"),
+            "def test_always_fails():\n    assert False\n",
+        )
+        .unwrap();
+
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        assert!(result.is_err(), "Failing test should cause validate_clean_run to return Err");
+
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("assert False") || err_msg.contains("AssertionError") || err_msg.contains("FAILED"),
+            "Error message should contain pytest output: {err_msg}"
+        );
+    }
+
     /// INV-4: discover_tests returns non-empty list of valid pytest node IDs for a
     /// project that has tests.
     #[test]
