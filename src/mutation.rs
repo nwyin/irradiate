@@ -74,6 +74,19 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
             }
             Statement::Compound(CompoundStatement::ClassDef(cls)) => {
                 let class_name = codegen_node(&cls.name);
+
+                // Skip Enum subclasses entirely: EnumMeta processes ALL names in the
+                // class body as potential member definitions, so trampoline artifacts
+                // (mangled method defs, mutants dicts, __name__ assignments) cause
+                // TypeError at class creation time for IntEnum/StrEnum/Flag variants.
+                let is_enum_class = cls.bases.iter().any(|base| {
+                    let base_text = codegen_node(&base.value);
+                    ENUM_BASES.contains(&base_text.trim())
+                });
+                if is_enum_class {
+                    continue;
+                }
+
                 if let cst::Suite::IndentedBlock(block) = &cls.body {
                     for method_stmt in &block.body {
                         if let Statement::Compound(CompoundStatement::FunctionDef(func)) =
@@ -100,6 +113,26 @@ pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
 
 /// Skip rules from the design doc.
 const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__new__"];
+
+/// Enum base classes whose methods must not be mutated.
+///
+/// Python's `EnumMeta` metaclass processes ALL names in the class body and treats
+/// non-descriptor, non-dunder names as enum member candidates.  Trampoline artifacts
+/// (mangled method defs, mutants dicts, `__name__` assignments) placed inside an
+/// Enum class body are mis-interpreted as member definitions, causing `TypeError`
+/// at class creation time (e.g. `int.__new__(cls, dict(...))` for IntEnum).
+const ENUM_BASES: &[&str] = &[
+    "Enum",
+    "IntEnum",
+    "StrEnum",
+    "Flag",
+    "IntFlag",
+    "enum.Enum",
+    "enum.IntEnum",
+    "enum.StrEnum",
+    "enum.Flag",
+    "enum.IntFlag",
+];
 
 /// Builtin function calls that are never mutated (neither the call itself nor its arguments).
 static NEVER_MUTATE_FUNCTION_CALLS: &[&str] = &["len", "isinstance"];
@@ -6849,5 +6882,141 @@ mod nonlocal_detection_tests {
         );
         assert!(!is_collected(source, "with_nonlocal"), "with_nonlocal must be skipped");
         assert!(is_collected(source, "without_nonlocal"), "without_nonlocal must still be collected");
+    }
+}
+
+// --- Enum class skip tests ---
+#[cfg(test)]
+mod enum_skip_tests {
+    use super::*;
+
+    // Helper: check whether any function with the given name was collected from source.
+    fn is_collected(source: &str, fn_name: &str) -> bool {
+        collect_file_mutations(source).iter().any(|fm| fm.name == fn_name)
+    }
+
+    // INV-1: Methods inside IntEnum subclasses produce NO mutations.
+    #[test]
+    fn test_intenum_methods_skipped() {
+        let source = concat!(
+            "from enum import IntEnum\n",
+            "\n",
+            "class codes(IntEnum):\n",
+            "    CONTINUE = 100\n",
+            "    OK = 200\n",
+            "\n",
+            "    def __str__(self) -> str:\n",
+            "        return str(self.value)\n",
+            "\n",
+            "    def __repr__(self) -> str:\n",
+            "        return f'<{self.name}: {self.value}>'\n",
+            "\n",
+            "    @classmethod\n",
+            "    def get_reason_phrase(cls, value: int) -> str:\n",
+            "        return cls(value).name\n",
+        );
+        assert!(!is_collected(source, "__str__"), "IntEnum __str__ must not be mutated");
+        assert!(!is_collected(source, "__repr__"), "IntEnum __repr__ must not be mutated");
+        assert!(!is_collected(source, "get_reason_phrase"), "IntEnum classmethod must not be mutated");
+    }
+
+    // INV-2: Methods inside plain Enum subclasses produce NO mutations.
+    #[test]
+    fn test_enum_methods_skipped() {
+        let source = concat!(
+            "from enum import Enum\n",
+            "\n",
+            "class Color(Enum):\n",
+            "    RED = 1\n",
+            "    GREEN = 2\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return self.name + ' color'\n",
+        );
+        assert!(!is_collected(source, "describe"), "Enum method must not be mutated");
+    }
+
+    // INV-3: Methods inside regular (non-Enum) classes are still mutated (regression check).
+    #[test]
+    fn test_regular_class_still_mutated() {
+        let source = concat!(
+            "class Foo:\n",
+            "    def bar(self, x: int) -> int:\n",
+            "        return x + 1\n",
+        );
+        assert!(is_collected(source, "bar"), "regular class method must still be collected");
+    }
+
+    // INV-4: Both Enum and regular class in same file — only regular class is mutated.
+    #[test]
+    fn test_mixed_file_enum_skipped_regular_mutated() {
+        let source = concat!(
+            "from enum import IntEnum\n",
+            "\n",
+            "class Status(IntEnum):\n",
+            "    OK = 200\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name + ' ok'\n",
+            "\n",
+            "class Parser:\n",
+            "    def parse(self, data: str) -> int:\n",
+            "        return len(data) + 1\n",
+        );
+        assert!(!is_collected(source, "label"), "IntEnum method must be skipped");
+        assert!(is_collected(source, "parse"), "regular class method must still be collected");
+    }
+
+    // StrEnum (Python 3.11+) methods skipped.
+    #[test]
+    fn test_strenum_methods_skipped() {
+        let source = concat!(
+            "from enum import StrEnum\n",
+            "\n",
+            "class Direction(StrEnum):\n",
+            "    NORTH = 'north'\n",
+            "\n",
+            "    def opposite(self) -> str:\n",
+            "        return 'south' if self == 'north' else 'north'\n",
+        );
+        assert!(!is_collected(source, "opposite"), "StrEnum method must not be mutated");
+    }
+
+    // Flag and IntFlag skipped.
+    #[test]
+    fn test_flag_methods_skipped() {
+        let source = concat!(
+            "from enum import Flag, IntFlag\n",
+            "\n",
+            "class Perm(Flag):\n",
+            "    READ = 1\n",
+            "    WRITE = 2\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name or 'unknown'\n",
+            "\n",
+            "class Bits(IntFlag):\n",
+            "    A = 1\n",
+            "\n",
+            "    def describe(self) -> str:\n",
+            "        return f'bits={int(self)}'\n",
+        );
+        assert!(!is_collected(source, "label"), "Flag method must not be mutated");
+        assert!(!is_collected(source, "describe"), "IntFlag method must not be mutated");
+    }
+
+    // Dotted import form: `enum.IntEnum`.
+    #[test]
+    fn test_dotted_enum_import_skipped() {
+        let source = concat!(
+            "import enum\n",
+            "\n",
+            "class codes(enum.IntEnum):\n",
+            "    OK = 200\n",
+            "\n",
+            "    def label(self) -> str:\n",
+            "        return self.name\n",
+        );
+        assert!(!is_collected(source, "label"), "enum.IntEnum method must not be mutated");
     }
 }
