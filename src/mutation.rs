@@ -597,17 +597,18 @@ fn collect_small_statement_mutations(
             if let Some(ref val) = ret.value {
                 // Pre-find return text before recursing so we have the start position.
                 let ret_text = codegen_node(ret);
-                let ret_start = source[*cursor..].find(&ret_text).map(|p| *cursor + p);
+                let ret_span = find_expr_span(source, *cursor, &ret_text);
 
                 collect_expr_mutations(val, source, cursor, mutations, ignored);
 
-                if let Some(start) = ret_start {
+                if let Some((start, src_len)) = ret_span {
+                    let ret_source = &source[start..start + src_len];
                     let val_text = codegen_node(val);
                     // Return value mutation: `return x → return None` or `return None → return ""`
-                    add_return_value_mutation(&val_text, &ret_text, start, mutations);
+                    add_return_value_mutation(&val_text, ret_source, start, mutations);
                     // Statement deletion: `return expr` → `return None` (skip if already None)
                     if val_text.trim() != "None" {
-                        record_mutation(&ret_text, "return None", "statement_deletion", start, mutations);
+                        record_mutation(ret_source, "return None", "statement_deletion", start, mutations);
                     }
                 }
             }
@@ -615,7 +616,7 @@ fn collect_small_statement_mutations(
         SmallStatement::Expr(e) => {
             // Pre-find the full expression text before descending so we have its start position.
             let expr_text = codegen_node(e);
-            let expr_start = source[*cursor..].find(&expr_text).map(|p| *cursor + p);
+            let expr_span = find_expr_span(source, *cursor, &expr_text);
 
             collect_expr_mutations(&e.value, source, cursor, mutations, ignored);
 
@@ -623,24 +624,26 @@ fn collect_small_statement_mutations(
             let is_docstring = matches!(&e.value, Expression::SimpleString(s)
                 if s.value.contains("\"\"\"") || s.value.contains("'''"));
             if !is_docstring {
-                if let Some(start) = expr_start {
-                    record_mutation(&expr_text, "pass", "statement_deletion", start, mutations);
+                if let Some((start, src_len)) = expr_span {
+                    let expr_source = &source[start..start + src_len];
+                    record_mutation(expr_source, "pass", "statement_deletion", start, mutations);
                 }
             }
         }
         SmallStatement::Assign(a) => {
             // Pre-find the full assignment text before descending so we have its start position.
             let assign_text = codegen_node(a);
-            let assign_start = source[*cursor..].find(&assign_text).map(|p| *cursor + p);
+            let assign_span = find_expr_span(source, *cursor, &assign_text);
 
             collect_expr_mutations(&a.value, source, cursor, mutations, ignored);
 
-            if let Some(start) = assign_start {
+            if let Some((start, src_len)) = assign_span {
+                let assign_source = &source[start..start + src_len];
                 // Assignment mutation: a = x → a = None
-                add_assignment_mutation_at(a, &assign_text, start, mutations);
+                add_assignment_mutation_at(a, assign_source, start, mutations);
                 // Statement deletion: x = expr → pass (skip self.* assignments — structural)
-                if !assign_text.starts_with("self.") {
-                    record_mutation(&assign_text, "pass", "statement_deletion", start, mutations);
+                if !assign_source.starts_with("self.") {
+                    record_mutation(assign_source, "pass", "statement_deletion", start, mutations);
                 }
             }
         }
@@ -648,22 +651,22 @@ fn collect_small_statement_mutations(
             if r.exc.is_some() {
                 // Only delete explicit raises; bare `raise` (re-raise in except) is skipped.
                 let raise_text = codegen_node(r);
-                if let Some(pos) = source[*cursor..].find(&raise_text) {
-                    let start = *cursor + pos;
-                    record_mutation(&raise_text, "pass", "statement_deletion", start, mutations);
-                    *cursor = start + raise_text.len();
+                if let Some((start, src_len)) = find_expr_span(source, *cursor, &raise_text) {
+                    let raise_source = &source[start..start + src_len];
+                    record_mutation(raise_source, "pass", "statement_deletion", start, mutations);
+                    *cursor = start + src_len;
                 }
             }
         }
         SmallStatement::AugAssign(aug) => {
             // Pre-find the full augmented assignment before descending.
             let full_text = codegen_node(aug);
-            let aug_start = source[*cursor..].find(&full_text).map(|p| *cursor + p);
+            let aug_span = find_expr_span(source, *cursor, &full_text);
 
             // The operator immediately follows the target.
             let target_text = codegen_node(&aug.target);
             let op_text = codegen_node(&aug.operator);
-            let op_start = aug_start.map(|s| s + target_text.len());
+            let op_start = aug_span.map(|(s, _)| s + target_text.len());
 
             collect_expr_mutations(&aug.value, source, cursor, mutations, ignored);
 
@@ -672,8 +675,9 @@ fn collect_small_statement_mutations(
                 add_augop_mutation_at(&aug.operator, &op_text, op_s, mutations);
             }
             // AugAssign → plain Assign (e.g. a += b → a = b)
-            if let Some(start) = aug_start {
-                add_augassign_to_assign_at(aug, &full_text, start, mutations);
+            if let Some((start, src_len)) = aug_span {
+                let aug_source = &source[start..start + src_len];
+                add_augassign_to_assign_at(aug, aug_source, start, mutations);
             }
         }
         SmallStatement::Assert(a) => {
@@ -685,10 +689,8 @@ fn collect_small_statement_mutations(
             // Type annotations are never mutated. Only process the assigned value (if any).
             // The full AnnAssign text is "target: annotation" or "target: annotation = value".
             let full_text = codegen_node(a);
-            let stmt_start = source[*cursor..]
-                .find(&full_text)
-                .map(|p| *cursor + p)
-                .unwrap_or(*cursor);
+            let (stmt_start, stmt_src_len) =
+                find_expr_span(source, *cursor, &full_text).unwrap_or((*cursor, full_text.len()));
 
             if let Some(ref val) = a.value {
                 let val_text = codegen_node(val);
@@ -701,23 +703,23 @@ fn collect_small_statement_mutations(
                 collect_expr_mutations(val, source, cursor, mutations, ignored);
             } else {
                 // Pure annotation (no value): "x: int" — advance cursor past it entirely.
-                *cursor = stmt_start + full_text.len();
+                *cursor = stmt_start + stmt_src_len;
             }
         }
         SmallStatement::Break(b) => {
             let text = codegen_node(b);
-            if let Some(pos) = source[*cursor..].find(&text) {
-                let start = *cursor + pos;
-                record_mutation(&text, "continue", "keyword_swap", start, mutations);
-                *cursor = start + text.len();
+            if let Some((start, src_len)) = find_expr_span(source, *cursor, &text) {
+                let src = &source[start..start + src_len];
+                record_mutation(src, "continue", "keyword_swap", start, mutations);
+                *cursor = start + src_len;
             }
         }
         SmallStatement::Continue(c) => {
             let text = codegen_node(c);
-            if let Some(pos) = source[*cursor..].find(&text) {
-                let start = *cursor + pos;
-                record_mutation(&text, "break", "keyword_swap", start, mutations);
-                *cursor = start + text.len();
+            if let Some((start, src_len)) = find_expr_span(source, *cursor, &text) {
+                let src = &source[start..start + src_len];
+                record_mutation(src, "break", "keyword_swap", start, mutations);
+                *cursor = start + src_len;
             }
         }
         _ => {}
@@ -746,11 +748,11 @@ fn collect_expr_mutations(
     let expr_text = codegen_node(expr);
 
     // Find the start of this expression by searching forward from the current cursor.
-    // Falls back to cursor if not found (shouldn't happen for well-formed Python).
-    let expr_start = source[*cursor..]
-        .find(&expr_text)
-        .map(|pos| *cursor + pos)
-        .unwrap_or(*cursor);
+    // Uses whitespace-flexible matching so multi-line expressions (where codegen
+    // collapses whitespace) are found correctly.
+    let (expr_start, expr_src_len) =
+        find_expr_span(source, *cursor, &expr_text).unwrap_or((*cursor, expr_text.len()));
+    let expr_source = &source[expr_start..expr_start + expr_src_len];
 
     // Local cursor anchored at expr_start; used to find children in left-to-right order.
     let mut local = expr_start;
@@ -774,7 +776,7 @@ fn collect_expr_mutations(
         }
         Expression::UnaryOperation(unop) => {
             // Record mutation on the whole unary expression before recursing.
-            add_unaryop_mutation_at(unop, &expr_text, expr_start, mutations);
+            add_unaryop_mutation_at(unop, expr_source, expr_start, mutations);
             collect_expr_mutations(&unop.expression, source, &mut local, mutations, ignored);
         }
         Expression::Comparison(cmp) => {
@@ -803,8 +805,8 @@ fn collect_expr_mutations(
             let is_skip = matches!(&*call.func, Expression::Name(n) if NEVER_MUTATE_FUNCTION_CALLS.contains(&n.value));
             if !is_skip {
                 add_method_mutations(call, expr_start, mutations);
-                add_arg_removal_mutations(call, &expr_text, expr_start, mutations);
-                add_dict_kwarg_mutations(call, &expr_text, expr_start, mutations);
+                add_arg_removal_mutations(call, expr_source, expr_start, mutations);
+                add_dict_kwarg_mutations(call, expr_source, expr_start, mutations);
                 collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
                 for arg in &call.args {
                     collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
@@ -828,7 +830,7 @@ fn collect_expr_mutations(
                 let replacement = format!(
                     "{lpar_text}{orelse_text}{ws_before_if}if{ws_after_if}{test_text}{ws_before_else}else{ws_after_else}{body_text}{rpar_text}"
                 );
-                record_mutation(&expr_text, &replacement, "ternary_swap", expr_start, mutations);
+                record_mutation(expr_source, &replacement, "ternary_swap", expr_start, mutations);
             }
             // Source order: body "if" test "else" orelse
             collect_expr_mutations(&ifexp.body, source, &mut local, mutations, ignored);
@@ -840,7 +842,7 @@ fn collect_expr_mutations(
             collect_expr_mutations(&ifexp.orelse, source, &mut local, mutations, ignored);
         }
         Expression::Lambda(lam) => {
-            add_lambda_mutation_at(lam, &expr_text, expr_start, mutations);
+            add_lambda_mutation_at(lam, expr_source, expr_start, mutations);
         }
         Expression::Tuple(t) => {
             for el in &t.elements {
@@ -896,7 +898,7 @@ fn collect_expr_mutations(
     }
 
     // Advance the outer cursor past this entire expression.
-    *cursor = expr_start + expr_text.len();
+    *cursor = expr_start + expr_src_len;
 }
 
 // --- Operator mutation helpers (all take explicit start position) ---
@@ -939,10 +941,10 @@ fn add_condition_negation_mutation(
         }
     }
     let test_text = codegen_node(test_expr);
-    if let Some(pos) = source[cursor..].find(&test_text) {
-        let start = cursor + pos;
-        let replacement = format!("not ({})", test_text);
-        record_mutation(&test_text, &replacement, "condition_negation", start, mutations);
+    if let Some((start, src_len)) = find_expr_span(source, cursor, &test_text) {
+        let test_source = &source[start..start + src_len];
+        let replacement = format!("not ({})", test_source);
+        record_mutation(test_source, &replacement, "condition_negation", start, mutations);
     }
 }
 
@@ -1195,33 +1197,34 @@ fn add_assignment_mutation_at(
 /// Return value mutation: `return x → return None` or `return None → return ""`.
 ///
 /// The mutation span covers only the value portion of the return statement, not the
-/// `return` keyword itself.  `val_text` is `codegen_node(val)`, `ret_text` is
-/// `codegen_node(ret)` (the full "return <value>" text), and `ret_start` is the byte
+/// `return` keyword itself.  `val_text` is `codegen_node(val)`, `ret_source` is
+/// the source text of the full "return <value>" statement, and `ret_start` is the byte
 /// offset of the return statement in the function source.
 fn add_return_value_mutation(
     val_text: &str,
-    ret_text: &str,
+    ret_source: &str,
     ret_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
     let replacement = if val_text.trim() == "None" { "\"\"" } else { "None" };
 
-    // Locate the value within ret_text by skipping "return" + whitespace.
+    // Locate the value within ret_source by skipping "return" + whitespace.
     let return_kw_len = "return".len();
-    if ret_text.len() <= return_kw_len {
+    if ret_source.len() <= return_kw_len {
         return; // malformed
     }
-    let after_return = &ret_text[return_kw_len..];
+    let after_return = &ret_source[return_kw_len..];
     let ws_len = after_return.len() - after_return.trim_start().len();
     let val_offset = return_kw_len + ws_len;
 
-    // Safety: verify the value fits within the return text.
-    if val_offset + val_text.len() > ret_text.len() {
+    if val_offset >= ret_source.len() {
         return;
     }
 
+    // The value span in source runs from val_offset to the end of ret_source.
+    let val_source = &ret_source[val_offset..];
     let val_start = ret_start + val_offset;
-    record_mutation(val_text, replacement, "return_value", val_start, mutations);
+    record_mutation(val_source, replacement, "return_value", val_start, mutations);
 }
 
 /// AugAssign operator swap: += → -=, etc.
@@ -1378,6 +1381,12 @@ fn add_arg_removal_mutations(
     }
 
     let func_text = codegen_node(&*call.func);
+    // Include grouping parentheses (lpar/rpar) so the replacement matches the original's
+    // wrapping.  For `(func(args))`, lpar="(" and rpar=")"; for plain `func(args)` both
+    // are empty.  This keeps the replacement syntactically valid when the source has
+    // multi-line continuation inside grouping parens.
+    let lpar_text: String = call.lpar.iter().map(codegen_node).collect();
+    let rpar_text: String = call.rpar.iter().map(codegen_node).collect();
 
     for (i, arg) in args.iter().enumerate() {
         // Skip *args and **kwargs (starred expressions).
@@ -1406,7 +1415,10 @@ fn add_arg_removal_mutations(
                     }
                 })
                 .collect();
-            let new_call = format!("{}({})", func_text, new_args.join(", "));
+            let new_call = format!(
+                "{lpar_text}{func_text}({}){rpar_text}",
+                new_args.join(", ")
+            );
             record_mutation(call_text, &new_call, "arg_removal", expr_start, mutations);
         }
 
@@ -1420,7 +1432,10 @@ fn add_arg_removal_mutations(
                 .filter(|(j, _)| *j != i)
                 .map(|(_, a)| arg_text_no_comma(a))
                 .collect();
-            let new_call = format!("{}({})", func_text, new_args.join(", "));
+            let new_call = format!(
+                "{lpar_text}{func_text}({}){rpar_text}",
+                new_args.join(", ")
+            );
             record_mutation(call_text, &new_call, "arg_removal", expr_start, mutations);
         }
     }
@@ -1759,6 +1774,60 @@ fn codegen_node<'a>(node: &impl Codegen<'a>) -> String {
     let mut state = CodegenState::default();
     node.codegen(&mut state);
     state.tokens
+}
+
+/// Find `codegen_text` in `source[cursor..]` with whitespace flexibility.
+/// Returns (start_offset_in_source, matched_length_in_source).
+///
+/// Each whitespace run in codegen_text matches any non-empty whitespace run in source.
+/// Non-whitespace characters must match exactly.
+fn find_expr_span(source: &str, cursor: usize, codegen_text: &str) -> Option<(usize, usize)> {
+    let haystack = &source[cursor..];
+    // Fast path: exact match
+    if let Some(pos) = haystack.find(codegen_text) {
+        return Some((cursor + pos, codegen_text.len()));
+    }
+    // Slow path: whitespace-flexible match
+    let hay = haystack.as_bytes();
+    let needle = codegen_text.as_bytes();
+    for start in 0..hay.len() {
+        if let Some(matched_len) = try_ws_flex_match(hay, start, needle) {
+            return Some((cursor + start, matched_len));
+        }
+    }
+    None
+}
+
+/// Try matching needle at hay[start..] where whitespace runs are flexible.
+/// Returns bytes consumed in hay on success.
+fn try_ws_flex_match(hay: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    let mut hi = start;
+    let mut ni = 0;
+    while ni < needle.len() {
+        if hi >= hay.len() {
+            return None;
+        }
+        if needle[ni].is_ascii_whitespace() {
+            // Skip whitespace run in needle
+            while ni < needle.len() && needle[ni].is_ascii_whitespace() {
+                ni += 1;
+            }
+            // Hay must have at least one whitespace char
+            if !hay[hi].is_ascii_whitespace() {
+                return None;
+            }
+            while hi < hay.len() && hay[hi].is_ascii_whitespace() {
+                hi += 1;
+            }
+        } else {
+            if hay[hi] != needle[ni] {
+                return None;
+            }
+            hi += 1;
+            ni += 1;
+        }
+    }
+    Some(hi - start)
 }
 
 /// Return the 1-indexed line number of `offset` within `text`.
@@ -4801,34 +4870,27 @@ mod return_value_tests {
     }
 
     // INV-9: `return 42` emits a return_value mutation replacing "42" with "None".
-    // This directly exercises the guard: if the condition flips from `>` to `<`,
-    // add_return_value_mutation called with ret_text that has trailing content would
-    // incorrectly suppress valid mutations.
+    // The value original uses ret_source[val_offset..], which is the source text of the
+    // return value portion.
     #[test]
     fn test_return_value_guard_emits_mutation() {
-        // Direct unit test of add_return_value_mutation with trailing whitespace in ret_text.
-        // val_offset(7) + val_text.len(2) = 9 < ret_text.len(10)
-        // With correct guard `>`: 9 > 10 = false → mutation IS emitted
-        // With mutant guard `<`: 9 < 10 = true → mutation suppressed (bug!)
         let mut mutations = Vec::new();
         add_return_value_mutation("42", "return 42 ", 0, &mut mutations);
-        assert_eq!(mutations.len(), 1, "guard must not suppress valid mutation when ret_text has trailing content");
+        assert_eq!(mutations.len(), 1, "guard must not suppress valid mutation when ret_source has trailing content");
         assert_eq!(mutations[0].replacement, "None");
-        assert_eq!(mutations[0].original, "42");
+        // Original is ret_source[val_offset..] = "42 " (source slice includes trailing content)
+        assert_eq!(mutations[0].original, "42 ");
     }
 
     // INV-10: `return None` emits a return_value mutation replacing "None" with `""`.
-    // Same guard boundary test for the None→"" path.
     #[test]
     fn test_return_value_none_emits_empty_string() {
-        // val_offset(7) + val_text.len(4) = 11 < ret_text.len(12)
-        // With correct guard `>`: 11 > 12 = false → mutation IS emitted
-        // With mutant guard `<`: 11 < 12 = true → mutation suppressed (bug!)
         let mut mutations = Vec::new();
         add_return_value_mutation("None", "return None ", 0, &mut mutations);
-        assert_eq!(mutations.len(), 1, "None→\"\" mutation must be emitted even when ret_text has trailing content");
+        assert_eq!(mutations.len(), 1, "None→\"\" mutation must be emitted even when ret_source has trailing content");
         assert_eq!(mutations[0].replacement, "\"\"");
-        assert_eq!(mutations[0].original, "None");
+        // Original is ret_source[val_offset..] = "None " (source slice includes trailing content)
+        assert_eq!(mutations[0].original, "None ");
     }
 
     // =====================================================================
@@ -6103,6 +6165,101 @@ mod statement_deletion_tests {
                     );
                 }
             }
+        }
+    }
+
+    // --- Whitespace-flexible matching tests ---
+
+    #[test]
+    fn test_find_expr_span_exact_match() {
+        let source = "def f():\n    return a + b\n";
+        let needle = "a + b";
+        let result = find_expr_span(source, 0, needle);
+        assert!(result.is_some());
+        let (start, len) = result.unwrap();
+        assert_eq!(&source[start..start + len], "a + b");
+    }
+
+    #[test]
+    fn test_find_expr_span_ws_flexible() {
+        let source = "def f():\n    return (\n        a +\n        b\n    )\n";
+        // codegen collapses to single-line
+        let needle = "a + b";
+        let result = find_expr_span(source, 0, needle);
+        assert!(result.is_some(), "ws-flexible match should find multi-line expression");
+        let (start, len) = result.unwrap();
+        let matched = &source[start..start + len];
+        // The matched span should include all the whitespace from source
+        assert!(matched.contains('\n'), "matched span should be multi-line");
+        assert!(matched.contains('a'));
+        assert!(matched.contains('b'));
+    }
+
+    #[test]
+    fn test_find_expr_span_not_found() {
+        let source = "def f():\n    return 42\n";
+        let needle = "xyz";
+        assert!(find_expr_span(source, 0, needle).is_none());
+    }
+
+    #[test]
+    fn test_find_expr_span_cursor_offset() {
+        let source = "a + b\na + b\n";
+        let needle = "a + b";
+        // First match
+        let (start1, len1) = find_expr_span(source, 0, needle).unwrap();
+        assert_eq!(start1, 0);
+        assert_eq!(len1, 5);
+        // Second match starting past the first
+        let (start2, _) = find_expr_span(source, start1 + len1, needle).unwrap();
+        assert_eq!(start2, 6);
+    }
+
+    #[test]
+    fn test_multiline_method_chain_all_mutations_parseable() {
+        let source = "def f(s):\n    return (\n        s.replace(\"&\", \"&amp;\")\n        .replace(\">\", \"&gt;\")\n        .replace(\"<\", \"&lt;\")\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            let mutated = apply_mutation(&fms[0].source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "operator {} produced unparseable output:\n{}",
+                m.operator,
+                mutated
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiline_chain_span_correctness() {
+        let source = "def f(s):\n    return (\n        s.replace(\"&\", \"&amp;\")\n        .replace(\">\", \"&gt;\")\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            assert_eq!(
+                &fms[0].source[m.start..m.end],
+                m.original,
+                "span mismatch for operator {}",
+                m.operator
+            );
+        }
+    }
+
+    #[test]
+    fn test_multiline_return_parseable() {
+        // Multi-line return with continuation
+        let source = "def f(x):\n    return (\n        x + 1\n    )\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            let mutated = apply_mutation(&fms[0].source, m);
+            assert!(
+                parse_module(&mutated, None).is_ok(),
+                "operator {} produced unparseable output:\n{}",
+                m.operator,
+                mutated
+            );
         }
     }
 }
