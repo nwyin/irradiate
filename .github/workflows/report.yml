@@ -1,11 +1,10 @@
 name: Report
 
 on:
-  # Disabled until scripts/generate_report.py and bench/ scaffolding exist.
-  # push:
-  #   branches: [main]
-  # schedule:
-  #   - cron: "0 6 * * 1"  # weekly Monday 6am UTC
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # weekly Monday 6am UTC
   workflow_dispatch:
 
 permissions:
@@ -50,8 +49,9 @@ jobs:
       - name: Set up fixture venv
         run: cd tests/fixtures/simple_project && uv venv --python 3.12 --clear && uv pip install pytest
 
-      - name: Run tests
-        run: cargo test
+      # Tests are already covered by the CI workflow — skip here to avoid the
+      # release-build timing sensitivity that causes flaky failures.
+      # The fixture venv is still needed for bench/vendor steps below.
 
       # Benchmarks are slow — only run on schedule and workflow_dispatch, not on every push.
       # The report still generates with placeholder data when bench results are absent.
