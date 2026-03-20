@@ -121,6 +121,14 @@ fn collect_function_mutations(
         return None;
     }
 
+    // Skip functions whose body contains any `nonlocal` statement (at any depth, including
+    // inside nested functions). The trampoline architecture renames and extracts functions to
+    // module/class scope, which breaks nonlocal scope chains — Python raises a SyntaxError at
+    // parse time when the renamed variant is imported.
+    if suite_contains_nonlocal(&func.body) {
+        return None;
+    }
+
     let func_source = codegen_node(func);
     let params_source = codegen_node(&func.params);
     let is_async = func.asynchronous.is_some();
@@ -494,6 +502,57 @@ fn expr_contains_yield(expr: &Expression) -> bool {
             }
         }),
         _ => false,
+    }
+}
+
+// --- Nonlocal detection ---
+//
+// A function must be skipped entirely if it (or any nested function within it) contains
+// a `nonlocal` statement. The trampoline architecture renames functions to module/class
+// scope; a `nonlocal` in a nested function would then fail to bind because its enclosing
+// renamed variant is at the wrong scope level — Python raises a SyntaxError at import time.
+//
+// Unlike suite_contains_yield (which stops at nested FunctionDef boundaries), here we
+// DO recurse into nested functions: a `nonlocal` anywhere in the tree means the outer
+// function's trampoline extraction breaks scope.
+
+fn suite_contains_nonlocal(suite: &cst::Suite) -> bool {
+    match suite {
+        cst::Suite::IndentedBlock(block) => block.body.iter().any(stmt_contains_nonlocal),
+        cst::Suite::SimpleStatementSuite(s) => s.body.iter().any(|ss| matches!(ss, SmallStatement::Nonlocal(_))),
+    }
+}
+
+fn stmt_contains_nonlocal(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Simple(simple) => simple.body.iter().any(|ss| matches!(ss, SmallStatement::Nonlocal(_))),
+        Statement::Compound(compound) => match compound {
+            // Recurse into nested functions — a nonlocal inside a nested def still breaks
+            // the outer function's trampoline.
+            CompoundStatement::FunctionDef(f) => suite_contains_nonlocal(&f.body),
+            CompoundStatement::If(if_stmt) => {
+                suite_contains_nonlocal(&if_stmt.body)
+                    || if_stmt
+                        .orelse
+                        .as_ref()
+                        .is_some_and(|orelse| match orelse.as_ref() {
+                            cst::OrElse::Elif(elif) => suite_contains_nonlocal(&elif.body),
+                            cst::OrElse::Else(else_clause) => suite_contains_nonlocal(&else_clause.body),
+                        })
+            }
+            CompoundStatement::While(w) => suite_contains_nonlocal(&w.body),
+            CompoundStatement::For(f) => suite_contains_nonlocal(&f.body),
+            CompoundStatement::With(w) => suite_contains_nonlocal(&w.body),
+            CompoundStatement::Try(t) => {
+                suite_contains_nonlocal(&t.body)
+                    || t.handlers.iter().any(|h| suite_contains_nonlocal(&h.body))
+                    || t.finalbody
+                        .as_ref()
+                        .is_some_and(|fin| suite_contains_nonlocal(&fin.body))
+            }
+            CompoundStatement::Match(m) => m.cases.iter().any(|c| suite_contains_nonlocal(&c.body)),
+            _ => false,
+        },
     }
 }
 
@@ -6665,5 +6724,130 @@ mod statement_deletion_tests {
         let source = "class C:\n    @property\n    @some_other\n    def x(self):\n        return 1\n";
         let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "@property with additional decorator must still be skipped");
+    }
+}
+
+// --- Nonlocal detection tests ---
+#[cfg(test)]
+mod nonlocal_detection_tests {
+    use super::*;
+
+    // Helper: call collect_file_mutations and check whether the named function was collected.
+    fn is_collected(source: &str, fn_name: &str) -> bool {
+        collect_file_mutations(source).iter().any(|fm| fm.name == fn_name)
+    }
+
+    // INV-1: Function with nested function using `nonlocal` produces NO mutations.
+    #[test]
+    fn test_nested_nonlocal_skips_outer() {
+        let source = concat!(
+            "def outer(self, ctx):\n",
+            "    flag = False\n",
+            "    def _inner(opts):\n",
+            "        nonlocal flag\n",
+            "        flag = True\n",
+            "    _inner([])\n",
+            "    return flag + 1\n",
+        );
+        assert!(!is_collected(source, "outer"), "outer must be skipped because nested _inner uses nonlocal");
+    }
+
+    // INV-2: Function with nested function NOT using `nonlocal` is still mutated.
+    #[test]
+    fn test_nested_no_nonlocal_is_mutated() {
+        let source = concat!(
+            "def outer(n):\n",
+            "    def inner(x):\n",
+            "        return x + 1\n",
+            "    return n + 1\n",
+        );
+        assert!(is_collected(source, "outer"), "outer without nonlocal must still be collected");
+    }
+
+    // INV-3: Function that itself uses `nonlocal` at the top level is also skipped.
+    // (Normally only valid if nested, but libcst parses it at top level too.)
+    #[test]
+    fn test_direct_nonlocal_skips_function() {
+        let source = concat!(
+            "def outer():\n",
+            "    nonlocal x\n",
+            "    return x + 1\n",
+        );
+        assert!(!is_collected(source, "outer"), "function with direct nonlocal must be skipped");
+    }
+
+    // INV-4: Class method with nested function using `nonlocal` is skipped.
+    #[test]
+    fn test_class_method_nested_nonlocal_skipped() {
+        let source = concat!(
+            "class Foo:\n",
+            "    def get_record(self, ctx):\n",
+            "        any_slash = False\n",
+            "        def _write(opts):\n",
+            "            nonlocal any_slash\n",
+            "            any_slash = True\n",
+            "        _write([])\n",
+            "        return any_slash + 1\n",
+        );
+        assert!(
+            !is_collected(source, "get_record"),
+            "class method with nested nonlocal must be skipped"
+        );
+    }
+
+    // INV-5: Multiple levels of nesting — inner uses nonlocal referencing middle's var.
+    #[test]
+    fn test_deep_nesting_nonlocal_skips_outer() {
+        let source = concat!(
+            "def outer(n):\n",
+            "    x = 0\n",
+            "    def middle():\n",
+            "        y = 0\n",
+            "        def inner():\n",
+            "            nonlocal y\n",
+            "            y = 1\n",
+            "        inner()\n",
+            "        return y\n",
+            "    return n + 1\n",
+        );
+        assert!(!is_collected(source, "outer"), "outer must be skipped when nonlocal is two levels deep");
+    }
+
+    // INV-6: `nonlocal x, y, z` (multiple names) — still detected.
+    #[test]
+    fn test_nonlocal_multiple_names_skips_outer() {
+        let source = concat!(
+            "def outer(n):\n",
+            "    x = 0\n",
+            "    y = 0\n",
+            "    z = 0\n",
+            "    def inner():\n",
+            "        nonlocal x, y, z\n",
+            "        x = 1\n",
+            "        y = 2\n",
+            "        z = 3\n",
+            "    inner()\n",
+            "    return n + 1\n",
+        );
+        assert!(!is_collected(source, "outer"), "nonlocal with multiple names must still cause outer to be skipped");
+    }
+
+    // Regression: unrelated sibling function is unaffected.
+    #[test]
+    fn test_sibling_function_unaffected() {
+        let source = concat!(
+            "def with_nonlocal():\n",
+            "    x = 0\n",
+            "    def inner():\n",
+            "        nonlocal x\n",
+            "        x = 1\n",
+            "    inner()\n",
+            "    return x + 1\n",
+            "\n",
+            "def without_nonlocal(n):\n",
+            "    return n + 1\n",
+        );
+        assert!(!is_collected(source, "with_nonlocal"), "with_nonlocal must be skipped");
+        assert!(is_collected(source, "without_nonlocal"), "without_nonlocal must still be collected");
     }
 }
