@@ -238,6 +238,97 @@ fn augassign_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// All METHOD_SWAPS source keys — used to verify that method_swap mutation spans cover
+/// only the method name (after the dot), not the object or surrounding text.
+const METHOD_SWAP_KEYS: &[&str] = &[
+    "lower", "upper", "lstrip", "rstrip", "find", "rfind",
+    "ljust", "rjust", "index", "rindex",
+    "removeprefix", "removesuffix", "partition", "rpartition",
+];
+
+/// Generate Python source containing lambda expressions inside function bodies.
+///
+/// Covers four variants that exercise the byte-offset splice in `add_lambda_mutation_at`:
+/// - Lambda with params and a binary operator in the body (`lambda x: x + 1`)
+/// - Lambda with no params and a numeric literal body (`lambda: 0`)
+/// - Lambda with `None` body — mutation produces `lambda: 0` (reverse direction)
+/// - Lambda where the param name appears in the body — critical regression case for the
+///   byte-offset splice fix (old `String::replace()` would corrupt the param here)
+///
+/// Lambdas are wrapped inside a function body since `collect_file_mutations`
+/// only processes top-level functions and methods.
+fn lambda_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["with_params_op", "no_params", "none_body", "param_in_body"]);
+    let op = arith_ops();
+    let v1 = int_vals();
+
+    (kind, op, v1).prop_map(|(kind, op, v1)| match kind {
+        "with_params_op" => format!("def f():\n    g = lambda x: x {op} {v1}\n    return g(1)\n"),
+        "no_params" => format!("def f():\n    g = lambda: {v1}\n    return g()\n"),
+        "none_body" => "def f():\n    g = lambda: None\n    return g()\n".to_string(),
+        "param_in_body" => "def f():\n    g = lambda x: x\n    return g(1)\n".to_string(),
+        _ => unreachable!(),
+    })
+}
+
+/// Generate Python source with method calls whose names appear in `METHOD_SWAPS`.
+///
+/// Includes the critical edge case where the object name equals the method name
+/// (e.g. `find.find(x)`), which previously triggered a text-heuristic bug that
+/// could compute the wrong byte offset for the method name.
+fn method_swap_strategy() -> impl Strategy<Value = String> {
+    let method = prop::sample::select(vec![
+        "lower", "upper", "find", "rfind", "index", "rindex",
+        "lstrip", "rstrip", "ljust", "rjust",
+        "removeprefix", "removesuffix", "partition", "rpartition",
+    ]);
+    // "find" as object triggers the critical edge case: object name == method name.
+    let obj = prop::sample::select(vec!["s", "text", "val", "find"]);
+
+    (method, obj).prop_map(|(method, obj)| match method {
+        "lower" | "upper" | "lstrip" | "rstrip" => {
+            format!("def f({obj}):\n    return {obj}.{method}()\n")
+        }
+        _ => format!("def f({obj}, x):\n    return {obj}.{method}(x)\n"),
+    })
+}
+
+/// Generate Python source with string literals of various forms.
+///
+/// Covers: double-quoted, single-quoted, r-prefix, b-prefix, and empty string.
+/// Triple-quoted strings (docstrings) are intentionally excluded since they are
+/// skipped by `add_string_mutation_at`.
+fn string_literal_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["double", "single", "r_prefix", "b_prefix", "empty"]);
+    let content = prop::sample::select(vec!["hello", "world", "test", "abc"]);
+
+    (kind, content).prop_map(|(kind, content)| match kind {
+        "double" => format!("def f():\n    return \"{content}\"\n"),
+        "single" => format!("def f():\n    return '{content}'\n"),
+        "r_prefix" => format!("def f():\n    return r\"{content}\"\n"),
+        "b_prefix" => format!("def f():\n    return b\"{content}\"\n"),
+        "empty" => "def f():\n    return \"\"\n".to_string(),
+        _ => unreachable!(),
+    })
+}
+
+/// Generate Python source with function calls containing 1, 2, or 3 positional
+/// args, plus keyword args.
+///
+/// Used to verify `add_arg_removal_mutations`: each non-None, non-starred arg
+/// produces up to 2 mutations (replace-with-None and remove-entirely).
+fn arg_removal_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["one_arg", "two_args", "three_args", "keyword_arg"]);
+
+    kind.prop_map(|kind| match kind {
+        "one_arg" => "def f():\n    foo(a)\n".to_string(),
+        "two_args" => "def f():\n    foo(a, b)\n".to_string(),
+        "three_args" => "def f():\n    foo(a, b, c)\n".to_string(),
+        "keyword_arg" => "def f():\n    foo(key=val)\n".to_string(),
+        _ => unreachable!(),
+    })
+}
+
 /// Helper: check all core invariants for a set of FunctionMutations.
 ///
 /// Used by tests that only need to verify offsets/content, not generator status.
@@ -751,5 +842,161 @@ proptest! {
                 );
             }
         }
+    }
+
+    /// Lambda functions satisfy all core invariants (INV-2..5) AND the param-preservation
+    /// invariant: after mutation, the text before `:` in the lambda is unchanged.
+    ///
+    /// INV-3 (lambda-specific): The byte-offset splice in `add_lambda_mutation_at` must not
+    /// alter text that precedes the colon separator — in particular, param names.
+    /// The previous `String::replace()` implementation would corrupt params when the param
+    /// name appeared in the body (e.g. `lambda x: x` → `lambda None: None` incorrectly).
+    #[test]
+    fn lambda_all_invariants(source in lambda_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+        // INV-3 (lambda param preservation): the text before `:` must be identical in
+        // both original and replacement, ensuring params are not rewritten.
+        for fm in &fms {
+            for m in &fm.mutations {
+                if m.operator == "lambda_mutation" {
+                    let orig_colon = m.original.find(':').expect("lambda original must contain ':'");
+                    let repl_colon = m.replacement.find(':').expect("lambda replacement must contain ':'");
+                    prop_assert_eq!(
+                        &m.original[..orig_colon],
+                        &m.replacement[..repl_colon],
+                        "lambda params must be unchanged after mutation; original={:?} replacement={:?}",
+                        m.original,
+                        m.replacement,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Lambda functions produce at least one mutation.
+    ///
+    /// Guards against the Lambda arm in `collect_expr_mutations` being silently
+    /// skipped, which would mean lambda bodies are never mutated.
+    #[test]
+    fn lambda_has_mutations(source in lambda_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(total > 0, "lambda function must produce at least one mutation; source:\n{source}");
+    }
+
+    /// Method swap sources satisfy all core invariants (INV-2..5) AND the structural
+    /// invariant: every `method_swap` mutation span is immediately preceded by `.`.
+    ///
+    /// INV-4 (method swap): ensures the byte-offset calculation in `add_method_mutations`
+    /// correctly locates the method name after the dot, even for the edge case where the
+    /// object name equals the method name (e.g. `find.find(x)` — the old text-heuristic
+    /// using `rfind(method_name)` instead of `rfind('.')` could find the wrong position).
+    #[test]
+    fn method_swap_all_invariants(source in method_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+        // INV-4 (method swap span preceded by `.`):
+        for fm in &fms {
+            for m in &fm.mutations {
+                if m.operator == "method_swap" {
+                    prop_assert!(
+                        METHOD_SWAP_KEYS.contains(&m.original.as_str()),
+                        "method_swap original '{}' must be a known METHOD_SWAPS key",
+                        m.original
+                    );
+                    prop_assert!(
+                        m.start > 0,
+                        "method_swap start ({}) must be > 0 (needs a preceding dot)",
+                        m.start
+                    );
+                    prop_assert_eq!(
+                        fm.source.as_bytes()[m.start - 1],
+                        b'.',
+                        "method_swap at offset {} must be preceded by '.' in source={:?}",
+                        m.start,
+                        &fm.source
+                    );
+                }
+            }
+        }
+    }
+
+    /// Method swap sources produce at least one mutation.
+    ///
+    /// Ensures the method_swap operator fires for all METHOD_SWAPS method names —
+    /// a regression would silently drop the method swap, leaving that mutation path untested.
+    #[test]
+    fn method_swap_has_mutations(source in method_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(total > 0, "method swap source must produce at least one mutation; source:\n{source}");
+    }
+
+    /// String literal functions satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches delimiter-detection bugs in `add_string_mutation_at`: the original must
+    /// reproduce the exact string literal (including prefix and outer quotes), and the
+    /// byte-span must correctly identify the literal in the function source.
+    #[test]
+    fn string_literal_all_invariants(source in string_literal_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// String literal functions produce at least one mutation.
+    ///
+    /// Guards against string literals being silently skipped. The strategy excludes
+    /// triple-quoted strings and strings where inner content contains the delimiter,
+    /// so every generated source must yield a string_mutation.
+    #[test]
+    fn string_literal_has_mutations(source in string_literal_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(total > 0, "string literal function must produce at least one mutation; source:\n{source}");
+    }
+
+    /// Function calls with arg removal targets satisfy all core invariants (INV-2..5).
+    #[test]
+    fn arg_removal_all_invariants(source in arg_removal_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Function calls produce at least one arg_removal mutation.
+    ///
+    /// Ensures `add_arg_removal_mutations` fires for all arities (1-arg, 2-arg, 3-arg,
+    /// keyword) — a regression would silently produce zero mutations.
+    #[test]
+    fn arg_removal_has_mutations(source in arg_removal_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(total > 0, "arg removal source must produce at least one mutation; source:\n{source}");
+    }
+
+    /// A 2-arg call produces at least 2 arg_removal mutations.
+    ///
+    /// For `foo(a, b)`, `add_arg_removal_mutations` must generate at minimum:
+    ///   - `foo(None, b)` (replace arg 0 with None)
+    ///   - `foo(a, None)` (replace arg 1 with None)
+    /// Fewer than 2 would indicate silent arg-mutation skipping for multi-arg calls.
+    #[test]
+    fn arg_removal_two_arg_min_count(
+        func in prop::sample::select(vec!["foo", "bar", "process"]),
+        a1 in prop::sample::select(vec!["a", "x", "p"]),
+        a2 in prop::sample::select(vec!["b", "y", "q"]),
+    ) {
+        let source = format!("def f():\n    {func}({a1}, {a2})\n");
+        let fms = collect_file_mutations(&source);
+        let arg_removal_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "arg_removal")
+            .count();
+        prop_assert!(
+            arg_removal_count >= 2,
+            "2-arg call must produce at least 2 arg_removal mutations, got {}; source:\n{source}",
+            arg_removal_count
+        );
     }
 }
