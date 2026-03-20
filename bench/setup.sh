@@ -26,15 +26,19 @@ uv pip install --python .venv/bin/python pytest
 cd "$ROOT"
 echo
 
-# ── 3. my_lib venv ────────────────────────────────────────────────────────
+# ── 3. my_lib venv (optional — vendor/mutmut is gitignored, only present locally)
 echo "[3/7] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
-cd vendor/mutmut/e2e_projects/my_lib
-if [ ! -d .venv ]; then
-    uv venv --python python3.12 --seed
+if [ -d vendor/mutmut/e2e_projects/my_lib ]; then
+    cd vendor/mutmut/e2e_projects/my_lib
+    if [ ! -d .venv ]; then
+        uv venv --python python3.12 --seed
+    fi
+    uv pip install --python .venv/bin/python pytest pytest-asyncio hatchling
+    uv pip install --python .venv/bin/python -e .
+    cd "$ROOT"
+else
+    echo "  vendor/mutmut not present (gitignored) — skipping my_lib venv"
 fi
-uv pip install --python .venv/bin/python pytest pytest-asyncio hatchling
-uv pip install --python .venv/bin/python -e .
-cd "$ROOT"
 echo
 
 # ── 4. synth venv ─────────────────────────────────────────────────────────

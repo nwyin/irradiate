@@ -95,7 +95,7 @@ mkdir -p "$RESULT_DIR"
 echo "Results:       $RESULT_DIR"
 echo
 
-NCPU="$(sysctl -n hw.ncpu)"
+NCPU="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
 
 # ── Helper: clean slate ───────────────────────────────────────────────────
 clean_slate() {
@@ -117,10 +117,11 @@ run_config() {
 
     clean_slate
 
-    # /usr/bin/time -l writes timing info to stderr; redirect tool stderr to file
-    # We capture the time output by wrapping with a subshell that redirects stderr
+    # /usr/bin/time writes timing info to stderr; -l is macOS, -v is Linux
+    local time_flag="-l"
+    if /usr/bin/time -v true 2>/dev/null; then time_flag="-v"; fi
     {
-        /usr/bin/time -l "$@" \
+        /usr/bin/time "$time_flag" "$@" \
             > >(tee "$out") \
             2> >(tee "$err" >&2)
     } 2>"$time_file" || true
