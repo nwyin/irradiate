@@ -63,22 +63,12 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     module_lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
 
     // Trampoline wrapper with original name and signature.
-    // Determine self_arg (Python value passed as last arg to trampoline), whether the first
-    // parameter is implicit (and should be stripped from call_args), and the lookup prefix for
-    // the mangled names (class attribute access style depends on method kind).
-    let (self_arg, has_self, lookup_prefix) = if fm.is_classmethod {
-        // @classmethod: first param is `cls` (strip it from call_args); look up via `cls.`
-        // because cls IS the class. Pass None as self_arg — bound classmethod has cls implicit.
-        ("None", true, "cls.".to_string())
-    } else if fm.is_staticmethod {
-        // @staticmethod: no implicit first arg; look up via ClassName. (only option without self/cls).
-        let cls = fm.class_name.as_deref().unwrap_or("");
-        ("None", false, if cls.is_empty() { String::new() } else { format!("{cls}.") })
-    } else if fm.class_name.is_some() {
-        // Regular instance method: pass self; look up via type(self). for MRO-correct access.
+    // Since all decorated functions are skipped, only two cases remain:
+    //   - Regular instance method: pass self; look up via type(self). for MRO-correct access.
+    //   - Top-level function: bare names are in module scope, no implicit first arg.
+    let (self_arg, has_self, lookup_prefix) = if fm.class_name.is_some() {
         ("self", true, "type(self).".to_string())
     } else {
-        // Top-level function: bare names are in module scope.
         ("None", false, String::new())
     };
     let params_text = &fm.params_source;
@@ -785,150 +775,63 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // @classmethod / @staticmethod dispatch (INV-1, INV-2, INV-3, INV-4)
+    // Decorator skip invariants (INV-1, INV-2, INV-3)
     // ─────────────────────────────────────────────────────────────────
 
-    // INV-4: is_classmethod is true iff @classmethod decorator is present.
+    // INV-1: Any function with one or more decorators produces NO mutations.
     #[test]
-    fn test_is_classmethod_detected() {
-        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
-        let fms = collect_file_mutations(source);
-        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
-        assert!(cm.is_classmethod, "escape must be detected as classmethod");
-        assert!(!cm.is_staticmethod, "escape must not be detected as staticmethod");
+    fn test_any_decorator_skips_function() {
+        let cases = [
+            "@property\ndef x(self):\n    return self._x\n",
+            "@classmethod\ndef make(cls):\n    return 1 + 2\n",
+            "@staticmethod\ndef helper():\n    return 1 + 2\n",
+            "@contextmanager\ndef ctx():\n    yield 1 + 2\n",
+            "@custom_decorator\ndef qux(a, b):\n    return a + b\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            assert!(
+                fms.is_empty(),
+                "decorated function must produce no mutations; source:\n{source}\ngot: {fms:?}"
+            );
+        }
     }
 
-    // INV-4: is_classmethod is false for a regular instance method.
+    // INV-1: Stacked decorators — any decorator on the function triggers the skip.
     #[test]
-    fn test_is_classmethod_false_for_instance_method() {
-        let source = "class Foo:\n    def method(self, v):\n        return v + 1\n";
+    fn test_stacked_decorators_skipped() {
+        let source = "@decorator1\n@decorator2\ndef stacked(a, b):\n    return a + b\n";
         let fms = collect_file_mutations(source);
-        let fm = fms.iter().find(|f| f.name == "method").expect("should find method");
-        assert!(!fm.is_classmethod, "regular method must not be classmethod");
-        assert!(!fm.is_staticmethod, "regular method must not be staticmethod");
+        assert!(fms.is_empty(), "function with stacked decorators must produce no mutations");
     }
 
-    // INV-4: is_staticmethod is true iff @staticmethod decorator is present.
+    // INV-2: Functions WITHOUT decorators still produce mutations (regression).
     #[test]
-    fn test_is_staticmethod_detected() {
-        let source =
-            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
+    fn test_plain_function_still_mutated() {
+        let source = "def plain(a, b):\n    return a + b\n";
         let fms = collect_file_mutations(source);
-        let sm = fms
-            .iter()
-            .find(|fm| fm.name == "format")
-            .expect("should find format");
-        assert!(sm.is_staticmethod, "format must be detected as staticmethod");
-        assert!(!sm.is_classmethod, "format must not be detected as classmethod");
+        assert!(!fms.is_empty(), "plain (undecorated) function must still produce mutations");
     }
 
-    // INV-4: Method with @classmethod plus another decorator is still detected as classmethod.
+    // INV-3: Class with mix of decorated and undecorated methods — only undecorated produces mutations.
     #[test]
-    fn test_is_classmethod_with_additional_decorator() {
-        // @classmethod + @functools.lru_cache stacked
-        let source = "class Foo:\n    @classmethod\n    @some_decorator\n    def cached(cls, x):\n        return x + 1\n";
+    fn test_class_mixed_decorated_undecorated() {
+        let source = concat!(
+            "class Foo:\n",
+            "    @classmethod\n",
+            "    def make(cls):\n",
+            "        return 1 + 2\n",
+            "\n",
+            "    def plain(self, v):\n",
+            "        return v + 1\n",
+        );
         let fms = collect_file_mutations(source);
-        let cm = fms.iter().find(|fm| fm.name == "cached").expect("should find cached");
-        assert!(cm.is_classmethod, "cached must be detected as classmethod even with another decorator");
+        // Only `plain` should be collected — `make` has @classmethod
+        assert!(fms.iter().all(|fm| fm.name == "plain"), "only undecorated method must be collected; got: {fms:?}");
+        assert!(!fms.is_empty(), "plain method must produce mutations");
     }
 
-    // INV-1: @classmethod trampoline wrapper must NOT reference `self` — uses `cls.` prefix.
-    #[test]
-    fn test_classmethod_wrapper_uses_cls_prefix_not_self() {
-        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
-        let fms = collect_file_mutations(source);
-        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
-        let output = generate_trampoline(cm, "markup");
-        assert!(
-            output.wrapper_code.contains("cls."),
-            "classmethod wrapper must use cls. prefix; got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            !output.wrapper_code.contains("type(self)"),
-            "classmethod wrapper must NOT use type(self); got:\n{}",
-            output.wrapper_code
-        );
-        // INV-1: self must not appear anywhere in the wrapper body
-        // (the def line has 'cls' as first param, not 'self')
-        assert!(
-            !output.wrapper_code.contains(", self)"),
-            "classmethod wrapper must NOT pass self to trampoline; got:\n{}",
-            output.wrapper_code
-        );
-    }
-
-    // INV-1: @classmethod wrapper correctly strips cls from call_args (cls is implicit).
-    #[test]
-    fn test_classmethod_wrapper_strips_cls_from_call_args() {
-        // escape(cls, s) → call_args should contain only s, not cls
-        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
-        let fms = collect_file_mutations(source);
-        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
-        let output = generate_trampoline(cm, "markup");
-        // The wrapper should be `def escape(cls, s): return _irradiate_trampoline(..., (s,), {}, None)`
-        // cls must NOT appear in the args tuple passed to trampoline
-        assert!(
-            output.wrapper_code.contains("(s,)"),
-            "classmethod call_args must contain only s (not cls); got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            output.wrapper_code.contains(", None)"),
-            "classmethod self_arg must be None (cls is implicit in bound method); got:\n{}",
-            output.wrapper_code
-        );
-    }
-
-    // INV-2: @staticmethod trampoline wrapper must NOT reference `self` or `cls`.
-    // Lookup uses the class name directly.
-    #[test]
-    fn test_staticmethod_wrapper_uses_class_name_prefix() {
-        let source =
-            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
-        let fms = collect_file_mutations(source);
-        let sm = fms
-            .iter()
-            .find(|fm| fm.name == "format")
-            .expect("should find format");
-        let output = generate_trampoline(sm, "formatter");
-        assert!(
-            output.wrapper_code.contains("Formatter."),
-            "staticmethod wrapper must use ClassName. prefix; got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            !output.wrapper_code.contains("type(self)"),
-            "staticmethod wrapper must NOT use type(self); got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            !output.wrapper_code.contains("cls."),
-            "staticmethod wrapper must NOT use cls.; got:\n{}",
-            output.wrapper_code
-        );
-    }
-
-    // INV-2: @staticmethod wrapper includes all params in call_args (no stripping).
-    #[test]
-    fn test_staticmethod_wrapper_all_params_in_call_args() {
-        let source =
-            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
-        let fms = collect_file_mutations(source);
-        let sm = fms
-            .iter()
-            .find(|fm| fm.name == "format")
-            .expect("should find format");
-        let output = generate_trampoline(sm, "formatter");
-        // Both value and width must appear in call_args tuple
-        assert!(
-            output.wrapper_code.contains("(value, width)"),
-            "staticmethod call_args must contain both params; got:\n{}",
-            output.wrapper_code
-        );
-    }
-
-    // INV-3: Instance method still uses type(self). prefix (regression check).
+    // INV-3: Instance method without decorator uses type(self). prefix (regression check).
     #[test]
     fn test_instance_method_still_uses_type_self_prefix() {
         let source = "class Foo:\n    def method(self, v):\n        return v + 1\n";
@@ -947,45 +850,20 @@ mod tests {
         );
     }
 
-    // INV-2: @staticmethod with zero parameters (no implicit args, empty call_args).
+    // Failure mode: file with only decorated functions produces empty mutation list (no crash).
     #[test]
-    fn test_staticmethod_zero_params() {
-        let source = "class Bar:\n    @staticmethod\n    def get_default():\n        return 0 + 1\n";
+    fn test_all_decorated_file_no_crash() {
+        let source = concat!(
+            "@property\n",
+            "def foo(self):\n",
+            "    return self._x\n",
+            "\n",
+            "@classmethod\n",
+            "def bar(cls):\n",
+            "    return 1\n",
+        );
         let fms = collect_file_mutations(source);
-        let sm = fms
-            .iter()
-            .find(|fm| fm.name == "get_default")
-            .expect("should find get_default");
-        assert!(sm.is_staticmethod, "get_default must be staticmethod");
-        let output = generate_trampoline(sm, "bar_module");
-        assert!(
-            output.wrapper_code.contains("Bar."),
-            "zero-param staticmethod must use ClassName. prefix; got:\n{}",
-            output.wrapper_code
-        );
-        // call_args must be empty tuple
-        assert!(
-            output.wrapper_code.contains("()"),
-            "zero-param staticmethod must have empty call_args; got:\n{}",
-            output.wrapper_code
-        );
-    }
-
-    // INV-1+INV-3: @classmethod wrapper parses as valid Python (syntax check).
-    #[test]
-    fn test_classmethod_wrapper_parses_as_valid_python() {
-        use libcst_native::parse_module;
-        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
-        let fms = collect_file_mutations(source);
-        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
-        let output = generate_trampoline(cm, "markup");
-        // Wrap in a class to make the wrapper parseable as a complete module
-        let full = format!("class _Dummy:\n    {}\n", output.wrapper_code.replace('\n', "\n    "));
-        assert!(
-            parse_module(&full, None).is_ok(),
-            "classmethod wrapper must be valid Python; got:\n{}",
-            output.wrapper_code
-        );
+        assert!(fms.is_empty(), "file with only decorated functions must produce empty list");
     }
 
     // ─────────────────────────────────────────────────────────────────
