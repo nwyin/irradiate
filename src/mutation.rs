@@ -136,6 +136,21 @@ fn collect_function_mutations(
         .iter()
         .any(|dec| codegen_node(&dec.decorator).trim() == "staticmethod");
 
+    // Skip property descriptors and setter/deleter — these produce non-function
+    // objects that cannot be trampolined (property has no writable __name__,
+    // and @x.setter / @x.deleter reference the property by its original name).
+    for dec in &func.decorators {
+        let dec_text = codegen_node(&dec.decorator);
+        let trimmed = dec_text.trim();
+        let base = trimmed.rsplit('.').next().unwrap_or(trimmed);
+        if matches!(base, "property" | "cached_property")
+            || trimmed.ends_with(".setter")
+            || trimmed.ends_with(".deleter")
+        {
+            return None;
+        }
+    }
+
     // Extract return type annotation, e.g. " -> int | None"
     let return_annotation = if let Some(ann) = &func.returns {
         let mut state = CodegenState::default();
@@ -6557,5 +6572,98 @@ mod statement_deletion_tests {
                 mutated
             );
         }
+    }
+
+    // --- Property descriptor skip tests ---
+    // INV-1: @property-decorated method produces NO mutations.
+    #[test]
+    fn test_property_skipped() {
+        let source = "class C:\n    @property\n    def x(self):\n        return self._x\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@property method must not produce mutations");
+    }
+
+    // INV-2: @x.setter-decorated method produces NO mutations.
+    #[test]
+    fn test_property_setter_skipped() {
+        let source = "class C:\n    @x.setter\n    def x(self, value):\n        self._x = value\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@x.setter method must not produce mutations");
+    }
+
+    // INV-3: @x.deleter-decorated method produces NO mutations.
+    #[test]
+    fn test_property_deleter_skipped() {
+        let source = "class C:\n    @x.deleter\n    def x(self):\n        del self._x\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@x.deleter method must not produce mutations");
+    }
+
+    // INV-4: @cached_property-decorated method produces NO mutations.
+    #[test]
+    fn test_cached_property_skipped() {
+        let source = "class C:\n    @cached_property\n    def x(self):\n        return expensive()\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@cached_property method must not produce mutations");
+    }
+
+    // INV-4b: @functools.cached_property (dotted) is also skipped via base-name match.
+    #[test]
+    fn test_functools_cached_property_skipped() {
+        let source = "class C:\n    @functools.cached_property\n    def x(self):\n        return expensive()\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@functools.cached_property method must not produce mutations");
+    }
+
+    // INV-5: Methods with other decorators (e.g., @override) are still mutated.
+    #[test]
+    fn test_other_decorator_not_skipped() {
+        let source = "class C:\n    @override\n    def x(self):\n        return 1 + 2\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "@override method must still produce mutations");
+    }
+
+    // INV-6: @classmethod and @staticmethod continue to be mutated.
+    #[test]
+    fn test_classmethod_not_skipped_by_property_rule() {
+        let source = "class C:\n    @classmethod\n    def make(cls):\n        return 1 + 2\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "@classmethod method must still produce mutations");
+    }
+
+    #[test]
+    fn test_staticmethod_not_skipped_by_property_rule() {
+        let source = "class C:\n    @staticmethod\n    def helper():\n        return 1 + 2\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "@staticmethod method must still produce mutations");
+    }
+
+    // Critical path: class with getter + setter + deleter — all three are skipped.
+    #[test]
+    fn test_full_property_trio_all_skipped() {
+        let source = concat!(
+            "class HTTPError(Exception):\n",
+            "    @property\n",
+            "    def request(self):\n",
+            "        return self._request\n",
+            "\n",
+            "    @request.setter\n",
+            "    def request(self, value):\n",
+            "        self._request = value\n",
+            "\n",
+            "    @request.deleter\n",
+            "    def request(self):\n",
+            "        del self._request\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "all three property methods must be skipped");
+    }
+
+    // Multiple decorators where one is @property — must still skip.
+    #[test]
+    fn test_property_with_additional_decorator_skipped() {
+        let source = "class C:\n    @property\n    @some_other\n    def x(self):\n        return 1\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@property with additional decorator must still be skipped");
     }
 }
