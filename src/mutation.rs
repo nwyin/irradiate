@@ -953,7 +953,18 @@ fn add_unaryop_mutation_at(
             let inner_text = codegen_node(&*unop.expression);
             record_mutation(full_text, &inner_text, "unary_removal", start, mutations);
         }
-        _ => {}
+        UnaryOp::Plus { .. } => {
+            // +x → -x
+            let operand_text = codegen_node(&*unop.expression);
+            let replacement = format!("-{}", operand_text);
+            record_mutation(full_text, &replacement, "unary_swap", start, mutations);
+        }
+        UnaryOp::Minus { .. } => {
+            // -x → +x
+            let operand_text = codegen_node(&*unop.expression);
+            let replacement = format!("+{}", operand_text);
+            record_mutation(full_text, &replacement, "unary_swap", start, mutations);
+        }
     }
 }
 
@@ -1024,6 +1035,12 @@ fn add_string_mutation_at(s: &cst::SimpleString, start: usize, mutations: &mut V
 
     if replacement != text {
         record_mutation(text, &replacement, "string_mutation", start, mutations);
+    }
+
+    // String emptying: "foo" → ""
+    if !inner.is_empty() {
+        let empty = format!("{prefix}{quote_char}{quote_char}");
+        record_mutation(text, &empty, "string_emptying", start, mutations);
     }
 }
 
@@ -3402,6 +3419,174 @@ mod unary_mutation_tests {
         let source = "def foo(a, b):\n    return not a and b > 0\n";
         let muts = unary_mutations(source);
         assert!(!muts.is_empty(), "unary_removal should be found inside compound expression");
+    }
+}
+
+// --- Unary swap mutation tests ---
+#[cfg(test)]
+mod unary_swap_tests {
+    use super::*;
+
+    fn unary_swap_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "unary_swap")
+            .collect()
+    }
+
+    // INV-1: `-x` → `+x`
+    #[test]
+    fn test_minus_swapped_to_plus() {
+        let source = "def foo(x):\n    return -x\n";
+        let muts = unary_swap_mutations(source);
+        assert!(!muts.is_empty(), "should find unary_swap for `-x`");
+        let m = &muts[0];
+        assert_eq!(m.original, "-x");
+        assert_eq!(m.replacement, "+x");
+    }
+
+    // INV-2: `+x` → `-x`
+    #[test]
+    fn test_plus_swapped_to_minus() {
+        let source = "def foo(x):\n    return +x\n";
+        let muts = unary_swap_mutations(source);
+        assert!(!muts.is_empty(), "should find unary_swap for `+x`");
+        let m = &muts[0];
+        assert_eq!(m.original, "+x");
+        assert_eq!(m.replacement, "-x");
+    }
+
+    // INV-3: `-5` → `+5` (literal numbers)
+    #[test]
+    fn test_minus_literal_swapped_to_plus() {
+        let source = "def foo():\n    return -5\n";
+        let muts = unary_swap_mutations(source);
+        assert!(!muts.is_empty(), "should find unary_swap for `-5`");
+        assert_eq!(muts[0].replacement, "+5");
+    }
+
+    // INV-4: `-x` produces both unary_swap (+x) and existing unary_removal (x)
+    #[test]
+    fn test_minus_produces_both_swap_and_removal_not_produced() {
+        // unary_removal only applies to `not` and `~`, not `-`
+        let source = "def foo(x):\n    return -x\n";
+        let fms = collect_file_mutations(source);
+        let all_muts: Vec<_> = fms.into_iter().flat_map(|fm| fm.mutations.into_iter()).collect();
+        let swaps: Vec<_> = all_muts.iter().filter(|m| m.operator == "unary_swap").collect();
+        let removals: Vec<_> = all_muts.iter().filter(|m| m.operator == "unary_removal").collect();
+        assert!(!swaps.is_empty(), "should have unary_swap for `-x`");
+        assert!(removals.is_empty(), "unary_removal must NOT fire for `-x`");
+    }
+
+    // INV-5: `not` and `~` do NOT get unary_swap
+    #[test]
+    fn test_not_and_bitnot_do_not_get_swap() {
+        let source_not = "def foo(x):\n    return not x\n";
+        let source_inv = "def foo(x):\n    return ~x\n";
+        assert!(unary_swap_mutations(source_not).is_empty(), "`not x` must not get unary_swap");
+        assert!(unary_swap_mutations(source_inv).is_empty(), "`~x` must not get unary_swap");
+    }
+
+    // INV-6: All unary_swap mutations produce parseable Python.
+    #[test]
+    fn test_unary_swap_produces_parseable_python() {
+        let cases = [
+            "def foo(x):\n    return -x\n",
+            "def foo(x):\n    return +x\n",
+            "def foo():\n    return -5\n",
+            "def foo(x, y):\n    return -(x + y)\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "unary_swap") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "unary_swap produced unparseable Python for {:?}:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- String emptying mutation tests ---
+#[cfg(test)]
+mod string_emptying_tests {
+    use super::*;
+
+    fn string_emptying_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "string_emptying")
+            .collect()
+    }
+
+    // INV-1: Non-empty string gets both string_mutation (XX) and string_emptying ("") mutations.
+    #[test]
+    fn test_nonempty_string_gets_both_mutations() {
+        let source = "def greet():\n    return \"hello\"\n";
+        let fms = collect_file_mutations(source);
+        let all_muts: Vec<_> = fms.into_iter().flat_map(|fm| fm.mutations.into_iter()).collect();
+        let xx_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "string_mutation").collect();
+        let empty_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "string_emptying").collect();
+        assert!(!xx_muts.is_empty(), "should find string_mutation (XX) for non-empty string");
+        assert!(!empty_muts.is_empty(), "should find string_emptying for non-empty string");
+        assert_eq!(empty_muts[0].replacement, "\"\"", "emptying replacement should be empty string");
+    }
+
+    // INV-2: Already-empty string does NOT get string_emptying (skip if already empty).
+    #[test]
+    fn test_already_empty_string_not_emptied() {
+        let source = "def foo():\n    return \"\"\n";
+        let muts = string_emptying_mutations(source);
+        assert!(muts.is_empty(), "empty string should not get string_emptying mutation");
+    }
+
+    // INV-3: Quote character is preserved in emptied string.
+    #[test]
+    fn test_empty_uses_same_quote_char() {
+        let source = "def foo():\n    return 'hello'\n";
+        let muts = string_emptying_mutations(source);
+        assert!(!muts.is_empty(), "single-quoted string should get string_emptying");
+        assert_eq!(muts[0].replacement, "''", "should use single quotes for emptied string");
+    }
+
+    // INV-4: Triple-quoted strings (docstrings) do NOT get string_emptying.
+    #[test]
+    fn test_triple_quoted_strings_not_emptied() {
+        let source = "def foo():\n    \"\"\"This is a docstring.\"\"\"\n    return 1\n";
+        let muts = string_emptying_mutations(source);
+        assert!(muts.is_empty(), "docstrings must not get string_emptying");
+    }
+
+    // INV-5: All string_emptying mutations produce parseable Python.
+    #[test]
+    fn test_string_emptying_produces_parseable_python() {
+        let cases = [
+            "def greet():\n    return \"hello\"\n",
+            "def foo():\n    return 'world'\n",
+            "def bar(x):\n    return x.replace('a', 'b')\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "string_emptying") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "string_emptying produced unparseable Python for {:?}:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
     }
 }
 
