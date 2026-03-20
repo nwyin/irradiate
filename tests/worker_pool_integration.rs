@@ -801,6 +801,162 @@ async fn test_worker_pool_explicit_recycle_overrides_auto_tune() {
     assert_eq!(results[0].status, MutantStatus::Killed);
 }
 
+/// INV-3: A worker process that calls os._exit() mid-test produces Error status, not a hang.
+///
+/// This exercises the unexpected-disconnect path in dispatch_work:
+/// worker_pids.remove + recycled_worker_ids check + active_mutants.remove → Error result.
+/// If the stuck-detection or disconnect handling is removed/mutated, this test hangs or panics.
+#[tokio::test]
+async fn test_worker_crash_produces_error_not_hang() {
+    let crash_project = project_root().join("tests/fixtures/crash_worker_project");
+    let python = fixture_python();
+
+    let (_tmp, mutant_names) = generate_mutants_for_project(
+        &crash_project,
+        "src/crash_target/__init__.py",
+        "crash_target",
+    );
+
+    let harness_dir = harness::extract_harness(&crash_project).expect("harness extraction");
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &crash_project.join("src"));
+    let mutants_dir = _tmp.path().to_path_buf();
+
+    // Use stats collection to discover the real test node ID (format varies by pytest/OS).
+    let test_stats = stats::collect_stats(
+        &python,
+        &crash_project,
+        &pythonpath,
+        &mutants_dir,
+        "tests",
+    )
+    .expect("Stats collection should succeed (test passes in stats mode)");
+
+    let test_id = test_stats
+        .duration_by_test
+        .keys()
+        .next()
+        .cloned()
+        .expect("crash_worker_project should collect one test");
+
+    // Also try alternate prefix form so _prepare_items lookup succeeds regardless of rootdir.
+    let mut candidate_ids = vec![test_id.clone()];
+    if let Some(stripped) = test_id.strip_prefix("tests/") {
+        candidate_ids.push(stripped.to_string());
+    } else {
+        candidate_ids.push(format!("tests/{test_id}"));
+    }
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("crash_target fixture must have an add mutant");
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: crash_project.clone(),
+        mutants_dir,
+        tests_dir: crash_project.join("tests"),
+        timeout_multiplier: 10.0,
+        pythonpath,
+        worker_recycle_after: Some(0), // no count recycling — only crash path matters
+        ..Default::default()
+    };
+
+    let work_items = vec![WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: candidate_ids,
+        estimated_duration_secs: 0.0,
+        timeout_secs: 60.0,
+    }];
+
+    // Must not hang. If disconnect handling is broken, run_worker_pool never returns.
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool must not hang when the worker process crashes");
+
+    assert_eq!(results.len(), 1, "Crashed worker must still produce exactly one result");
+    assert_eq!(
+        results[0].status,
+        MutantStatus::Error,
+        "os._exit() in the worker must produce Error status, got {:?}",
+        results[0].status
+    );
+}
+
+/// Memory limit recycling: run completes correctly when max_worker_memory_mb is set
+/// to a very low value (1 MB). Any Python process far exceeds 1 MB RSS, so workers
+/// will be flagged for recycling by the periodic memory check.
+///
+/// This exercises the memory-recycle code path in dispatch_work (lines ~634-655):
+/// check_rss → flag worker → memory_recycle=true on next result → spawn replacement.
+/// If the memory recycle path hangs or drops work items, this test will fail.
+#[tokio::test]
+async fn test_memory_limit_run_completes() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+    let is_pos_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_is_positive__irradiate_"))
+        .expect("Should have an is_positive mutant");
+
+    // 1 MB limit: any Python process will far exceed this.
+    // The periodic memory check will flag each worker after it starts.
+    // Setting worker_recycle_after=Some(0) disables count recycling so only memory
+    // recycling can trigger respawn — exercises that specific code path.
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: fixture.clone(),
+        mutants_dir: _tmp.path().to_path_buf(),
+        tests_dir: fixture.join("tests"),
+        timeout_multiplier: 10.0,
+        max_worker_memory_mb: 1, // any Python process exceeds this
+        worker_recycle_after: Some(0), // count recycling disabled; only memory path active
+        ..Default::default()
+    };
+
+    let work_items = vec![
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+        WorkItem {
+            mutant_name: is_pos_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+    ];
+
+    // Must complete without hanging, even if memory recycling respawns workers mid-run.
+    let results = run_worker_pool(&config, work_items)
+        .await
+        .expect("Worker pool must complete even with aggressive memory recycling");
+
+    assert_eq!(results.len(), 2, "All mutants must produce results despite memory recycling");
+    // Memory recycling must not corrupt results: each status must be a valid classification.
+    for result in &results {
+        assert!(
+            matches!(
+                result.status,
+                MutantStatus::Killed | MutantStatus::Survived | MutantStatus::Error
+            ),
+            "Mutant {} must have a valid status after memory recycling, got {:?}",
+            result.mutant_name,
+            result.status
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_stats_collection() {
     let fixture = fixture_dir();

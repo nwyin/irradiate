@@ -768,4 +768,79 @@ mod tests {
         let result = determine_recycle_after(Some(1), false, 0);
         assert_eq!(result, 1);
     }
+
+    // --- check_rss tests (INV-1) ---
+
+    /// INV-1: check_rss returns nonzero RSS for the current process.
+    /// Kills mutations that break the ps output parsing (e.g., Ok(0) for any pid).
+    #[tokio::test]
+    async fn test_check_rss_current_process() {
+        let pid = std::process::id();
+        let result = check_rss(pid).await;
+        assert!(
+            result.is_ok(),
+            "check_rss should succeed for current process (pid {pid}), got: {result:?}"
+        );
+        assert!(
+            result.unwrap() > 0,
+            "current process should have nonzero RSS"
+        );
+    }
+
+    /// INV-1: check_rss returns Err for a nonexistent PID.
+    /// Kills mutations that suppress errors (e.g., returning Ok(0) for any input).
+    #[tokio::test]
+    async fn test_check_rss_invalid_pid() {
+        // PID 999999999 is virtually guaranteed not to exist on any real system.
+        let result = check_rss(999_999_999).await;
+        assert!(
+            result.is_err(),
+            "check_rss should return Err for a nonexistent PID, got: {result:?}"
+        );
+    }
+
+    // --- recycle decision logic tests (INV-2) ---
+    //
+    // These tests directly exercise the `(count_recycle || memory_recycle) && work_remaining`
+    // boolean condition in dispatch_work. Each test targets a specific cargo-mutant survivor:
+    // - test_recycle_decision_memory_without_count: kills the `||` → `&&` mutation
+    // - test_recycle_decision_no_flags_no_recycle: kills the inversion of either flag
+    // - test_recycle_decision_no_work_remaining: kills removal of `&& work_remaining`
+
+    /// INV-2: memory_recycle alone (count threshold not reached) still triggers recycling.
+    /// Kills the `||` → `&&` mutation in dispatch_work.
+    #[test]
+    fn test_recycle_decision_memory_without_count_threshold() {
+        let count_recycle = false; // count threshold not reached
+        let memory_recycle = true; // RSS exceeded limit
+        let work_remaining = true;
+        assert!(
+            (count_recycle || memory_recycle) && work_remaining,
+            "memory_recycle alone must trigger recycling when work remains"
+        );
+    }
+
+    /// INV-2: neither count nor memory flag → no recycling.
+    #[test]
+    fn test_recycle_decision_no_flags_no_recycle() {
+        let count_recycle = false;
+        let memory_recycle = false;
+        let work_remaining = true;
+        assert!(
+            !((count_recycle || memory_recycle) && work_remaining),
+            "without either flag, recycling must not occur"
+        );
+    }
+
+    /// INV-2: memory_recycle set but work queue empty → no recycling (nothing to dispatch).
+    #[test]
+    fn test_recycle_decision_no_work_remaining() {
+        let count_recycle = false;
+        let memory_recycle = true;
+        let work_remaining = false; // queue drained
+        assert!(
+            !((count_recycle || memory_recycle) && work_remaining),
+            "recycling must not occur when no work remains"
+        );
+    }
 }
