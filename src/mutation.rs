@@ -2897,3 +2897,659 @@ mod assignment_mutation_tests {
         );
     }
 }
+
+// --- Unary operation mutation tests ---
+#[cfg(test)]
+mod unary_mutation_tests {
+    use super::*;
+
+    fn unary_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "unary_removal")
+            .collect()
+    }
+
+    // INV-1: `not x` → `x` removes the unary `not` operator.
+    #[test]
+    fn test_not_removal() {
+        let source = "def foo(x):\n    return not x\n";
+        let muts = unary_mutations(source);
+        assert!(!muts.is_empty(), "should find unary_removal mutation for `not x`");
+        let m = &muts[0];
+        assert_eq!(m.original, "not x", "original should be the full `not x` expression");
+        assert_eq!(m.replacement, "x", "replacement should be just `x`");
+    }
+
+    // INV-2: `~x` → `x` removes the bitwise invert operator.
+    #[test]
+    fn test_bit_invert_removal() {
+        let source = "def foo(x):\n    return ~x\n";
+        let muts = unary_mutations(source);
+        assert!(!muts.is_empty(), "should find unary_removal mutation for `~x`");
+        let m = &muts[0];
+        assert_eq!(m.replacement, "x", "replacement should be just `x`");
+    }
+
+    // INV-3: Unary `-` is NOT removed (only `not` and `~` are removed).
+    #[test]
+    fn test_minus_not_removed() {
+        let source = "def foo(x):\n    return -x\n";
+        let muts = unary_mutations(source);
+        assert!(muts.is_empty(), "unary minus must not produce unary_removal mutation");
+    }
+
+    // INV-4: Correct byte span — source[start..end] == original.
+    #[test]
+    fn test_unary_span_correctness() {
+        let source = "def foo(x):\n    return not x\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        for m in fm.mutations.iter().filter(|m| m.operator == "unary_removal") {
+            let span_text = &fm.source[m.start..m.end];
+            assert_eq!(
+                span_text, m.original,
+                "INV-4: span [{}, {}) = {:?} but original = {:?}",
+                m.start, m.end, span_text, m.original
+            );
+        }
+    }
+
+    // INV-5: All unary mutations produce parseable Python.
+    #[test]
+    fn test_unary_mutation_produces_parseable_python() {
+        let cases = [
+            "def foo(x):\n    return not x\n",
+            "def foo(x):\n    return ~x\n",
+            "def foo(a, x):\n    return not x and a > 0\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "unary_removal") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "unary_removal mutation produced unparseable Python for {:?}:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-6: `not x` mutation is found even when inside a compound expression.
+    #[test]
+    fn test_not_inside_and_expression() {
+        let source = "def foo(a, b):\n    return not a and b > 0\n";
+        let muts = unary_mutations(source);
+        assert!(!muts.is_empty(), "unary_removal should be found inside compound expression");
+    }
+}
+
+// --- Float mutation tests ---
+#[cfg(test)]
+mod float_mutation_tests {
+    use super::*;
+
+    fn float_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "number_mutation")
+            .collect()
+    }
+
+    // INV-1: `1.5` → `2.5` (float + 1.0).
+    #[test]
+    fn test_float_incremented_by_one() {
+        let source = "def foo():\n    return 1.5\n";
+        let muts = float_mutations(source);
+        assert!(!muts.is_empty(), "should find number_mutation for float 1.5");
+        let m = &muts[0];
+        assert_eq!(m.replacement, "2.5", "1.5 should become 2.5");
+    }
+
+    // INV-2: `0.0` → `1.0`.
+    #[test]
+    fn test_float_zero_incremented() {
+        let source = "def foo():\n    return 0.0\n";
+        let muts = float_mutations(source);
+        assert!(!muts.is_empty(), "should find number_mutation for float 0.0");
+        let m = &muts[0];
+        assert_eq!(m.replacement, "1", "0.0 should become 1 (1.0 after formatting)");
+    }
+
+    // INV-3: Float mutation produces parseable Python.
+    #[test]
+    fn test_float_mutation_parseable_python() {
+        let cases = ["def foo():\n    return 1.5\n", "def foo():\n    return 0.0\n"];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "number_mutation") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "float mutation produced unparseable Python for {:?}:\n{}",
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-4: Correct byte span for float.
+    #[test]
+    fn test_float_span_correctness() {
+        let source = "def foo():\n    return 1.5\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        for m in fm.mutations.iter().filter(|m| m.operator == "number_mutation") {
+            let span_text = &fm.source[m.start..m.end];
+            assert_eq!(
+                span_text, m.original,
+                "span [{}, {}) = {:?} but original = {:?}",
+                m.start, m.end, span_text, m.original
+            );
+        }
+    }
+}
+
+// --- AugAssign mutation tests ---
+#[cfg(test)]
+mod augassign_mutation_tests {
+    use super::*;
+
+    fn augop_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "augop_swap")
+            .collect()
+    }
+
+    fn augassign_to_assign_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "augassign_to_assign")
+            .collect()
+    }
+
+    // INV-1: `a += b` → `a -= b` (augop_swap).
+    #[test]
+    fn test_add_assign_swapped_to_sub_assign() {
+        let source = "def foo(a, b):\n    a += b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty(), "should find augop_swap for +=");
+        assert!(muts.iter().any(|m| m.replacement.contains("-=")), "should swap += to -=");
+    }
+
+    // INV-2: `a -= b` → `a += b`.
+    #[test]
+    fn test_sub_assign_swapped_to_add_assign() {
+        let source = "def foo(a, b):\n    a -= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("+=")), "should swap -= to +=");
+    }
+
+    // INV-3: `a *= b` → `a /= b`.
+    #[test]
+    fn test_mul_assign_swapped_to_div_assign() {
+        let source = "def foo(a, b):\n    a *= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("/=")), "should swap *= to /=");
+    }
+
+    // INV-4: `a //= b` → `a /= b`.
+    #[test]
+    fn test_floordiv_assign_swapped() {
+        let source = "def foo(a, b):\n    a //= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        // //= → /= (trimmed comparison)
+        assert!(muts.iter().any(|m| m.replacement.trim() == "/="), "should swap //= to /=");
+    }
+
+    // INV-5: `a **= b` → `a *= b`.
+    #[test]
+    fn test_pow_assign_swapped_to_mul_assign() {
+        let source = "def foo(a, b):\n    a **= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("*=")), "should swap **= to *=");
+    }
+
+    // INV-6: `a <<= b` → `a >>= b`.
+    #[test]
+    fn test_lshift_assign_swapped_to_rshift_assign() {
+        let source = "def foo(a, b):\n    a <<= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains(">>=")), "should swap <<= to >>=");
+    }
+
+    // INV-7: `a >>= b` → `a <<= b`.
+    #[test]
+    fn test_rshift_assign_swapped_to_lshift_assign() {
+        let source = "def foo(a, b):\n    a >>= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("<<=")), "should swap >>= to <<=");
+    }
+
+    // INV-8: `a &= b` → `a |= b`.
+    #[test]
+    fn test_and_assign_swapped_to_or_assign() {
+        let source = "def foo(a, b):\n    a &= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("|=")), "should swap &= to |=");
+    }
+
+    // INV-9: `a |= b` → `a &= b`.
+    #[test]
+    fn test_or_assign_swapped_to_and_assign() {
+        let source = "def foo(a, b):\n    a |= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("&=")), "should swap |= to &=");
+    }
+
+    // INV-10: `a ^= b` → `a &= b`.
+    #[test]
+    fn test_xor_assign_swapped_to_and_assign() {
+        let source = "def foo(a, b):\n    a ^= b\n    return a\n";
+        let muts = augop_mutations(source);
+        assert!(!muts.is_empty());
+        assert!(muts.iter().any(|m| m.replacement.contains("&=")), "should swap ^= to &=");
+    }
+
+    // INV-11: `a += b` → `a = b` (augassign_to_assign).
+    #[test]
+    fn test_augassign_to_assign_conversion() {
+        let source = "def foo(a, b):\n    a += b\n    return a\n";
+        let muts = augassign_to_assign_mutations(source);
+        assert!(!muts.is_empty(), "should find augassign_to_assign mutation");
+        // The replacement should be `a = b` (the plain assignment form).
+        assert!(
+            muts.iter().any(|m| m.replacement.contains("a =") && !m.replacement.contains("+=")),
+            "augassign_to_assign should produce plain `a = b`; got: {:?}",
+            muts.iter().map(|m| &m.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    // INV-12: All augop mutations produce parseable Python.
+    #[test]
+    fn test_augop_mutations_parseable() {
+        let cases = [
+            "def foo(a, b):\n    a += b\n    return a\n",
+            "def foo(a, b):\n    a -= b\n    return a\n",
+            "def foo(a, b):\n    a *= b\n    return a\n",
+            "def foo(a, b):\n    a //= b\n    return a\n",
+            "def foo(a, b):\n    a **= b\n    return a\n",
+            "def foo(a, b):\n    a <<= b\n    return a\n",
+            "def foo(a, b):\n    a >>= b\n    return a\n",
+            "def foo(a, b):\n    a &= b\n    return a\n",
+            "def foo(a, b):\n    a |= b\n    return a\n",
+            "def foo(a, b):\n    a ^= b\n    return a\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "augop_swap" || m.operator == "augassign_to_assign")
+                {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "augop mutation {:?} produced unparseable Python for {:?}:\n{}",
+                        m.operator,
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-13: Correct byte span for augop — source[start..end] == original.
+    #[test]
+    fn test_augop_span_correctness() {
+        let source = "def foo(a, b):\n    a += b\n    return a\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.first().expect("should collect mutations");
+        for m in fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "augop_swap" || m.operator == "augassign_to_assign")
+        {
+            let span_text = &fm.source[m.start..m.end];
+            assert_eq!(
+                span_text, m.original,
+                "span [{}, {}) = {:?} but original = {:?}",
+                m.start, m.end, span_text, m.original
+            );
+        }
+    }
+}
+
+// --- IfExp (ternary) mutation tests ---
+#[cfg(test)]
+mod ifexp_mutation_tests {
+    use super::*;
+
+    // INV-1: `x + 1 if True else y - 1` — mutations found for both `+` and `-` inside ternary.
+    #[test]
+    fn test_ifexp_recurses_into_body_and_orelse() {
+        let source = "def foo(x, y):\n    return x + 1 if True else y - 1\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "should collect mutations from ifexp");
+        let fm = &fms[0];
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        // Should find both the `+` in `x + 1` and the `-` in `y - 1`
+        assert!(binops.len() >= 2, "should find binop mutations inside ternary body and orelse");
+        let has_add = binops.iter().any(|m| m.original.trim() == "+");
+        let has_sub = binops.iter().any(|m| m.original.trim() == "-");
+        assert!(has_add, "should find + → - mutation in ternary body");
+        assert!(has_sub, "should find - → + mutation in ternary orelse");
+    }
+
+    // INV-2: Mutations inside ternary produce parseable Python.
+    #[test]
+    fn test_ifexp_mutations_parseable() {
+        let source = "def foo(x, y):\n    return x + 1 if True else y - 1\n";
+        let fms = collect_file_mutations(source);
+        for fm in &fms {
+            for m in &fm.mutations {
+                let mutated = apply_mutation(&fm.source, m);
+                assert!(
+                    parse_module(&mutated, None).is_ok(),
+                    "ifexp mutation {:?} produced unparseable Python:\n{}",
+                    m.operator,
+                    mutated
+                );
+            }
+        }
+    }
+}
+
+// --- Container literal recursion tests ---
+#[cfg(test)]
+mod container_mutation_tests {
+    use super::*;
+
+    // INV-1: Tuple — mutations found inside tuple elements.
+    #[test]
+    fn test_tuple_elements_mutated() {
+        let source = "def foo(a, b, c, d):\n    return (a + b, c * d)\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        // should find `+` and `*`
+        assert!(binops.len() >= 2, "should find binop mutations inside tuple elements");
+        let has_add = binops.iter().any(|m| m.original.trim() == "+");
+        let has_mul = binops.iter().any(|m| m.original.trim() == "*");
+        assert!(has_add, "should mutate `+` inside tuple");
+        assert!(has_mul, "should mutate `*` inside tuple");
+    }
+
+    // INV-2: Empty tuple must not crash.
+    #[test]
+    fn test_empty_tuple_no_crash() {
+        let source = "def foo():\n    return ()\n";
+        let fms = collect_file_mutations(source);
+        // No binop mutations; function may be excluded (no mutable ops). Just must not crash.
+        let _ = fms;
+    }
+
+    // INV-3: List — mutations found inside list elements.
+    #[test]
+    fn test_list_elements_mutated() {
+        let source = "def foo(a, b, c, d):\n    return [a + b, c - d]\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert!(binops.len() >= 2, "should find binop mutations inside list elements");
+        let has_add = binops.iter().any(|m| m.original.trim() == "+");
+        let has_sub = binops.iter().any(|m| m.original.trim() == "-");
+        assert!(has_add, "should mutate `+` inside list");
+        assert!(has_sub, "should mutate `-` inside list");
+    }
+
+    // INV-4: Empty list must not crash.
+    #[test]
+    fn test_empty_list_no_crash() {
+        let source = "def foo():\n    return []\n";
+        let fms = collect_file_mutations(source);
+        let _ = fms;
+    }
+
+    // INV-5: Dict — mutations found in dict values.
+    #[test]
+    fn test_dict_value_mutated() {
+        let source = "def foo(a, b):\n    return {'key': a + b}\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert!(!binops.is_empty(), "should find binop mutation inside dict value");
+    }
+
+    // INV-6: Empty dict must not crash.
+    #[test]
+    fn test_empty_dict_no_crash() {
+        let source = "def foo():\n    return {}\n";
+        let fms = collect_file_mutations(source);
+        let _ = fms;
+    }
+
+    // INV-7: Subscript — mutations found in sub.value (the subscripted object).
+    // The subscript arm recurses into sub.value, so mutations on the object are found.
+    // Note: the slice expression is NOT recursed into by the current implementation.
+    #[test]
+    fn test_subscript_value_mutated() {
+        // d.lower()[0] — subscript arm recurses into sub.value = d.lower() (a Call),
+        // which produces a method_swap mutation for .lower() → .upper().
+        let source = "def foo(d):\n    return d.lower()[0]\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let method_muts: Vec<_> =
+            fm.mutations.iter().filter(|m| m.operator == "method_swap").collect();
+        assert!(
+            !method_muts.is_empty(),
+            "subscript arm should recurse into sub.value and find method_swap mutation"
+        );
+    }
+
+    // INV-8: All container literal mutations produce parseable Python.
+    #[test]
+    fn test_container_mutations_parseable() {
+        let cases = [
+            "def foo(a, b, c, d):\n    return (a + b, c * d)\n",
+            "def foo(a, b, c, d):\n    return [a + b, c - d]\n",
+            "def foo(a, b):\n    return {'key': a + b}\n",
+            "def foo(d):\n    return d.lower()[0]\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in &fm.mutations {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "container mutation {:?} produced unparseable Python for {:?}:\n{}",
+                        m.operator,
+                        source,
+                        mutated
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- Assert statement mutation tests ---
+#[cfg(test)]
+mod assert_mutation_tests {
+    use super::*;
+
+    // INV-1: `assert x + 1` — `+` inside assert test should be mutated.
+    #[test]
+    fn test_assert_test_expression_mutated() {
+        let source = "def foo(x):\n    assert x + 1\n    return x\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert!(!binops.is_empty(), "binop inside assert test should be mutated");
+    }
+
+    // INV-2: Assert mutation produces parseable Python.
+    #[test]
+    fn test_assert_mutation_parseable() {
+        let source = "def foo(x):\n    assert x + 1\n    return x\n";
+        let fms = collect_file_mutations(source);
+        for fm in &fms {
+            for m in &fm.mutations {
+                let mutated = apply_mutation(&fm.source, m);
+                assert!(
+                    parse_module(&mutated, None).is_ok(),
+                    "assert mutation {:?} produced unparseable Python:\n{}",
+                    m.operator,
+                    mutated
+                );
+            }
+        }
+    }
+
+    // INV-3: `assert a > b` — comparison inside assert is also mutated.
+    #[test]
+    fn test_assert_comparison_mutated() {
+        let source = "def foo(a, b):\n    assert a > b\n    return a\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let compops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "compop_swap").collect();
+        assert!(!compops.is_empty(), "comparison inside assert test should be mutated");
+    }
+}
+
+// --- Yield detection tests ---
+#[cfg(test)]
+mod yield_detection_tests {
+    use super::*;
+
+    // Helper: parse a function def and call suite_contains_yield.
+    fn check_yield_in_source(source: &str) -> bool {
+        let module = parse_module(source, None).expect("valid Python");
+        for stmt in &module.body {
+            if let Statement::Compound(CompoundStatement::FunctionDef(func)) = stmt {
+                return suite_contains_yield(&func.body);
+            }
+        }
+        panic!("no function def found in source");
+    }
+
+    // INV-1: `yield` inside an `if` block → detected.
+    #[test]
+    fn test_yield_inside_if_detected() {
+        // Note: we need a mutable expr to ensure collect_file_mutations works if called,
+        // but here we directly test suite_contains_yield.
+        let source = "def gen():\n    if True:\n        yield 1\n";
+        assert!(check_yield_in_source(source), "yield inside if must be detected");
+    }
+
+    // INV-2: `yield` inside a `while` loop → detected.
+    #[test]
+    fn test_yield_inside_while_detected() {
+        let source = "def gen():\n    while True:\n        yield 1\n";
+        assert!(check_yield_in_source(source), "yield inside while must be detected");
+    }
+
+    // INV-3: `yield` inside a `for` loop → detected.
+    #[test]
+    fn test_yield_inside_for_detected() {
+        let source = "def gen(items):\n    for x in items:\n        yield x\n";
+        assert!(check_yield_in_source(source), "yield inside for must be detected");
+    }
+
+    // INV-4: `yield` inside a `with` block → detected.
+    #[test]
+    fn test_yield_inside_with_detected() {
+        let source = "def gen(f):\n    with open(f) as h:\n        yield h.read()\n";
+        assert!(check_yield_in_source(source), "yield inside with must be detected");
+    }
+
+    // INV-5: `yield` inside `try/except` → detected.
+    #[test]
+    fn test_yield_inside_try_detected() {
+        let source = "def gen():\n    try:\n        yield 1\n    except Exception:\n        pass\n";
+        assert!(check_yield_in_source(source), "yield inside try must be detected");
+    }
+
+    // INV-6: `yield` inside a nested `def` → NOT detected (must not recurse past FunctionDef).
+    #[test]
+    fn test_yield_inside_nested_def_not_detected() {
+        let source = "def outer():\n    def inner():\n        yield 1\n    return 0\n";
+        assert!(
+            !check_yield_in_source(source),
+            "yield inside nested def must NOT make outer a generator"
+        );
+    }
+
+    // INV-7: No yield anywhere → not detected.
+    #[test]
+    fn test_no_yield_not_detected() {
+        let source = "def foo():\n    return 1 + 2\n";
+        assert!(!check_yield_in_source(source), "function without yield must not be detected");
+    }
+
+    // INV-8: `yield from` → detected.
+    #[test]
+    fn test_yield_from_detected() {
+        let source = "def gen(items):\n    yield from items\n";
+        assert!(check_yield_in_source(source), "yield from must be detected");
+    }
+
+    // INV-9: Top-level `yield` (simple return body style) → detected.
+    #[test]
+    fn test_top_level_yield_detected() {
+        let source = "def gen():\n    yield 1\n";
+        assert!(check_yield_in_source(source), "top-level yield must be detected");
+    }
+
+    // INV-10: `yield` inside `except` handler (not in body) → detected.
+    #[test]
+    fn test_yield_inside_except_handler_detected() {
+        let source = "def gen():\n    try:\n        pass\n    except Exception:\n        yield 0\n";
+        assert!(check_yield_in_source(source), "yield inside except handler must be detected");
+    }
+
+    // INV-11: `yield` only inside nested def — outer is_generator flag is correctly False.
+    // Exercises the is_generator field of FunctionMutations by collecting mutations.
+    #[test]
+    fn test_outer_is_generator_false_when_yield_only_in_nested_def() {
+        // outer needs a mutation so it gets collected; use a comparison.
+        let source = "def outer(n):\n    if n > 0:\n        def inner():\n            yield n\n    return n\n";
+        let fms = collect_file_mutations(source);
+        let outer = fms.iter().find(|fm| fm.name == "outer").expect("outer should be collected");
+        assert!(
+            !outer.is_generator,
+            "outer must not be is_generator just because nested def has yield"
+        );
+    }
+}
