@@ -4077,6 +4077,118 @@ mod yield_detection_tests {
             }
         }
     }
+
+    // Kills mutant: line 329 `||` → `&&` (float detection via `.`) and
+    //               line 332 `!=` → `==` (float dedup guard).
+    // A simple float like `1.5` contains `.` but NOT `e`, so with `&&` it would
+    // skip the float branch entirely — no default_arg mutation would be emitted.
+    // With `==`, the dedup guard `r != trimmed` would flip to `r == trimmed`, which
+    // is never true for n+1.0 vs n, so the mutation would be suppressed.
+    #[test]
+    fn test_default_float_simple() {
+        let source = "def f(x=1.5):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("def f(x=1.5) must produce a default_arg mutation");
+        assert_eq!(m.original, "1.5");
+        assert_eq!(m.replacement, "2.5");
+        assert_eq!(&fms[0].source[m.start..m.end], "1.5");
+    }
+
+    // Kills mutant: line 329 `||` → `&&` via the `e` branch.
+    // `1e2` contains `e` but NOT `.`, so with `&&` the float branch would be skipped.
+    #[test]
+    fn test_default_float_scientific() {
+        let source = "def f(x=1e2):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("def f(x=1e2) must produce a default_arg mutation");
+        assert_eq!(m.original, "1e2");
+        // 1e2 = 100.0, +1.0 = 101.0
+        assert_eq!(m.replacement, "101");
+        assert_eq!(&fms[0].source[m.start..m.end], "1e2");
+    }
+
+    // Kills mutant: line 343 `==` → `!=` (triple-quote detection: `quote_char == '"'`).
+    // Flipping to `!=` would choose `'''` as the triple for a `"`-quoted string, so
+    // `!rest.starts_with("'''")` would be true for `'hello'` but the wrong check runs.
+    // More directly: single-quoted string `'hello'` must produce a mutation.
+    #[test]
+    fn test_default_single_quoted_string() {
+        let source = "def f(x='hello'):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("def f(x='hello') must produce a default_arg mutation");
+        assert_eq!(m.original, "'hello'");
+        assert_eq!(m.replacement, "'XXhelloXX'");
+        assert_eq!(&fms[0].source[m.start..m.end], "'hello'");
+    }
+
+    // Kills mutant: line 344 `&&` → `||` (compound guard weakening).
+    // Triple-quoted `"""doc"""` falls through to the `None` fallback — replacement must be "None".
+    // If either `&&` becomes `||`, the guard weakens: `!starts_with(triple) || ends_with(q)` is
+    // true for `"""doc"""` (ends_with `"` is true), so it would enter the string branch and
+    // produce `"""XXdocXX"""` instead. The test pins the replacement to "None".
+    #[test]
+    fn test_default_triple_quoted_fallback() {
+        let source = "def f(x=\"\"\"doc\"\"\"):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("triple-quoted default must still produce a default_arg mutation via fallback");
+        // Must fall back to None replacement, NOT wrap with XX (which would happen if && → ||)
+        assert_eq!(
+            m.replacement, "None",
+            "triple-quoted string must get fallback 'None' replacement, not XX-wrapping"
+        );
+        assert_ne!(
+            m.replacement, "\"\"\"XXdocXX\"\"\"",
+            "triple-quoted string must not be XX-wrapped"
+        );
+    }
+
+    // Kills mutant: line 344 second `&&` → `||` (ends_with guard).
+    // Confirms both sides of the compound guard work independently.
+    // - single-quoted `'hi'`: must produce XX-wrapped mutation (not None fallback)
+    // - triple-quoted `'''hi'''`: must produce None fallback (not XX-wrapped)
+    #[test]
+    fn test_default_string_guard_compound() {
+        // Normal single-quoted: must produce XX mutation
+        let source_single = "def f(x='hi'):\n    return x\n";
+        let fms = collect_file_mutations(source_single);
+        let m = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("single-quoted 'hi' must produce default_arg mutation");
+        assert_eq!(m.replacement, "'XXhiXX'", "single-quoted must get XX-wrapped replacement");
+
+        // Triple-quoted: must fall back to None, not produce XX-wrapping
+        // Second `&&` → `||` makes condition: `(A && B) || C` where C=`len>=2` is always true,
+        // so triple-quoted would enter the string branch and produce '''XXhiXX''' instead.
+        let source_triple = "def f(x='''hi'''):\n    return x\n";
+        let fms2 = collect_file_mutations(source_triple);
+        let m2 = fms2[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "default_arg")
+            .expect("triple-quoted '''hi''' must produce a default_arg mutation (fallback to None)");
+        assert_eq!(
+            m2.replacement, "None",
+            "triple-quoted must get fallback 'None', not '''XXhiXX'''"
+        );
+    }
 }
 
 // --- Keyword swap tests (break→return, continue→break) ---
