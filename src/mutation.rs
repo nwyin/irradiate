@@ -11,7 +11,7 @@
 
 use libcst_native::{
     self as cst, parse_module, BinaryOp, BooleanOp, Codegen, CodegenState, CompOp,
-    CompoundStatement, Expression, SmallStatement, Statement, UnaryOp,
+    CompoundStatement, Expression, SmallStatement, Statement, UnaryOp, YieldValue,
 };
 
 /// A single mutation that can be applied to source code.
@@ -605,6 +605,19 @@ fn collect_expr_mutations(
         }
         Expression::Attribute(attr) => {
             collect_expr_mutations(&attr.value, source, &mut local, mutations, ignored);
+        }
+        Expression::Yield(y) => {
+            // Recurse into the yielded value so operators inside `yield x OP y` are mutated.
+            if let Some(ref yv) = y.value {
+                match yv.as_ref() {
+                    YieldValue::Expression(inner) => {
+                        collect_expr_mutations(inner, source, &mut local, mutations, ignored);
+                    }
+                    YieldValue::From(from) => {
+                        collect_expr_mutations(&from.item, source, &mut local, mutations, ignored);
+                    }
+                }
+            }
         }
         _ => {}
     }
