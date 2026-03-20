@@ -145,7 +145,9 @@ fn generate_wrapper_function(
     //   async regular    → return await trampoline(...)
     //   sync regular     → return trampoline(...)
     let body = match (is_async, is_generator) {
-        (true, true) => format!("    async for _item in {trampoline_call}:\n        yield _item"),
+        (true, true) => format!(
+            "    _agen = {trampoline_call}\n    try:\n        async for _item in _agen:\n            yield _item\n    finally:\n        await _agen.aclose()"
+        ),
         (false, true) => format!("    yield from {trampoline_call}"),
         (true, false) => format!("    return await {trampoline_call}"),
         (false, false) => format!("    return {trampoline_call}"),
@@ -703,9 +705,11 @@ mod tests {
         );
     }
 
+    // INV-1: Async generator wrapper must contain try/finally/aclose for proper cleanup.
+    // INV-2: Async generator wrapper must still yield items correctly.
     // INV-3: Async generator wrapper uses `async for ... yield` instead of `return await`.
     #[test]
-    fn test_async_generator_wrapper_uses_async_for_yield() {
+    fn test_async_generator_wrapper_uses_try_finally_aclose() {
         let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
         assert!(
@@ -713,11 +717,31 @@ mod tests {
             "async generator with compop must produce mutations"
         );
         let output = generate_trampoline(&fms[0], "agen_mod");
+        // INV-1: must assign to _agen and use try/finally/aclose
         assert!(
-            output
-                .wrapper_code
-                .contains("async for _item in _irradiate_trampoline("),
-            "Async generator wrapper must use 'async for _item in', got:\n{}",
+            output.wrapper_code.contains("_agen = _irradiate_trampoline("),
+            "Async generator wrapper must assign trampoline to _agen, got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains("try:"),
+            "Async generator wrapper must have 'try:', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains("finally:"),
+            "Async generator wrapper must have 'finally:', got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains("await _agen.aclose()"),
+            "Async generator wrapper must call 'await _agen.aclose()', got:\n{}",
+            output.wrapper_code
+        );
+        // INV-2: must still yield items
+        assert!(
+            output.wrapper_code.contains("async for _item in _agen:"),
+            "Async generator wrapper must use 'async for _item in _agen:', got:\n{}",
             output.wrapper_code
         );
         assert!(
@@ -725,6 +749,7 @@ mod tests {
             "Async generator wrapper must yield _item, got:\n{}",
             output.wrapper_code
         );
+        // INV-3: must be async def, must not use return
         assert!(
             !output.wrapper_code.contains("return "),
             "Async generator wrapper must NOT use 'return', got:\n{}",
