@@ -100,6 +100,10 @@ const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__
 /// Builtin function calls that are never mutated (neither the call itself nor its arguments).
 static NEVER_MUTATE_FUNCTION_CALLS: &[&str] = &["len", "isinstance"];
 
+/// Decorators whose removal is skipped: removing them changes ABC semantics fundamentally
+/// (@abstractmethod) or is semantically meaningless for mutation testing (@override).
+const SKIP_DECORATOR_REMOVAL: &[&str] = &["abstractmethod", "override"];
+
 fn collect_function_mutations(
     func: &cst::FunctionDef,
     class_name: Option<&str>,
@@ -110,11 +114,6 @@ fn collect_function_mutations(
 
     // Skip dunder methods that affect object identity
     if NEVER_MUTATE_FUNCTIONS.contains(&name.as_str()) {
-        return None;
-    }
-
-    // Skip decorated functions (same rationale as mutmut)
-    if !func.decorators.is_empty() {
         return None;
     }
 
@@ -151,6 +150,31 @@ fn collect_function_mutations(
         &mut mutations,
         ignored_lines,
     );
+
+    // Decorator removal mutations: one per non-skipped decorator.
+    // Uses a separate forward cursor since decorators precede `def` in func_source.
+    let mut dec_cursor: usize = 0;
+    for dec in &func.decorators {
+        let dec_expr_text = codegen_node(&dec.decorator);
+        let dec_expr_trimmed = dec_expr_text.trim();
+        let dec_text = codegen_node(dec);
+
+        // Skip decorators that must not be removed.
+        if SKIP_DECORATOR_REMOVAL.contains(&dec_expr_trimmed) {
+            // Still advance the cursor so subsequent decorators are found correctly.
+            if let Some(pos) = func_source[dec_cursor..].find(&dec_text) {
+                dec_cursor += pos + dec_text.len();
+            }
+            continue;
+        }
+
+        if let Some(pos) = func_source[dec_cursor..].find(&dec_text) {
+            let dec_start = dec_cursor + pos;
+            // Replacement is "" — removing the decorator line entirely.
+            record_mutation(&dec_text, "", "decorator_removal", dec_start, &mut mutations);
+            dec_cursor = dec_start + dec_text.len();
+        }
+    }
 
     // Post-collection pragma filtering: map each mutation's byte offset within
     // func_source to an absolute line number in the full file, then drop any
@@ -1592,10 +1616,19 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_decorated_functions() {
+    fn test_decorated_functions_are_collected() {
+        // Decorated functions are now fully processed: body mutations + decorator_removal.
         let source = "@decorator\ndef foo():\n    return 1 + 2\n";
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty(), "Decorated functions should be skipped");
+        assert_eq!(fms.len(), 1, "Decorated function should be collected");
+        let dec_removals: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "decorator_removal")
+            .collect();
+        assert_eq!(dec_removals.len(), 1, "Should have one decorator_removal mutation");
+        assert_eq!(dec_removals[0].original, "@decorator\n");
+        assert_eq!(dec_removals[0].replacement, "");
     }
 
     #[test]
@@ -4208,6 +4241,170 @@ mod return_value_tests {
             "the text before the value span must end with 'return ', got: {:?}",
             before_span
         );
+    }
+
+    // =====================================================================
+    // Decorator removal tests
+    // =====================================================================
+    #[cfg(test)]
+    mod decorator_removal_tests {
+        use super::*;
+
+        // INV-1: A single non-skipped decorator produces exactly one decorator_removal mutation.
+        #[test]
+        fn test_single_decorator_removed() {
+            let source = "@cache\ndef f():\n    return 1\n";
+            let fms = collect_file_mutations(source);
+            assert_eq!(fms.len(), 1, "decorated function must be collected");
+            let removals: Vec<_> = fms[0]
+                .mutations
+                .iter()
+                .filter(|m| m.operator == "decorator_removal")
+                .collect();
+            assert_eq!(removals.len(), 1, "should produce one decorator_removal");
+            assert_eq!(removals[0].original, "@cache\n", "original must be the full decorator line");
+            assert_eq!(removals[0].replacement, "", "replacement must be empty string");
+        }
+
+        // INV-2: Two non-skipped decorators each produce an independent decorator_removal mutation.
+        #[test]
+        fn test_multiple_decorators_independent() {
+            let source = "@a\n@b\ndef f():\n    return 1\n";
+            let fms = collect_file_mutations(source);
+            assert_eq!(fms.len(), 1);
+            let removals: Vec<_> = fms[0]
+                .mutations
+                .iter()
+                .filter(|m| m.operator == "decorator_removal")
+                .collect();
+            assert_eq!(removals.len(), 2, "should produce two decorator_removal mutations");
+            // Spans must be distinct and non-overlapping
+            let start_a = removals.iter().find(|m| m.original == "@a\n").expect("@a\n removal");
+            let start_b = removals.iter().find(|m| m.original == "@b\n").expect("@b\n removal");
+            assert!(
+                start_a.start != start_b.start,
+                "different decorators must have different start offsets"
+            );
+        }
+
+        // INV-3: @abstractmethod is never emitted as a decorator_removal mutation.
+        #[test]
+        fn test_abstractmethod_skipped() {
+            let source = "@abstractmethod\ndef f():\n    return 1\n";
+            let fms = collect_file_mutations(source);
+            // Only body mutations (return_value) — no decorator_removal.
+            if let Some(fm) = fms.first() {
+                let removals: Vec<_> = fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "decorator_removal")
+                    .collect();
+                assert!(removals.is_empty(), "@abstractmethod must not be removed");
+            }
+        }
+
+        // INV-4: @override is never emitted as a decorator_removal mutation.
+        #[test]
+        fn test_override_skipped() {
+            let source = "@override\ndef f():\n    return 1\n";
+            let fms = collect_file_mutations(source);
+            if let Some(fm) = fms.first() {
+                let removals: Vec<_> = fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "decorator_removal")
+                    .collect();
+                assert!(removals.is_empty(), "@override must not be removed");
+            }
+        }
+
+        // INV-5: Decorator with arguments produces one removal mutation for the full call line.
+        #[test]
+        fn test_decorator_with_args() {
+            let source = "@app.route(\"/path\")\ndef f():\n    return 1\n";
+            let fms = collect_file_mutations(source);
+            assert_eq!(fms.len(), 1);
+            let removals: Vec<_> = fms[0]
+                .mutations
+                .iter()
+                .filter(|m| m.operator == "decorator_removal")
+                .collect();
+            assert_eq!(removals.len(), 1, "decorated function with args must produce one removal");
+            assert!(
+                removals[0].original.starts_with("@app.route"),
+                "original must include the full decorator call"
+            );
+            assert_eq!(removals[0].replacement, "");
+        }
+
+        // INV-6: Applying any decorator_removal mutation produces parseable Python.
+        #[test]
+        fn test_decorator_removal_parseable() {
+            let cases = [
+                "@cache\ndef f():\n    return 1\n",
+                "@a\n@b\ndef f():\n    return 1\n",
+                "@app.route(\"/path\")\ndef f():\n    return 1\n",
+                "@staticmethod\ndef f():\n    return 1\n",
+            ];
+            for source in &cases {
+                let fms = collect_file_mutations(source);
+                for fm in &fms {
+                    for m in fm.mutations.iter().filter(|m| m.operator == "decorator_removal") {
+                        let mutated = apply_mutation(&fm.source, m);
+                        assert!(
+                            parse_module(&mutated, None).is_ok(),
+                            "decorator_removal of '{}' produced unparseable Python:\n{}",
+                            m.original,
+                            mutated
+                        );
+                    }
+                }
+            }
+        }
+
+        // INV-7: The decorator_removal mutation span correctly covers the full decorator line.
+        // source[m.start..m.end] == m.original, and m.start < m.end.
+        #[test]
+        fn test_decorator_removal_span_correctness() {
+            let cases = [
+                "@cache\ndef f():\n    return 1\n",
+                "@a\n@b\ndef f():\n    return 1\n",
+                "@staticmethod\ndef f(self):\n    return 1\n",
+            ];
+            for source in &cases {
+                let fms = collect_file_mutations(source);
+                for fm in &fms {
+                    for m in fm.mutations.iter().filter(|m| m.operator == "decorator_removal") {
+                        // Span bounds must be valid
+                        assert!(m.start < m.end, "start < end must hold");
+                        assert!(m.end <= fm.source.len(), "end must be within source");
+                        // Source slice must equal original
+                        assert_eq!(
+                            &fm.source[m.start..m.end],
+                            m.original.as_str(),
+                            "source[{}..{}] must equal original for decorator in {:?}",
+                            m.start,
+                            m.end,
+                            source
+                        );
+                    }
+                }
+            }
+        }
+
+        // INV-8: A decorated function also collects body mutations (e.g. binop_swap).
+        #[test]
+        fn test_decorated_function_body_mutations_collected() {
+            let source = "@cache\ndef f(a, b):\n    return a + b\n";
+            let fms = collect_file_mutations(source);
+            assert_eq!(fms.len(), 1);
+            let body_muts: Vec<_> = fms[0]
+                .mutations
+                .iter()
+                .filter(|m| m.operator != "decorator_removal")
+                .collect();
+            assert!(!body_muts.is_empty(), "body mutations must also be collected");
+        }
     }
 }
 
