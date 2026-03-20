@@ -456,6 +456,23 @@ macro_rules! assert_core_invariants {
     };
 }
 
+/// Generate `dict(k1=v1, k2=v2, ...)` calls with 1–4 keyword args.
+///
+/// Exercises `add_dict_kwarg_mutations`: each keyword argument must produce
+/// exactly one dict_kwarg mutation. Positional and starred args are not included
+/// here — they are covered by unit tests.
+fn dict_kwarg_strategy() -> impl Strategy<Value = String> {
+    prop::sample::select(vec![1usize, 2, 3, 4]).prop_map(|n| {
+        let kwarg_names = ["a", "b", "c", "d"];
+        let args: Vec<String> = kwarg_names[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| format!("{k}={}", i + 1))
+            .collect();
+        format!("def f():\n    return dict({})\n", args.join(", "))
+    })
+}
+
 proptest! {
     /// INV-1: Determinism — collecting mutations twice yields identical results.
     #[test]
@@ -1089,6 +1106,18 @@ proptest! {
         assert_core_invariants!(fms);
     }
 
+    // --- dict_kwarg tests ---
+
+    /// dict_kwarg sources satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches offset bugs in `add_dict_kwarg_mutations`: the keyword name span
+    /// must exactly match the keyword name in the function source text.
+    #[test]
+    fn dict_kwarg_all_invariants(source in dict_kwarg_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
     /// Return value sources produce at least one return_value mutation.
     ///
     /// Guards against the return_value arm being silently skipped: all variants in
@@ -1167,6 +1196,36 @@ proptest! {
             1,
             "single-default function must produce exactly 1 default_arg mutation; source:\n{}",
             source
+        );
+    }
+
+    /// N keyword args produce exactly N dict_kwarg mutations.
+    ///
+    /// INV-extra: ensures one mutation per kwarg, not zero (silent skip) or more than
+    /// one (spurious duplicates). A regression here would mean some kwargs go unmutated.
+    #[test]
+    fn dict_kwarg_count_equals_n_kwargs(source in dict_kwarg_strategy()) {
+        let fms = collect_file_mutations(&source);
+
+        // Count kwargs: the strategy generates `dict(a=1, b=2, ...)` — split on `,` and
+        // count segments that contain `=` (all are keyword args in this strategy).
+        // Subtract 1 because the `return dict(` prefix contains no `=`, and the
+        // segment count equals the number of kwargs.
+        let n_kwargs = source
+            .split(',')
+            .filter(|seg| seg.contains('='))
+            .count();
+
+        let dict_kwarg_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "dict_kwarg")
+            .count();
+
+        prop_assert_eq!(
+            dict_kwarg_count, n_kwargs,
+            "N kwargs must produce N dict_kwarg mutations, got {}; source:\n{}",
+            dict_kwarg_count, source
         );
     }
 }

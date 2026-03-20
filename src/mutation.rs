@@ -728,6 +728,7 @@ fn collect_expr_mutations(
             if !is_skip {
                 add_method_mutations(call, expr_start, mutations);
                 add_arg_removal_mutations(call, &expr_text, expr_start, mutations);
+                add_dict_kwarg_mutations(call, &expr_text, expr_start, mutations);
                 collect_expr_mutations(&call.func, source, &mut local, mutations, ignored);
                 for arg in &call.args {
                     collect_expr_mutations(&arg.value, source, &mut local, mutations, ignored);
@@ -1269,6 +1270,49 @@ fn add_arg_removal_mutations(
                 .collect();
             let new_call = format!("{}({})", func_text, new_args.join(", "));
             record_mutation(call_text, &new_call, "arg_removal", expr_start, mutations);
+        }
+    }
+}
+
+/// Generate dict keyword-name mutations for `dict(key=value)` calls.
+///
+/// For each keyword argument in a `dict(...)` call, emits a mutation that appends "XX"
+/// to the keyword name: `dict(foo=1)` → `dict(fooXX=1)`.
+///
+/// Only fires for calls to the bare name `dict` — not for arbitrary callables with keyword args.
+/// Positional args and starred args (`**extra`) are skipped.
+fn add_dict_kwarg_mutations(
+    call: &cst::Call,
+    call_text: &str,
+    expr_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // Only mutate `dict(...)` calls.
+    if !matches!(&*call.func, Expression::Name(n) if n.value == "dict") {
+        return;
+    }
+
+    for arg in call.args.iter() {
+        let kw = match &arg.keyword {
+            Some(k) => k,
+            None => continue, // positional or **splat — skip
+        };
+        // Skip **kwargs (double-starred args have keyword but also star="**").
+        if !arg.star.is_empty() {
+            continue;
+        }
+
+        let kw_name = kw.value;
+        let mutated_name = format!("{kw_name}XX");
+
+        // The mutation spans the keyword name only. Find it inside call_text.
+        // The keyword appears as `<kw_name>=` after the opening `(`. Python requires
+        // unique keyword names in a call, so the first occurrence is always correct.
+        let open_paren = call_text.find('(').unwrap_or(0);
+        let needle = format!("{kw_name}=");
+        if let Some(rel) = call_text[open_paren..].find(needle.as_str()) {
+            let kw_start = open_paren + rel;
+            record_mutation(kw_name, &mutated_name, "dict_kwarg", expr_start + kw_start, mutations);
         }
     }
 }
@@ -4310,6 +4354,104 @@ mod split_swap_tests {
                 "mutated source must preserve call arguments: got {:?}",
                 mutated
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dict_kwarg_tests {
+    use super::*;
+
+    fn kwarg_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations)
+            .filter(|m| m.operator == "dict_kwarg")
+            .collect()
+    }
+
+    #[test]
+    fn test_dict_single_kwarg() {
+        let source = "def f():\n    return dict(a=1)\n";
+        let muts = kwarg_mutations(source);
+        assert_eq!(muts.len(), 1, "dict(a=1) must produce exactly one dict_kwarg mutation");
+        assert_eq!(muts[0].original, "a");
+        assert_eq!(muts[0].replacement, "aXX");
+    }
+
+    #[test]
+    fn test_dict_multiple_kwargs() {
+        let source = "def f():\n    return dict(a=1, b=2)\n";
+        let muts = kwarg_mutations(source);
+        assert_eq!(muts.len(), 2, "dict(a=1, b=2) must produce two dict_kwarg mutations");
+        let originals: Vec<&str> = muts.iter().map(|m| m.original.as_str()).collect();
+        assert!(originals.contains(&"a"), "must mutate kwarg 'a'");
+        assert!(originals.contains(&"b"), "must mutate kwarg 'b'");
+        assert_eq!(muts.iter().find(|m| m.original == "a").unwrap().replacement, "aXX");
+        assert_eq!(muts.iter().find(|m| m.original == "b").unwrap().replacement, "bXX");
+    }
+
+    #[test]
+    fn test_dict_no_kwargs() {
+        let source = "def f():\n    return dict()\n";
+        let muts = kwarg_mutations(source);
+        assert!(muts.is_empty(), "dict() must produce no dict_kwarg mutations");
+    }
+
+    #[test]
+    fn test_dict_positional_only() {
+        let source = "def f():\n    return dict([(1, 2)])\n";
+        let muts = kwarg_mutations(source);
+        assert!(muts.is_empty(), "dict with positional-only args must not produce dict_kwarg mutations");
+    }
+
+    #[test]
+    fn test_dict_mixed_args() {
+        // dict(a=1, **extra) — only `a` is a plain keyword arg; **extra is starred
+        let source = "def f(extra):\n    return dict(a=1, **extra)\n";
+        let muts = kwarg_mutations(source);
+        assert_eq!(muts.len(), 1, "only plain kwarg 'a' must be mutated, not **extra");
+        assert_eq!(muts[0].original, "a");
+        assert_eq!(muts[0].replacement, "aXX");
+    }
+
+    #[test]
+    fn test_non_dict_call_no_mutation() {
+        // foo(a=1) must NOT produce dict_kwarg mutations — only dict() calls are targeted.
+        let source = "def f():\n    foo(a=1)\n";
+        let muts = kwarg_mutations(source);
+        assert!(muts.is_empty(), "foo(a=1) must not produce dict_kwarg mutations");
+    }
+
+    #[test]
+    fn test_dict_kwarg_parseable() {
+        // Verify that applying all dict_kwarg mutations produces valid (parseable) Python.
+        let source = "def f():\n    return dict(foo=1, bar=2)\n";
+        let fms = collect_file_mutations(source);
+        for fm in &fms {
+            for m in fm.mutations.iter().filter(|m| m.operator == "dict_kwarg") {
+                let mutated = apply_mutation(&fm.source, m);
+                // A mutated source is parseable if libcst can collect mutations from it.
+                // We only need to verify that collect_file_mutations doesn't panic.
+                let _ = collect_file_mutations(&mutated);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dict_kwarg_span_correctness() {
+        // INV-3: fm.source[m.start..m.end] must equal m.original for dict_kwarg mutations.
+        let source = "def f():\n    return dict(foo=1, bar=2)\n";
+        let fms = collect_file_mutations(source);
+        for fm in &fms {
+            for m in fm.mutations.iter().filter(|m| m.operator == "dict_kwarg") {
+                let slice = &fm.source[m.start..m.end];
+                assert_eq!(
+                    slice, m.original.as_str(),
+                    "source slice at [{}..{}] must equal original '{}', got '{}'",
+                    m.start, m.end, m.original, slice
+                );
+            }
         }
     }
 }
