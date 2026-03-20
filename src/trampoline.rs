@@ -62,11 +62,24 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     // Set __name__ on orig for trampoline dispatch
     module_lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
 
-    // Trampoline wrapper with original name and signature
-    let self_arg = if fm.class_name.is_some() {
-        "self"
+    // Trampoline wrapper with original name and signature.
+    // Determine self_arg (Python value passed as last arg to trampoline), whether the first
+    // parameter is implicit (and should be stripped from call_args), and the lookup prefix for
+    // the mangled names (class attribute access style depends on method kind).
+    let (self_arg, has_self, lookup_prefix) = if fm.is_classmethod {
+        // @classmethod: first param is `cls` (strip it from call_args); look up via `cls.`
+        // because cls IS the class. Pass None as self_arg — bound classmethod has cls implicit.
+        ("None", true, "cls.".to_string())
+    } else if fm.is_staticmethod {
+        // @staticmethod: no implicit first arg; look up via ClassName. (only option without self/cls).
+        let cls = fm.class_name.as_deref().unwrap_or("");
+        ("None", false, if cls.is_empty() { String::new() } else { format!("{cls}.") })
+    } else if fm.class_name.is_some() {
+        // Regular instance method: pass self; look up via type(self). for MRO-correct access.
+        ("self", true, "type(self).".to_string())
     } else {
-        "None"
+        // Top-level function: bare names are in module scope.
+        ("None", false, String::new())
     };
     let params_text = &fm.params_source;
     let wrapper_code = generate_wrapper_function(
@@ -74,6 +87,8 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
         &mangled,
         params_text,
         self_arg,
+        has_self,
+        &lookup_prefix,
         fm.is_async,
         fm.is_generator,
         &fm.return_annotation,
@@ -86,11 +101,14 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_wrapper_function(
     original_name: &str,
     mangled_name: &str,
     params_source: &str,
     self_arg: &str,
+    has_self: bool,
+    lookup_prefix: &str,
     is_async: bool,
     is_generator: bool,
     return_annotation: &str,
@@ -98,8 +116,8 @@ fn generate_wrapper_function(
     let async_prefix = if is_async { "async " } else { "" };
 
     // Parse parameter names from the params source to build forwarding args.
-    // We need to collect positional args into a tuple and kwargs into a dict.
-    let (pos_args, kw_args, kwargs_name) = parse_param_names(params_source, self_arg != "None");
+    // has_self=true strips the implicit first parameter (self or cls) from call_args.
+    let (pos_args, kw_args, kwargs_name) = parse_param_names(params_source, has_self);
 
     let args_list = if pos_args.is_empty() {
         "()".to_string()
@@ -122,14 +140,11 @@ fn generate_wrapper_function(
         format!("{{{}}}", entries.join(", "))
     };
 
-    // Class method wrappers must look up the mangled orig/mutants via `type(self)` because
-    // class body names are NOT in scope for methods — they are class attributes, not locals/globals.
-    // Top-level functions use bare module-level names (no prefix needed).
-    let lookup_prefix = if self_arg == "self" {
-        "type(self)."
-    } else {
-        ""
-    };
+    // lookup_prefix controls how mangled names are resolved:
+    //   instance method  → "type(self)." (class attribute via MRO)
+    //   classmethod      → "cls."        (cls IS the class)
+    //   staticmethod     → "ClassName."  (no implicit arg; use class name directly)
+    //   top-level fn     → ""            (module globals are directly accessible)
     let trampoline_call = format!(
         "_irradiate_trampoline({lookup_prefix}{mangled_name}__irradiate_orig, {lookup_prefix}{mangled_name}__irradiate_mutants, {args_list}, {kwargs_dict}, {self_arg})"
     );
@@ -282,8 +297,9 @@ pub fn parse_param_names(
         }
     }
 
-    // Strip 'self' for class methods
-    if has_self && !pos_args.is_empty() && pos_args[0] == "self" {
+    // Strip the implicit first argument (self for instance methods, cls for classmethods).
+    // We strip by position rather than by name so that both `self` and `cls` are handled.
+    if has_self && !pos_args.is_empty() {
         pos_args.remove(0);
     }
 
@@ -492,6 +508,8 @@ mod tests {
             "a, /, b, *, c, **kwargs",
             "None",
             false,
+            "",
+            false,
             false,
             "",
         );
@@ -515,6 +533,8 @@ mod tests {
             "a, b: str = \"111\"",
             "None",
             false,
+            "",
+            false,
             false,
             " -> int | None",
         );
@@ -527,7 +547,8 @@ mod tests {
     // INV-3: Wrapper without return annotation or kwargs still correct.
     #[test]
     fn test_wrapper_no_annotation_no_kwargs() {
-        let wrapper = generate_wrapper_function("add", "x_add", "a, b", "None", false, false, "");
+        let wrapper =
+            generate_wrapper_function("add", "x_add", "a, b", "None", false, "", false, false, "");
         assert!(
             wrapper.starts_with("def add(a, b):"),
             "wrapper def line must be clean: {wrapper}"
@@ -759,6 +780,210 @@ mod tests {
         assert!(
             !output.wrapper_code.contains("yield"),
             "Sync regular wrapper must NOT use 'yield', got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // @classmethod / @staticmethod dispatch (INV-1, INV-2, INV-3, INV-4)
+    // ─────────────────────────────────────────────────────────────────
+
+    // INV-4: is_classmethod is true iff @classmethod decorator is present.
+    #[test]
+    fn test_is_classmethod_detected() {
+        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
+        let fms = collect_file_mutations(source);
+        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
+        assert!(cm.is_classmethod, "escape must be detected as classmethod");
+        assert!(!cm.is_staticmethod, "escape must not be detected as staticmethod");
+    }
+
+    // INV-4: is_classmethod is false for a regular instance method.
+    #[test]
+    fn test_is_classmethod_false_for_instance_method() {
+        let source = "class Foo:\n    def method(self, v):\n        return v + 1\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "method").expect("should find method");
+        assert!(!fm.is_classmethod, "regular method must not be classmethod");
+        assert!(!fm.is_staticmethod, "regular method must not be staticmethod");
+    }
+
+    // INV-4: is_staticmethod is true iff @staticmethod decorator is present.
+    #[test]
+    fn test_is_staticmethod_detected() {
+        let source =
+            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
+        let fms = collect_file_mutations(source);
+        let sm = fms
+            .iter()
+            .find(|fm| fm.name == "format")
+            .expect("should find format");
+        assert!(sm.is_staticmethod, "format must be detected as staticmethod");
+        assert!(!sm.is_classmethod, "format must not be detected as classmethod");
+    }
+
+    // INV-4: Method with @classmethod plus another decorator is still detected as classmethod.
+    #[test]
+    fn test_is_classmethod_with_additional_decorator() {
+        // @classmethod + @functools.lru_cache stacked
+        let source = "class Foo:\n    @classmethod\n    @some_decorator\n    def cached(cls, x):\n        return x + 1\n";
+        let fms = collect_file_mutations(source);
+        let cm = fms.iter().find(|fm| fm.name == "cached").expect("should find cached");
+        assert!(cm.is_classmethod, "cached must be detected as classmethod even with another decorator");
+    }
+
+    // INV-1: @classmethod trampoline wrapper must NOT reference `self` — uses `cls.` prefix.
+    #[test]
+    fn test_classmethod_wrapper_uses_cls_prefix_not_self() {
+        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
+        let fms = collect_file_mutations(source);
+        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
+        let output = generate_trampoline(cm, "markup");
+        assert!(
+            output.wrapper_code.contains("cls."),
+            "classmethod wrapper must use cls. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("type(self)"),
+            "classmethod wrapper must NOT use type(self); got:\n{}",
+            output.wrapper_code
+        );
+        // INV-1: self must not appear anywhere in the wrapper body
+        // (the def line has 'cls' as first param, not 'self')
+        assert!(
+            !output.wrapper_code.contains(", self)"),
+            "classmethod wrapper must NOT pass self to trampoline; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-1: @classmethod wrapper correctly strips cls from call_args (cls is implicit).
+    #[test]
+    fn test_classmethod_wrapper_strips_cls_from_call_args() {
+        // escape(cls, s) → call_args should contain only s, not cls
+        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
+        let fms = collect_file_mutations(source);
+        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
+        let output = generate_trampoline(cm, "markup");
+        // The wrapper should be `def escape(cls, s): return _irradiate_trampoline(..., (s,), {}, None)`
+        // cls must NOT appear in the args tuple passed to trampoline
+        assert!(
+            output.wrapper_code.contains("(s,)"),
+            "classmethod call_args must contain only s (not cls); got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains(", None)"),
+            "classmethod self_arg must be None (cls is implicit in bound method); got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-2: @staticmethod trampoline wrapper must NOT reference `self` or `cls`.
+    // Lookup uses the class name directly.
+    #[test]
+    fn test_staticmethod_wrapper_uses_class_name_prefix() {
+        let source =
+            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
+        let fms = collect_file_mutations(source);
+        let sm = fms
+            .iter()
+            .find(|fm| fm.name == "format")
+            .expect("should find format");
+        let output = generate_trampoline(sm, "formatter");
+        assert!(
+            output.wrapper_code.contains("Formatter."),
+            "staticmethod wrapper must use ClassName. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("type(self)"),
+            "staticmethod wrapper must NOT use type(self); got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            !output.wrapper_code.contains("cls."),
+            "staticmethod wrapper must NOT use cls.; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-2: @staticmethod wrapper includes all params in call_args (no stripping).
+    #[test]
+    fn test_staticmethod_wrapper_all_params_in_call_args() {
+        let source =
+            "class Formatter:\n    @staticmethod\n    def format(value, width):\n        return value + width\n";
+        let fms = collect_file_mutations(source);
+        let sm = fms
+            .iter()
+            .find(|fm| fm.name == "format")
+            .expect("should find format");
+        let output = generate_trampoline(sm, "formatter");
+        // Both value and width must appear in call_args tuple
+        assert!(
+            output.wrapper_code.contains("(value, width)"),
+            "staticmethod call_args must contain both params; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-3: Instance method still uses type(self). prefix (regression check).
+    #[test]
+    fn test_instance_method_still_uses_type_self_prefix() {
+        let source = "class Foo:\n    def method(self, v):\n        return v + 1\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "method").expect("should find method");
+        let output = generate_trampoline(fm, "foo_module");
+        assert!(
+            output.wrapper_code.contains("type(self)."),
+            "instance method must still use type(self). prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains(", self)"),
+            "instance method must pass self to trampoline; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-2: @staticmethod with zero parameters (no implicit args, empty call_args).
+    #[test]
+    fn test_staticmethod_zero_params() {
+        let source = "class Bar:\n    @staticmethod\n    def get_default():\n        return 0 + 1\n";
+        let fms = collect_file_mutations(source);
+        let sm = fms
+            .iter()
+            .find(|fm| fm.name == "get_default")
+            .expect("should find get_default");
+        assert!(sm.is_staticmethod, "get_default must be staticmethod");
+        let output = generate_trampoline(sm, "bar_module");
+        assert!(
+            output.wrapper_code.contains("Bar."),
+            "zero-param staticmethod must use ClassName. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        // call_args must be empty tuple
+        assert!(
+            output.wrapper_code.contains("()"),
+            "zero-param staticmethod must have empty call_args; got:\n{}",
+            output.wrapper_code
+        );
+    }
+
+    // INV-1+INV-3: @classmethod wrapper parses as valid Python (syntax check).
+    #[test]
+    fn test_classmethod_wrapper_parses_as_valid_python() {
+        use libcst_native::parse_module;
+        let source = "class Markup:\n    @classmethod\n    def escape(cls, s):\n        return s + 'x'\n";
+        let fms = collect_file_mutations(source);
+        let cm = fms.iter().find(|fm| fm.name == "escape").expect("should find escape");
+        let output = generate_trampoline(cm, "markup");
+        // Wrap in a class to make the wrapper parseable as a complete module
+        let full = format!("class _Dummy:\n    {}\n", output.wrapper_code.replace('\n', "\n    "));
+        assert!(
+            parse_module(&full, None).is_ok(),
+            "classmethod wrapper must be valid Python; got:\n{}",
             output.wrapper_code
         );
     }

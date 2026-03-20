@@ -47,6 +47,10 @@ pub struct FunctionMutations {
     /// Whether the function is a generator (contains `yield` at the function body level,
     /// not inside nested functions). An async generator has both `is_async` and `is_generator`.
     pub is_generator: bool,
+    /// Whether the function has a `@classmethod` decorator.
+    pub is_classmethod: bool,
+    /// Whether the function has a `@staticmethod` decorator.
+    pub is_staticmethod: bool,
     /// Mutations found within this function body.
     pub mutations: Vec<Mutation>,
 }
@@ -121,6 +125,16 @@ fn collect_function_mutations(
     let params_source = codegen_node(&func.params);
     let is_async = func.asynchronous.is_some();
     let is_generator = suite_contains_yield(&func.body);
+
+    // Detect @classmethod / @staticmethod decorators.
+    let is_classmethod = func
+        .decorators
+        .iter()
+        .any(|dec| codegen_node(&dec.decorator).trim() == "classmethod");
+    let is_staticmethod = func
+        .decorators
+        .iter()
+        .any(|dec| codegen_node(&dec.decorator).trim() == "staticmethod");
 
     // Extract return type annotation, e.g. " -> int | None"
     let return_annotation = if let Some(ann) = &func.returns {
@@ -209,6 +223,8 @@ fn collect_function_mutations(
         return_annotation,
         is_async,
         is_generator,
+        is_classmethod,
+        is_staticmethod,
         mutations,
     })
 }
