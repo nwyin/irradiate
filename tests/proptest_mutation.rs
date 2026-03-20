@@ -130,6 +130,100 @@ fn unary_expr_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// Generate Python class definitions with a regular method containing a binary operator.
+///
+/// Exercises the class method collection path in `collect_file_mutations()`.
+/// Methods like `compute`, `process`, etc. are regular (non-dunder) so they ARE mutated.
+fn class_method_strategy() -> impl Strategy<Value = String> {
+    let class_names = prop::sample::select(vec!["MyClass", "Foo", "Bar", "Processor"]);
+    let method_names = prop::sample::select(vec!["compute", "process", "run", "execute"]);
+    let ops = arith_ops();
+    let v1 = int_vals();
+    let v2 = int_vals();
+
+    (class_names, method_names, ops, v1, v2).prop_map(|(cls, method, op, v1, v2)| {
+        format!("class {cls}:\n    def {method}(self):\n        return {v1} {op} {v2}\n")
+    })
+}
+
+/// Generate Python class definitions with ONLY a dunder method in NEVER_MUTATE_FUNCTIONS.
+///
+/// These methods (`__getattribute__`, `__setattr__`, `__new__`) must be skipped entirely
+/// — the mutation engine must produce zero mutations for them.
+fn class_dunder_method_strategy() -> impl Strategy<Value = String> {
+    let class_names = prop::sample::select(vec!["MyClass", "Foo"]);
+    let dunder_names =
+        prop::sample::select(vec!["__getattribute__", "__setattr__", "__new__"]);
+    let ops = arith_ops();
+    let v1 = int_vals();
+    let v2 = int_vals();
+
+    (class_names, dunder_names, ops, v1, v2).prop_map(|(cls, method, op, v1, v2)| {
+        format!("class {cls}:\n    def {method}(self):\n        return {v1} {op} {v2}\n")
+    })
+}
+
+/// Generate Python functions with assignment statements.
+///
+/// Exercises `add_assignment_mutation_at()`:
+/// - Simple: `a = x OP v` → assignment mutation (whole RHS → None)
+/// - Chained: `a = b = x OP v` → value identified by summing target codegen lengths, not find("=")
+/// - None assignment: `a = None` → mutated to `a = ""`
+fn assignment_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["simple", "chained", "none_assign"]);
+    let ops = arith_ops();
+    let v1 = int_vals();
+
+    (kind, ops, v1).prop_map(|(kind, op, v1)| match kind {
+        "simple" => format!("def f(x):\n    a = x {op} {v1}\n    return a\n"),
+        "chained" => format!("def f(x):\n    a = b = x {op} {v1}\n    return a\n"),
+        "none_assign" => "def f():\n    a = None\n    return a\n".to_string(),
+        _ => unreachable!(),
+    })
+}
+
+/// Generate Python functions with match/case statements (Python 3.10+).
+///
+/// Exercises `add_match_case_removal_mutations()`:
+/// - Each case in an N-case match (N > 1) produces exactly one removal mutation.
+/// - Two-case, three-case, and wildcard variants are covered.
+fn match_case_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["two_case", "three_case", "wildcard"]);
+
+    kind.prop_map(|kind| match kind {
+        "two_case" => concat!(
+            "def f(x):\n",
+            "    match x:\n",
+            "        case 1:\n",
+            "            return 1\n",
+            "        case 2:\n",
+            "            return 2\n",
+        )
+        .to_string(),
+        "three_case" => concat!(
+            "def f(x):\n",
+            "    match x:\n",
+            "        case 1:\n",
+            "            return 1\n",
+            "        case 2:\n",
+            "            return 2\n",
+            "        case 3:\n",
+            "            return 3\n",
+        )
+        .to_string(),
+        "wildcard" => concat!(
+            "def f(x):\n",
+            "    match x:\n",
+            "        case 1:\n",
+            "            return 1\n",
+            "        case _:\n",
+            "            return 0\n",
+        )
+        .to_string(),
+        _ => unreachable!(),
+    })
+}
+
 /// Generate functions with augmented assignment statements.
 ///
 /// Exercises the AugAssign arm in mutation collection.
@@ -439,5 +533,223 @@ proptest! {
         let fms = collect_file_mutations(&source);
         let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
         prop_assert!(total > 0, "augmented assignment function must produce at least one mutation; source:\n{source}");
+    }
+
+    // --- Class method tests ---
+
+    /// INV-1: Class method sources satisfy all core invariants (INV-2..5).
+    ///
+    /// Guards against offset miscalculation when collecting mutations from methods
+    /// inside a class body, where the function source is extracted differently than
+    /// for top-level functions.
+    #[test]
+    fn class_method_all_invariants(source in class_method_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Class methods with binary operators produce at least one mutation.
+    ///
+    /// Guards against the class-body dispatch path silently skipping methods.
+    #[test]
+    fn class_method_has_mutations(source in class_method_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(
+            total > 0,
+            "class method with binary operator must produce mutations; source:\n{source}"
+        );
+    }
+
+    /// INV-2: Class methods have class_name == Some(...).
+    ///
+    /// A wrong `None` here would cause the trampoline to mangle the method as a
+    /// top-level function (`x_compute` instead of `xǁMyClassǁcompute`), silently
+    /// producing a wrong mutant key and breaking mutant lookup.
+    #[test]
+    fn class_method_class_name_is_some(source in class_method_strategy()) {
+        let fms = collect_file_mutations(&source);
+        for fm in &fms {
+            prop_assert!(
+                fm.class_name.is_some(),
+                "class method '{}' must have class_name == Some(...); source:\n{source}",
+                fm.name
+            );
+        }
+    }
+
+    /// INV-2: Top-level functions have class_name == None.
+    ///
+    /// A spurious Some(...) would cause the trampoline to mangle the function with
+    /// the Unicode class separator, breaking the mutant key entirely.
+    #[test]
+    fn top_level_func_class_name_is_none(source in python_func_strategy()) {
+        let fms = collect_file_mutations(&source);
+        for fm in &fms {
+            prop_assert!(
+                fm.class_name.is_none(),
+                "top-level function '{}' must have class_name == None; source:\n{source}",
+                fm.name
+            );
+        }
+    }
+
+    /// Dunder methods in NEVER_MUTATE_FUNCTIONS must produce zero mutations.
+    ///
+    /// `__getattribute__`, `__setattr__`, and `__new__` are explicitly excluded
+    /// because mutating them causes infinite recursion or object construction failures.
+    /// A regression here would produce unsafe mutants that crash the test harness.
+    #[test]
+    fn class_dunder_method_no_mutations(source in class_dunder_method_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert_eq!(
+            total, 0,
+            "dunder methods in NEVER_MUTATE_FUNCTIONS must not be mutated; source:\n{}",
+            source
+        );
+    }
+
+    // --- Assignment tests ---
+
+    /// INV-1: Assignment sources satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches offset bugs in `add_assignment_mutation_at()` — the assignment mutation
+    /// spans the whole assignment statement, and the byte span must be exact.
+    #[test]
+    fn assignment_all_invariants(source in assignment_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Assignment functions produce at least one mutation.
+    ///
+    /// Guards against assignment statements being silently skipped.  All variants in
+    /// `assignment_strategy()` contain either an operator expression or a None literal,
+    /// both of which must yield at least one mutation.
+    #[test]
+    fn assignment_has_mutations(source in assignment_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let total: usize = fms.iter().map(|fm| fm.mutations.len()).sum();
+        prop_assert!(
+            total > 0,
+            "assignment function must produce at least one mutation; source:\n{source}"
+        );
+    }
+
+    /// INV-3: Chained assignments produce mutations with valid byte offsets.
+    ///
+    /// For `a = b = expr`, the value start must be computed by summing codegen lengths
+    /// of all AssignTarget nodes — NOT by `find("=")`, which returns the first `=` and
+    /// drops `b` as a target. The core invariant (`fm.source[m.start..m.end] == m.original`)
+    /// catches this: if the offset is wrong, the source slice won't match the stored original.
+    #[test]
+    fn chained_assignment_core_invariants(source in
+        (arith_ops(), int_vals()).prop_map(|(op, v1)| {
+            format!("def f(x):\n    a = b = x {op} {v1}\n    return a\n")
+        })
+    ) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    // --- Match/case tests ---
+
+    /// INV-1: Match/case sources satisfy all core invariants (INV-2..5).
+    ///
+    /// The match_case_removal mutations span the entire match statement (with its
+    /// leading indent). Byte-span miscalculation here would produce overlapping or
+    /// out-of-bounds mutations.
+    #[test]
+    fn match_case_all_invariants(source in match_case_strategy()) {
+        let fms = collect_file_mutations(&source);
+        // If libcst cannot parse match/case on this platform, skip.
+        prop_assume!(!fms.is_empty());
+        assert_core_invariants!(fms);
+    }
+
+    /// INV-4: An N-case match statement produces exactly N removal mutations.
+    ///
+    /// Catches off-by-one errors in the case-block boundary detection logic and ensures
+    /// the single-case guard (`n_cases <= 1`) is not incorrectly applied.
+    #[test]
+    fn match_case_removal_count(source in match_case_strategy()) {
+        let fms = collect_file_mutations(&source);
+        // If libcst cannot parse match/case on this platform, skip.
+        prop_assume!(!fms.is_empty());
+
+        // Count `case` lines to determine expected removal count.
+        let n_cases = source
+            .lines()
+            .filter(|l| l.trim_start().starts_with("case "))
+            .count();
+        prop_assume!(n_cases > 1);
+
+        let removal_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "match_case_removal")
+            .count();
+
+        prop_assert_eq!(
+            removal_count, n_cases,
+            "N-case match must produce exactly N removal mutations; source:\n{}",
+            source
+        );
+    }
+
+    // --- INV-5: multi_mutation_apply meta-test ---
+
+    /// INV-5: apply_mutation produces byte-exact prefix and suffix preservation.
+    ///
+    /// Verifies that for every mutation from any source type:
+    ///   - `mutated[..m.start]` == `fm.source[..m.start]`  (prefix unchanged)
+    ///   - `mutated[m.start..m.start + m.replacement.len()]` == `m.replacement`
+    ///   - `mutated[m.start + m.replacement.len()..]` == `fm.source[m.end..]`
+    ///
+    /// This is stronger than length-checking: it catches bugs where apply_mutation
+    /// uses the wrong start/end offsets (e.g., off-by-one) that produce the right
+    /// total length but corrupt neighboring bytes.
+    #[test]
+    fn multi_mutation_apply_splice_exact(
+        source in prop_oneof![
+            python_func_strategy(),
+            compound_stmt_strategy(),
+            generator_func_strategy(),
+            container_literal_strategy(),
+            unary_expr_strategy(),
+            augassign_strategy(),
+            class_method_strategy(),
+            assignment_strategy(),
+            match_case_strategy(),
+        ]
+    ) {
+        let fms = collect_file_mutations(&source);
+        for fm in &fms {
+            for m in &fm.mutations {
+                let mutated = apply_mutation(&fm.source, m);
+                // Prefix preserved
+                prop_assert_eq!(
+                    &mutated[..m.start],
+                    &fm.source[..m.start],
+                    "prefix not preserved for {:?}: source[..{}] changed",
+                    m.operator, m.start
+                );
+                // Replacement inserted
+                prop_assert_eq!(
+                    &mutated[m.start..m.start + m.replacement.len()],
+                    m.replacement.as_str(),
+                    "replacement not found at expected position for {:?}",
+                    m.operator
+                );
+                // Suffix preserved
+                prop_assert_eq!(
+                    &mutated[m.start + m.replacement.len()..],
+                    &fm.source[m.end..],
+                    "suffix not preserved for {:?}: source[{}..] changed",
+                    m.operator, m.end
+                );
+            }
+        }
     }
 }
