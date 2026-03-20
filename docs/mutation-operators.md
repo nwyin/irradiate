@@ -4,7 +4,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ## irradiate (current)
 
-14 operator categories, ~100+ distinct mutations. Python-specific, operates on CST via libcst.
+25 operator categories, ~150+ distinct mutations. Python-specific, operates on CST via libcst.
 
 ### Operators implemented
 
@@ -15,25 +15,38 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 | Comparison ops | `compop_swap` | 10 pairs: `<=`→`<`, `>=`→`>`, `<`→`<=`, `>`→`>=`, `==`↔`!=`, `is`↔`is not`, `in`↔`not in` |
 | Augmented assign | `augop_swap` | 11 pairs: `+=`↔`-=`, `*=`↔`/=`, `//=`→`/=`, `%=`→`/=`, `**=`→`*=`, `<<=`↔`>>=`, `&=`↔`\|=`, `^=`→`&=` |
 | Unary ops | `unary_removal` | `not x`→`x`, `~x`→`x` |
+| Unary sign | `unary_swap` | `+x`↔`-x` |
 | String methods | `method_swap` | 15 pairs: `lower`↔`upper`, `lstrip`↔`rstrip`, `find`↔`rfind`, `ljust`↔`rjust`, `index`↔`rindex`, `removeprefix`↔`removesuffix`, `partition`↔`rpartition` |
 | Constants | `name_swap` | `True`↔`False`, `deepcopy`→`copy` |
 | Numbers | `number_mutation` | `n`→`n+1` (int and float) |
 | Strings | `string_mutation` | `"foo"`→`"XXfooXX"` (skip docstrings, delimiter-containing) |
+| String emptying | `string_emptying` | `"foo"`→`""` (catches empty-string handling bugs) |
 | Lambdas | `lambda_mutation` | body→`None` (or `None`→`0`) |
 | Assignments | `assignment_mutation` | value→`None` (or `None`→`""`) |
 | Aug-to-plain | `augassign_to_assign` | `x += 5`→`x = 5` |
 | Arg removal | `arg_removal` | Replace each arg with `None` + remove each arg (skip starred) |
+| Dict kwargs | `dict_kwarg` | `dict(foo=1)`→`dict(fooXX=1)` |
+| Default args | `default_arg` | Mutate default parameter values (`None`→`""`, `True`↔`False`, `n`→`n+1`, etc.) |
+| Decorator removal | `decorator_removal` | Remove each `@decorator` individually (skip `@abstractmethod`, `@override`) |
+| Return values | `return_value` | `return x`→`return None` (or `None`→`""`) |
+| Exception types | `exception_type` | `except ValueError:`→`except Exception:` (broaden handler) |
 | Match cases | `match_case_removal` | Remove each `case` branch (when >1 case) |
+| Condition negation | `condition_negation` | `if cond:`→`if not (cond):`, `while cond:`→`while not (cond):`, `assert cond`→`assert not (cond)`, ternary conditions |
+| Statement deletion | `statement_deletion` | `x = expr`→`pass`, `return x`→`return None`, `foo()`→`pass`, `raise E`→`pass` |
+| Keyword swap | `keyword_swap` | `break`↔`continue` |
+| Loop mutation | `loop_mutation` | `for x in items:`→`for x in []:`, `while cond:`→`while False:` |
+| Ternary swap | `ternary_swap` | `a if cond else b`→`b if cond else a` (skip identical branches) |
 
 ### Skip rules
 
-- Decorated functions (any decorator)
+- Decorated functions (any decorator) — except for `decorator_removal` itself
 - `__getattribute__`, `__setattr__`, `__new__`
 - `len()`, `isinstance()` calls (and their arguments)
 - Type annotations (parameter, return, standalone)
 - Triple-quoted strings (docstrings)
 - `# pragma: no mutate` lines
 - Starred arguments (`*args`, `**kwargs`)
+- `@abstractmethod`, `@override` decorators (not removed by `decorator_removal`)
 
 ---
 
@@ -270,19 +283,19 @@ Operators that exist in 3+ ecosystems are considered "universal". Operators uniq
 | Augmented assign swap | Yes | Yes | -- | Yes | Yes | Yes | Yes | Yes |
 | Aug assign→plain assign | Yes | mutmut | -- | -- | -- | -- | -- | Yes |
 | Number literal ±1 | Yes | Yes | Yes | -- | -- | -- | Yes | Yes |
-| String mutation | Yes | Yes | -- | Yes | Yes | Yes | -- | -- |
-| Unary `+`↔`-` | -- | mutmut | Yes | Yes | Yes | -- | Yes | -- |
+| String mutation | Yes (`XX` + emptying) | Yes | -- | Yes | Yes | Yes | -- | -- |
+| Unary `+`↔`-` | Yes | mutmut | Yes | Yes | Yes | -- | Yes | -- |
 | Increment `++`↔`--` | n/a | n/a | Yes | Yes | Yes | -- | Yes | Yes |
 | Method swaps | Yes (string) | mutmut | Arcmutate | Yes | Yes (LINQ) | -- | -- | -- |
 | Void method removal | -- | -- | Yes | -- | Yes | -- | Yes | Yes |
-| Return value replacement | -- | -- | Yes | -- | -- | Yes | Yes | Yes |
+| Return value replacement | Yes | -- | Yes | -- | -- | Yes | Yes | Yes |
 | Function body→default | -- | -- | PIT Extreme | Yes (block) | Yes (block) | Yes (primary) | -- | -- |
-| Statement deletion | -- | mutpy | Yes (Major) | -- | Yes | -- | -- | -- |
-| Decorator removal | -- | cosmic-ray, mutpy | -- | -- | -- | -- | -- | -- |
-| Exception handler mutation | -- | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
+| Statement deletion | Yes | mutpy | Yes (Major) | -- | Yes | -- | -- | -- |
+| Decorator removal | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | -- |
+| Exception handler mutation | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
 | Condition→`true`/`false` | -- | cosmic-ray | Yes | Yes | Yes | -- | -- | -- |
-| Condition negation (insert `not`) | -- | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
-| Loop zero iteration | -- | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
+| Condition negation (insert `not`) | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
+| Loop zero iteration | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
 | Slice index removal | -- | mutpy | -- | -- | -- | -- | -- | -- |
 | `self.x`→`x` | -- | mutpy | -- | -- | -- | -- | -- | -- |
 | `super()` manipulation | -- | mutpy | -- | -- | -- | -- | -- | -- |
@@ -292,11 +305,11 @@ Operators that exist in 3+ ecosystems are considered "universal". Operators uniq
 | Object literal emptying | -- | -- | -- | Yes | Yes | -- | -- | -- |
 | Type cast removal | -- | -- | -- | -- | -- | -- | -- | Yes |
 | Function unwrapping | -- | -- | -- | -- | -- | -- | -- | Yes (49) |
-| Ternary branch swap | -- | -- | -- | -- | -- | -- | -- | Yes |
+| Ternary branch swap | Yes | -- | -- | -- | -- | -- | -- | Yes |
 | Match/case removal | Yes | mutmut | -- | -- | -- | Yes | -- | Yes |
 | Argument removal | Yes | mutmut | Arcmutate | -- | -- | -- | -- | -- |
 | Lambda body mutation | Yes | mutmut | -- | -- | -- | -- | -- | -- |
-| `break`↔`continue` | -- | mutmut, mutpy, CR | -- | -- | -- | -- | -- | Yes |
+| `break`↔`continue` | Yes | mutmut, mutpy, CR | -- | -- | -- | -- | -- | Yes |
 | Visibility reduction | -- | -- | -- | -- | -- | -- | -- | Yes |
 | Struct/object field deletion | -- | -- | -- | -- | -- | Yes | -- | -- |
 | Match arm guard mutation | -- | -- | -- | -- | -- | Yes | -- | -- |
@@ -308,32 +321,35 @@ Operators that exist in 3+ ecosystems are considered "universal". Operators uniq
 
 ## Opportunities for irradiate
 
-Operators implemented by multiple frameworks that irradiate does not yet have, ranked by likely value for Python:
+Operators implemented by multiple frameworks that irradiate does not yet have, ranked by likely value for Python.
 
-### High value (applicable to Python, widely implemented)
+### Implemented (March 2026)
 
-1. **Condition negation** — `if cond:`→`if not cond:` (cosmic-ray, mutpy, Stryker, Infection). Catches missing negative-path tests.
-2. **Statement deletion** — `x = expr`→`pass`, `return x`→`pass` (mutpy, Major, Stryker.NET). Catches dead code and weak assertions.
-3. **`break`↔`continue`** — (mutmut, mutpy, cosmic-ray, Infection). Already in mutmut, easy to add.
-4. **Decorator removal** — (cosmic-ray, mutpy). Remove `@decorator` one at a time. Catches untested decorator effects.
-5. **Exception handler mutation** — `except E: handle()`→`except E: raise` or `pass` (mutpy, cosmic-ray, Infection). Catches swallowed exceptions.
+The following gaps have been closed:
 
-### Medium value (Python-applicable, fewer implementations)
+- ~~**Condition negation**~~ — `condition_negation` operator: `if cond:`→`if not (cond):`, `while`, `assert`, ternary
+- ~~**Statement deletion**~~ — `statement_deletion` operator: assign→`pass`, return→`return None`, expr→`pass`, raise→`pass`
+- ~~**`break`↔`continue`**~~ — `keyword_swap` operator
+- ~~**Decorator removal**~~ — `decorator_removal` operator (skip `@abstractmethod`, `@override`)
+- ~~**Exception handler mutation**~~ — `exception_type` operator: broaden to `except Exception:`
+- ~~**Zero-iteration loop**~~ — `loop_mutation` operator: `for x in items:`→`for x in []:`, `while cond:`→`while False:`
+- ~~**Return value replacement**~~ — `return_value` operator: `return x`→`return None`
+- ~~**Ternary branch swap**~~ — `ternary_swap` operator: `a if cond else b`→`b if cond else a`
+- ~~**String emptying**~~ — `string_emptying` operator: `"foo"`→`""`
+- ~~**Unary `+`↔`-`**~~ — `unary_swap` operator
 
-6. **Zero-iteration loop** — `for x in items:`→`for x in []:`  (cosmic-ray, mutpy, Infection). Tests that loop body matters.
-7. **Return value replacement** — `return x`→`return None`/`return 0`/`return ""` (PIT, cargo-mutants). Broader than current lambda/assignment mutations.
-8. **Slice index removal** — `x[1:2:3]`→`x[:2:3]` (mutpy only, but Python-specific and high signal).
-9. **Ternary branch swap** — `a if cond else b`→`b if cond else a` (Infection).
-10. **String emptying** — `"foo"`→`""` (Stryker, Stryker.NET). Simpler than current `XX` bookending, catches different bugs.
-11. **Unary `+`↔`-`** — (mutmut, mutpy, PIT, Stryker). Currently irradiate only removes `not`/`~`.
+### Remaining opportunities
 
-### Lower value / Python-questionable
+1. **Slice index removal** — `x[1:2:3]`→`x[:2:3]` (mutpy only, but Python-specific and high signal).
+2. **Condition→`true`/`false`** — `if cond:`→`if True:` / `if False:` (cosmic-ray, PIT, Stryker). Different from condition negation.
+3. **Constant replacement** (`42`→`0`, `0`→`1`, `c`→`-c`) — More aggressive than current `n+1`. May produce many equivalent mutants.
+4. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
+5. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
+6. **Regex mutation** — Applicable but complex. Would need a regex parser.
 
-12. **Constant replacement** (`42`→`0`, `0`→`1`, `c`→`-c`) — More aggressive than current `n+1`. May produce many equivalent mutants.
-13. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
-14. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
-15. **Visibility reduction** — Not applicable to Python (no access modifiers).
-16. **Type cast removal** — Not applicable to Python (no explicit casts).
-17. **Regex mutation** — Applicable but complex. Would need a regex parser.
-18. **Optional chaining** — Not applicable (Python has no `?.` operator).
-19. **`++`/`--` swap** — Not applicable (Python has no increment operators).
+### Not applicable to Python
+
+- **Visibility reduction** — No access modifiers.
+- **Type cast removal** — No explicit casts.
+- **Optional chaining** — No `?.` operator.
+- **`++`/`--` swap** — No increment operators.
