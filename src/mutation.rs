@@ -505,11 +505,20 @@ fn collect_statement_mutations(
         Statement::Compound(compound) => match compound {
             CompoundStatement::FunctionDef(_) => {} // don't recurse into nested functions
             CompoundStatement::If(if_stmt) => {
+                let cond_cursor = pos_after_keyword(source, *cursor, "if ");
+                add_condition_negation_mutation(&if_stmt.test, source, cond_cursor, mutations);
                 collect_expr_mutations(&if_stmt.test, source, cursor, mutations, ignored);
                 collect_suite_mutations(&if_stmt.body, source, cursor, mutations, ignored);
                 if let Some(ref orelse) = if_stmt.orelse {
                     match orelse.as_ref() {
                         cst::OrElse::Elif(elif) => {
+                            let cond_cursor = pos_after_keyword(source, *cursor, "elif ");
+                            add_condition_negation_mutation(
+                                &elif.test,
+                                source,
+                                cond_cursor,
+                                mutations,
+                            );
                             collect_expr_mutations(&elif.test, source, cursor, mutations, ignored);
                             collect_suite_mutations(&elif.body, source, cursor, mutations, ignored);
                         }
@@ -526,6 +535,8 @@ fn collect_statement_mutations(
                 }
             }
             CompoundStatement::While(w) => {
+                let cond_cursor = pos_after_keyword(source, *cursor, "while ");
+                add_condition_negation_mutation(&w.test, source, cond_cursor, mutations);
                 collect_expr_mutations(&w.test, source, cursor, mutations, ignored);
                 collect_suite_mutations(&w.body, source, cursor, mutations, ignored);
             }
@@ -630,6 +641,8 @@ fn collect_small_statement_mutations(
             }
         }
         SmallStatement::Assert(a) => {
+            let cond_cursor = pos_after_keyword(source, *cursor, "assert ");
+            add_condition_negation_mutation(&a.test, source, cond_cursor, mutations);
             collect_expr_mutations(&a.test, source, cursor, mutations, ignored);
         }
         SmallStatement::AnnAssign(a) => {
@@ -783,6 +796,10 @@ fn collect_expr_mutations(
             }
             // Source order: body "if" test "else" orelse
             collect_expr_mutations(&ifexp.body, source, &mut local, mutations, ignored);
+            // Condition negation: a if cond else b → a if not (cond) else b
+            // Search past the "if " keyword that separates body from test.
+            let cond_cursor = pos_after_keyword(source, local, "if ");
+            add_condition_negation_mutation(&ifexp.test, source, cond_cursor, mutations);
             collect_expr_mutations(&ifexp.test, source, &mut local, mutations, ignored);
             collect_expr_mutations(&ifexp.orelse, source, &mut local, mutations, ignored);
         }
@@ -863,6 +880,43 @@ fn record_mutation(
         replacement: replacement.to_string(),
         operator,
     });
+}
+
+/// Emit a condition_negation mutation for `test_expr` if it is not already a `not` expression.
+///
+/// `cursor` is the position in `source` to start searching for `test_expr`.  Pass a position
+/// that is AFTER the statement keyword (e.g. past `"if "`, `"while "`, `"assert "`) so that
+/// single-letter conditions are not found as substrings of the keyword itself.
+///
+/// Does NOT advance any caller-owned cursor; pass by value.
+fn add_condition_negation_mutation(
+    test_expr: &Expression,
+    source: &str,
+    cursor: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // Skip if already `not <expr>` — negating a negation is equivalent to removing `not`,
+    // which `unary_removal` already covers.
+    if let Expression::UnaryOperation(unop) = test_expr {
+        if matches!(unop.operator, UnaryOp::Not { .. }) {
+            return;
+        }
+    }
+    let test_text = codegen_node(test_expr);
+    if let Some(pos) = source[cursor..].find(&test_text) {
+        let start = cursor + pos;
+        let replacement = format!("not ({})", test_text);
+        record_mutation(&test_text, &replacement, "condition_negation", start, mutations);
+    }
+}
+
+/// Return the byte offset in `source` immediately after the first occurrence of `keyword`
+/// starting from `cursor`.  Falls back to `cursor` if not found (e.g. malformed source).
+fn pos_after_keyword(source: &str, cursor: usize, keyword: &str) -> usize {
+    source[cursor..]
+        .find(keyword)
+        .map(|p| cursor + p + keyword.len())
+        .unwrap_or(cursor)
 }
 
 /// Binary operator swaps: +↔-, *↔/, etc.
@@ -5335,6 +5389,175 @@ mod exception_type_tests {
         );
         for (fm, m) in &pairs {
             assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+        }
+    }
+
+    // --- condition_negation tests ---
+
+    // INV-1: Applying any condition_negation mutation must produce parseable Python.
+    // INV-2: Operator name is always "condition_negation".
+    // INV-3: Replacement is always `not ({original_condition})`.
+
+    fn condition_negation_mutations_for(source: &str) -> Vec<(FunctionMutations, Mutation)> {
+        collect_file_mutations(source)
+            .into_iter()
+            .flat_map(|fm| {
+                fm.mutations
+                    .iter()
+                    .filter(|m| m.operator == "condition_negation")
+                    .cloned()
+                    .map(|m| (fm.clone(), m))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_condition_negation_if_statement() {
+        // Critical path: `if x > 0:` → `if not (x > 0):`
+        let source = "def f(x):\n    if x > 0:\n        return x\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one condition_negation for a single if");
+        let (fm, m) = &pairs[0];
+        // INV-2
+        assert_eq!(m.operator, "condition_negation");
+        // INV-3: replacement must wrap original in `not (...)`
+        assert_eq!(m.original, "x > 0");
+        assert_eq!(m.replacement, "not (x > 0)");
+        // INV-1: mutated source must parse
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_while_loop() {
+        // Critical path: `while items:` generates one mutation.
+        let source = "def f(items):\n    while items:\n        items.pop()\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one condition_negation for a single while");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "items");
+        assert_eq!(m.replacement, "not (items)");
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_assert_no_message() {
+        // Critical path: `assert result == expected` → condition mutated, no msg.
+        let source = "def f(result, expected):\n    assert result == expected\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one condition_negation for assert without message");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "result == expected");
+        assert_eq!(m.replacement, "not (result == expected)");
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_assert_with_message() {
+        // Critical path: `assert cond, "msg"` — mutation targets condition only, message preserved.
+        let source = "def f(result):\n    assert result, \"expected true\"\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one condition_negation for assert with message");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "result");
+        assert_eq!(m.replacement, "not (result)");
+        // The mutated function must still include the message.
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(mutated.contains("\"expected true\""), "message must be preserved in mutated source");
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_ternary_expression() {
+        // Critical path: `x if flag else y` → `x if not (flag) else y`
+        let source = "def f(x, y, flag):\n    return x if flag else y\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one condition_negation for ternary");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.original, "flag");
+        assert_eq!(m.replacement, "not (flag)");
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_compound_condition() {
+        // Compound: `if a and b or c:` → `if not (a and b or c):`
+        let source = "def f(a, b, c):\n    if a and b or c:\n        return 1\n";
+        let pairs = condition_negation_mutations_for(source);
+        let cn: Vec<_> = pairs.iter().filter(|(_, m)| m.operator == "condition_negation").collect();
+        assert_eq!(cn.len(), 1, "one condition_negation for compound condition");
+        let (fm, m) = &cn[0];
+        assert_eq!(m.replacement, format!("not ({})", m.original));
+        let mutated = apply_mutation(&fm.source, m);
+        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+    }
+
+    #[test]
+    fn test_condition_negation_already_negated_skipped() {
+        // Failure mode: `if not x:` must NOT generate condition_negation (unary_removal covers it).
+        let source = "def f(x):\n    if not x:\n        return 1\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 0, "condition_negation must be skipped when condition is already `not <expr>`");
+    }
+
+    #[test]
+    fn test_condition_negation_elif_branch() {
+        // `elif` branches must also get condition_negation mutations.
+        let source = "def f(x):\n    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n    else:\n        return 0\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "if and elif each get one condition_negation");
+        // Both conditions appear in the mutations
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"x > 0"), "if condition must be mutated");
+        assert!(originals.contains(&"x < 0"), "elif condition must be mutated");
+        for (fm, m) in &pairs {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
+        }
+    }
+
+    #[test]
+    fn test_condition_negation_nested_if() {
+        // Nested if inside if — both conditions get independent mutations.
+        let source = "def f(a, b):\n    if a:\n        if b:\n            return 1\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "outer and inner if each get one condition_negation");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"a"), "outer if condition must be mutated");
+        assert!(originals.contains(&"b"), "inner if condition must be mutated");
+        for (fm, m) in &pairs {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
+        }
+    }
+
+    #[test]
+    fn test_condition_negation_parseability_all_sites() {
+        // INV-1: every condition_negation mutation must produce parseable Python across all sites.
+        let cases = [
+            "def f(x):\n    if x > 0:\n        return x\n",
+            "def f(items):\n    while items:\n        items.pop()\n",
+            "def f(r, e):\n    assert r == e\n",
+            "def f(r):\n    assert r, \"msg\"\n",
+            "def f(x, y, flag):\n    return x if flag else y\n",
+            "def f(a, b, c):\n    if a and b or c:\n        return 1\n",
+        ];
+        for source in &cases {
+            let pairs = condition_negation_mutations_for(source);
+            assert!(!pairs.is_empty(), "should produce at least one condition_negation for: {source}");
+            for (fm, m) in &pairs {
+                assert_eq!(m.operator, "condition_negation");
+                assert_eq!(m.replacement, format!("not ({})", m.original), "INV-3 violated");
+                let mutated = apply_mutation(&fm.source, m);
+                assert!(
+                    parse_module(&mutated, None).is_ok(),
+                    "INV-1 violated: unparseable mutant for {source}: {mutated}"
+                );
+            }
         }
     }
 }
