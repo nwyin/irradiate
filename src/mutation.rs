@@ -470,6 +470,22 @@ fn collect_small_statement_mutations(
                 *cursor = stmt_start + full_text.len();
             }
         }
+        SmallStatement::Break(b) => {
+            let text = codegen_node(b);
+            if let Some(pos) = source[*cursor..].find(&text) {
+                let start = *cursor + pos;
+                record_mutation(&text, "return", "keyword_swap", start, mutations);
+                *cursor = start + text.len();
+            }
+        }
+        SmallStatement::Continue(c) => {
+            let text = codegen_node(c);
+            if let Some(pos) = source[*cursor..].find(&text) {
+                let start = *cursor + pos;
+                record_mutation(&text, "break", "keyword_swap", start, mutations);
+                *cursor = start + text.len();
+            }
+        }
         _ => {}
     }
 }
@@ -3564,5 +3580,102 @@ mod yield_detection_tests {
             !outer.is_generator,
             "outer must not be is_generator just because nested def has yield"
         );
+    }
+}
+
+// --- Keyword swap tests (break→return, continue→break) ---
+#[cfg(test)]
+mod keyword_swap_tests {
+    use super::*;
+
+    // INV-1: `while True: break` → break is replaced with return.
+    #[test]
+    fn test_break_to_return() {
+        let source = "def f():\n    while True:\n        break\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "should collect mutations from function");
+        let fm = &fms[0];
+        let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+        assert!(!kw.is_empty(), "break inside while should produce a keyword_swap mutation");
+        let m = kw[0];
+        assert_eq!(m.original, "break", "original must be 'break'");
+        assert_eq!(m.replacement, "return", "replacement must be 'return'");
+    }
+
+    // INV-2: `for x in y: continue` → continue is replaced with break.
+    #[test]
+    fn test_continue_to_break() {
+        let source = "def f(y):\n    for x in y:\n        continue\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+        assert!(!kw.is_empty(), "continue inside for should produce a keyword_swap mutation");
+        let m = kw[0];
+        assert_eq!(m.original, "continue", "original must be 'continue'");
+        assert_eq!(m.replacement, "break", "replacement must be 'break'");
+    }
+
+    // INV-3: `break` inside nested if is still found.
+    #[test]
+    fn test_break_inside_nested_if() {
+        let source = "def f(cond):\n    while True:\n        if cond:\n            break\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+        assert!(!kw.is_empty(), "break inside nested if should still produce keyword_swap");
+        assert_eq!(kw[0].original, "break");
+        assert_eq!(kw[0].replacement, "return");
+    }
+
+    // INV-4: All keyword_swap mutations produce valid Python (parse_module succeeds).
+    #[test]
+    fn test_keyword_swap_parseable() {
+        let sources = [
+            "def f():\n    while True:\n        break\n",
+            "def f(y):\n    for x in y:\n        continue\n",
+            "def f(cond):\n    while True:\n        if cond:\n            break\n",
+        ];
+        for source in &sources {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "keyword_swap") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "keyword_swap mutation {:?} → {:?} produced unparseable Python:\n{}",
+                        m.original, m.replacement, mutated
+                    );
+                }
+            }
+        }
+    }
+
+    // INV-5: Mutation start/end match the keyword position in source.
+    #[test]
+    fn test_keyword_swap_span_correctness() {
+        let cases = [
+            ("def f():\n    while True:\n        break\n", "break"),
+            ("def f(y):\n    for x in y:\n        continue\n", "continue"),
+        ];
+        for (source, keyword) in &cases {
+            let fms = collect_file_mutations(source);
+            assert!(!fms.is_empty());
+            let fm = &fms[0];
+            let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+            assert!(!kw.is_empty(), "expected keyword_swap for '{keyword}'");
+            let m = kw[0];
+            // start..end must index the keyword in the function source
+            assert_eq!(
+                &fm.source[m.start..m.end], *keyword,
+                "source[{}..{}] must equal '{keyword}'",
+                m.start, m.end
+            );
+            // start < end invariant
+            assert!(m.start < m.end, "start must be < end");
+            // end in bounds
+            assert!(m.end <= fm.source.len(), "end must be <= source length");
+        }
     }
 }

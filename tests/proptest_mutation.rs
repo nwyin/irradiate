@@ -1000,3 +1000,51 @@ proptest! {
         );
     }
 }
+
+/// Generate Python functions containing `break` or `continue` inside a loop body.
+///
+/// Exercises the keyword_swap arms in `collect_small_statement_mutations`:
+/// - `while True: break` → break→return
+/// - `for x in range(N): continue` → continue→break
+fn keyword_swap_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["while_break", "for_continue"]);
+    let n = prop::sample::select(vec!["0", "1", "10", "100"]);
+
+    (kind, n).prop_map(|(kind, n)| match kind {
+        "while_break" => "def f():\n    while True:\n        break\n".to_string(),
+        "for_continue" => format!("def f():\n    for x in range({n}):\n        continue\n"),
+        _ => unreachable!(),
+    })
+}
+
+proptest! {
+    /// Keyword swap functions satisfy all core invariants (INV-2..5).
+    ///
+    /// Catches offset bugs in the Break/Continue arms of `collect_small_statement_mutations`:
+    /// the keyword text must be located at the exact byte position recorded in the mutation.
+    #[test]
+    fn keyword_swap_all_invariants(source in keyword_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Keyword swap functions produce exactly 1 keyword_swap mutation.
+    ///
+    /// INV-extra: `break` always produces exactly 1 mutation (break→return); likewise
+    /// `continue` produces exactly 1 (continue→break). More would indicate a duplicate
+    /// find; fewer would indicate the arm is silently skipped.
+    #[test]
+    fn keyword_swap_exactly_one_mutation(source in keyword_swap_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let kw_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "keyword_swap")
+            .count();
+        prop_assert_eq!(
+            kw_count, 1,
+            "each loop with a single break/continue must produce exactly 1 keyword_swap mutation; source:\n{}",
+            source
+        );
+    }
+}
