@@ -763,6 +763,24 @@ fn collect_expr_mutations(
             }
         }
         Expression::IfExp(ifexp) => {
+            // Ternary swap: swap body and orelse, keep condition.
+            // `a if cond else b` → `b if cond else a`
+            let body_text = codegen_node(&*ifexp.body);
+            let test_text = codegen_node(&*ifexp.test);
+            let orelse_text = codegen_node(&*ifexp.orelse);
+            if body_text != orelse_text {
+                // Preserve original whitespace around `if` and `else` keywords.
+                let ws_before_if = codegen_node(&ifexp.whitespace_before_if);
+                let ws_after_if = codegen_node(&ifexp.whitespace_after_if);
+                let ws_before_else = codegen_node(&ifexp.whitespace_before_else);
+                let ws_after_else = codegen_node(&ifexp.whitespace_after_else);
+                let lpar_text: String = ifexp.lpar.iter().map(codegen_node).collect();
+                let rpar_text: String = ifexp.rpar.iter().map(codegen_node).collect();
+                let replacement = format!(
+                    "{lpar_text}{orelse_text}{ws_before_if}if{ws_after_if}{test_text}{ws_before_else}else{ws_after_else}{body_text}{rpar_text}"
+                );
+                record_mutation(&expr_text, &replacement, "ternary_swap", expr_start, mutations);
+            }
             // Source order: body "if" test "else" orelse
             collect_expr_mutations(&ifexp.body, source, &mut local, mutations, ignored);
             collect_expr_mutations(&ifexp.test, source, &mut local, mutations, ignored);
@@ -5132,6 +5150,135 @@ mod exception_type_tests {
         );
         for (fm, m) in &pairs {
             assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ternary_swap_tests {
+    use super::*;
+    use libcst_native::parse_module;
+
+    fn ternary_mutations(source: &str) -> Vec<(FunctionMutations, Mutation)> {
+        collect_file_mutations(source)
+            .into_iter()
+            .flat_map(|fm| {
+                fm.mutations
+                    .iter()
+                    .filter(|m| m.operator == "ternary_swap")
+                    .map(|m| (fm.clone(), m.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    // INV-2: operator name is "ternary_swap"
+    #[test]
+    fn test_operator_name() {
+        let source = "def f(flag):\n    return x if flag else y\n";
+        let pairs = ternary_mutations(source);
+        assert!(!pairs.is_empty(), "must produce at least one ternary_swap mutation");
+        for (_, m) in &pairs {
+            assert_eq!(m.operator, "ternary_swap");
+        }
+    }
+
+    // INV-3: condition is preserved; only body and orelse are swapped
+    #[test]
+    fn test_simple_swap() {
+        let source = "def f(flag):\n    return x if flag else y\n";
+        let pairs = ternary_mutations(source);
+        let swap_muts: Vec<_> = pairs.iter().filter(|(_, m)| m.original.contains("flag")).collect();
+        assert_eq!(swap_muts.len(), 1, "x if flag else y must produce exactly one ternary_swap");
+        let (_, m) = &swap_muts[0];
+        assert_eq!(m.original, "x if flag else y");
+        assert_eq!(m.replacement, "y if flag else x", "body and orelse must be swapped; condition stays");
+    }
+
+    // INV-1: every generated mutation produces parseable Python
+    #[test]
+    fn test_parseable() {
+        let sources = [
+            "def f(ok):\n    return \"yes\" if ok else \"no\"\n",
+            "def f(cond, a, b):\n    return f(a) if cond else g(b)\n",
+            "def f(c1, c2):\n    return a if c1 else (b if c2 else d)\n",
+        ];
+        for source in &sources {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "ternary_swap") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "mutated source must be parseable:\n{mutated}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Identical branches must NOT generate a ternary_swap (equivalent mutant)
+    #[test]
+    fn test_identical_branches_skipped() {
+        let source = "def f(cond):\n    return x if cond else x\n";
+        let pairs = ternary_mutations(source);
+        assert!(pairs.is_empty(), "identical branches must not produce ternary_swap mutation");
+    }
+
+    // String literals: "yes" if ok else "no"
+    #[test]
+    fn test_string_branches() {
+        let source = "def f(ok):\n    return \"yes\" if ok else \"no\"\n";
+        let pairs = ternary_mutations(source);
+        let swap_muts: Vec<_> = pairs.iter().filter(|(_, m)| m.original.contains("ok")).collect();
+        assert_eq!(swap_muts.len(), 1);
+        let (_, m) = &swap_muts[0];
+        assert!(m.replacement.starts_with("\"no\""), "orelse must become body: {}", m.replacement);
+        assert!(m.replacement.ends_with("\"yes\""), "body must become orelse: {}", m.replacement);
+        assert!(m.replacement.contains("ok"), "condition must be preserved: {}", m.replacement);
+    }
+
+    // Ternary in a function call: f(a if c else b) — still generates mutation
+    #[test]
+    fn test_ternary_inside_call() {
+        let source = "def f(c, a, b):\n    return g(a if c else b)\n";
+        let pairs = ternary_mutations(source);
+        assert!(!pairs.is_empty(), "ternary inside a call must still generate ternary_swap");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.original, "a if c else b");
+        assert_eq!(m.replacement, "b if c else a");
+    }
+
+    // Nested ternary: each level gets its own swap independently
+    #[test]
+    fn test_nested_ternary() {
+        let source = "def f(c1, c2):\n    return a if c1 else (b if c2 else d)\n";
+        let pairs = ternary_mutations(source);
+        let swap_originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        // Outer swap
+        assert!(
+            swap_originals.iter().any(|s| s.contains("c1")),
+            "outer ternary must be swapped; got: {swap_originals:?}"
+        );
+        // Inner swap
+        assert!(
+            swap_originals.iter().any(|s| s.contains("c2") && !s.contains("c1")),
+            "inner ternary must be swapped independently; got: {swap_originals:?}"
+        );
+    }
+
+    // Span correctness: fm.source[m.start..m.end] == m.original
+    #[test]
+    fn test_span_correctness() {
+        let source = "def f(flag):\n    return x if flag else y\n";
+        let pairs = ternary_mutations(source);
+        for (fm, m) in &pairs {
+            let slice = &fm.source[m.start..m.end];
+            assert_eq!(
+                slice, m.original.as_str(),
+                "source slice at [{}..{}] must equal original '{}', got '{}'",
+                m.start, m.end, m.original, slice
+            );
         }
     }
 }
