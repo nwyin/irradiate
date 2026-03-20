@@ -489,6 +489,33 @@ fn collect_suite_mutations(
     }
 }
 
+/// Recursively walk an elif/else chain, emitting condition_negation mutations for every elif
+/// condition and collecting mutations from every branch body. This fixes a bug where only
+/// the first elif in a chain was processed.
+fn process_orelse(
+    orelse: &cst::OrElse,
+    source: &str,
+    cursor: &mut usize,
+    mutations: &mut Vec<Mutation>,
+    ignored: &std::collections::HashSet<usize>,
+) {
+    match orelse {
+        cst::OrElse::Elif(elif) => {
+            let cond_cursor = pos_after_keyword(source, *cursor, "elif ");
+            add_condition_negation_mutation(&elif.test, source, cond_cursor, mutations);
+            collect_expr_mutations(&elif.test, source, cursor, mutations, ignored);
+            collect_suite_mutations(&elif.body, source, cursor, mutations, ignored);
+            // Recurse into nested orelse (more elifs or a final else)
+            if let Some(ref nested_orelse) = elif.orelse {
+                process_orelse(nested_orelse, source, cursor, mutations, ignored);
+            }
+        }
+        cst::OrElse::Else(else_clause) => {
+            collect_suite_mutations(&else_clause.body, source, cursor, mutations, ignored);
+        }
+    }
+}
+
 fn collect_statement_mutations(
     stmt: &Statement,
     source: &str,
@@ -510,28 +537,7 @@ fn collect_statement_mutations(
                 collect_expr_mutations(&if_stmt.test, source, cursor, mutations, ignored);
                 collect_suite_mutations(&if_stmt.body, source, cursor, mutations, ignored);
                 if let Some(ref orelse) = if_stmt.orelse {
-                    match orelse.as_ref() {
-                        cst::OrElse::Elif(elif) => {
-                            let cond_cursor = pos_after_keyword(source, *cursor, "elif ");
-                            add_condition_negation_mutation(
-                                &elif.test,
-                                source,
-                                cond_cursor,
-                                mutations,
-                            );
-                            collect_expr_mutations(&elif.test, source, cursor, mutations, ignored);
-                            collect_suite_mutations(&elif.body, source, cursor, mutations, ignored);
-                        }
-                        cst::OrElse::Else(else_clause) => {
-                            collect_suite_mutations(
-                                &else_clause.body,
-                                source,
-                                cursor,
-                                mutations,
-                                ignored,
-                            );
-                        }
-                    }
+                    process_orelse(orelse, source, cursor, mutations, ignored);
                 }
             }
             CompoundStatement::While(w) => {
@@ -5687,6 +5693,127 @@ mod exception_type_tests {
             let mutated = apply_mutation(&fm.source, m);
             assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
         }
+    }
+
+    #[test]
+    fn test_condition_negation_multi_elif_chain() {
+        // INV-1: every elif in a chain must get a condition_negation mutation.
+        // Regression test for the bug where only the first elif was processed.
+        let source = concat!(
+            "def f(x):\n",
+            "    if x > 10:\n",
+            "        return 'high'\n",
+            "    elif x > 5:\n",
+            "        return 'mid'\n",
+            "    elif x > 0:\n",
+            "        return 'low'\n",
+            "    else:\n",
+            "        return 'neg'\n",
+        );
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 3, "if + 2 elifs = 3 condition_negation mutations");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"x > 10"), "if condition must be mutated");
+        assert!(originals.contains(&"x > 5"), "first elif condition must be mutated");
+        assert!(originals.contains(&"x > 0"), "second elif condition must be mutated");
+        for (fm, m) in &pairs {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
+        }
+    }
+
+    #[test]
+    fn test_condition_negation_five_elif_chain() {
+        // INV-1 with deep chain — no mutation loss for many elifs.
+        // 1 if + 4 elifs = 5 conditions total.
+        let source = concat!(
+            "def f(x):\n",
+            "    if x == 1:\n",
+            "        return 'one'\n",
+            "    elif x == 2:\n",
+            "        return 'two'\n",
+            "    elif x == 3:\n",
+            "        return 'three'\n",
+            "    elif x == 4:\n",
+            "        return 'four'\n",
+            "    elif x == 5:\n",
+            "        return 'five'\n",
+            "    else:\n",
+            "        return 'other'\n",
+        );
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 5, "if + 4 elifs = 5 condition_negation mutations");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        for cond in &["x == 1", "x == 2", "x == 3", "x == 4", "x == 5"] {
+            assert!(originals.contains(cond), "condition '{cond}' must be mutated");
+        }
+        for (fm, m) in &pairs {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
+        }
+    }
+
+    #[test]
+    fn test_condition_negation_elif_bodies_not_treated_as_conditions() {
+        // INV-3: assignment targets inside elif bodies must NOT get condition_negation.
+        // This is the specific failure mode from bench/corpora/click/src/click/core.py.
+        let source = concat!(
+            "def f(x):\n",
+            "    if isinstance(x, list):\n",
+            "        pass\n",
+            "    elif isinstance(x, range):\n",
+            "        pass\n",
+            "    elif isinstance(x, str):\n",
+            "        result = x.upper()\n",
+            "    else:\n",
+            "        result = str(x)\n",
+        );
+        let pairs = condition_negation_mutations_for(source);
+        // Exactly 3 condition_negation mutations (if + 2 elifs), none on assignment targets
+        assert_eq!(pairs.len(), 3, "if + 2 elifs = 3 condition_negation mutations");
+        for (_, m) in &pairs {
+            // original must be the test expression, never an assignment target like "result"
+            assert!(
+                !m.original.contains('='),
+                "condition_negation must not target assignment: got '{}'",
+                m.original
+            );
+            assert!(
+                m.original.starts_with("isinstance"),
+                "condition must be isinstance call, got '{}'",
+                m.original
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_negation_elif_terminal_else_processed() {
+        // INV-4: the final else body after elifs must produce mutations.
+        let source = concat!(
+            "def f(x, y):\n",
+            "    if x > 0:\n",
+            "        return x\n",
+            "    elif x < 0:\n",
+            "        return -x\n",
+            "    else:\n",
+            "        return y + 1\n",  // binop_swap should fire here
+        );
+        // Filter for all mutations (not just condition_negation) and verify the else body is reached
+        let all_muts: Vec<(FunctionMutations, Mutation)> = collect_file_mutations(source)
+            .into_iter()
+            .flat_map(|fm| {
+                fm.mutations
+                    .iter()
+                    .map(|m| (fm.clone(), m.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // The else body has `y + 1` — binop_swap should produce a mutation there
+        let else_body_muts: Vec<_> = all_muts
+            .iter()
+            .filter(|(_, m)| m.operator == "binop_swap" && m.original.contains('+'))
+            .collect();
+        assert!(!else_body_muts.is_empty(), "else body after elif chain must be mutated");
     }
 
     #[test]
