@@ -101,6 +101,9 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
     let mut i = skip_until;
     // Track which class we're currently inside: (class_name, class_indent_level).
     let mut current_class: Option<(String, usize)> = None;
+    // Track top-level trampolines emitted inline (both module_code + wrapper_code),
+    // so the final append loop can skip them.
+    let mut emitted_inline: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     while i < lines.len() {
         let line = lines[i];
@@ -182,15 +185,18 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
                     output.push_str(&indented_module);
                     output.push('\n');
                 } else {
-                    // For top-level functions: emit the wrapper INLINE here (at the same
-                    // position as the original def) so that module-level code following
-                    // the definition can call the function without a NameError.
+                    // For top-level functions: emit module_code (orig, variants, dict) FIRST,
+                    // then wrapper_code, both inline at the original def position.
                     //
-                    // module_code (orig, variants, dict) is still appended at the end —
-                    // those are only accessed when the wrapper is *called* (at runtime),
-                    // not when the wrapper *def* is executed, so forward-reference is safe.
+                    // This is necessary because module-level statements that call the wrapper
+                    // execute at import time. When the wrapper body runs it immediately
+                    // dereferences x_func__irradiate_orig (from module_code). If module_code
+                    // were deferred to EOF those names would be undefined → NameError.
+                    output.push_str(&trampolines[idx].module_code);
+                    output.push('\n');
                     output.push_str(&trampolines[idx].wrapper_code);
                     output.push('\n');
+                    emitted_inline.insert(idx);
                 }
                 continue;
             }
@@ -201,18 +207,17 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         i += 1;
     }
 
-    // Append module_code (mangled orig, variants, lookup dict) for TOP-LEVEL functions only.
+    // Append module_code for any top-level function NOT yet emitted inline.
+    // In the normal case all top-level functions are in emitted_inline (they were
+    // found during the walk and their module_code was emitted inline before the wrapper).
+    // This loop exists as a fallback for any edge case where the walk missed a function.
+    //
     // For class methods, both module_code and wrapper_code were already emitted
     // inside the class body during the walk above (to preserve the __class__ cell
     // so that super() works correctly).
-    //
-    // For top-level functions, the wrapper_code was already emitted inline (in source
-    // order) during the walk to preserve definition-before-use for module-level calls.
-    // The module_code is safe to append here because it is only accessed when the
-    // wrapper is *called* (at runtime), not when the wrapper *def* is executed.
     output.push('\n');
     for (idx, fm) in function_mutations.iter().enumerate() {
-        if fm.class_name.is_none() {
+        if fm.class_name.is_none() && !emitted_inline.contains(&idx) {
             output.push_str(&trampolines[idx].module_code);
             output.push_str("\n\n");
         }
@@ -1183,6 +1188,86 @@ X = factory(5)
         assert!(
             wrapper_pos < call_pos,
             "wrapper (line {wrapper_pos}) must be before call (line {call_pos})\n{}",
+            result.source
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // INV-1 / INV-2: module_code must precede wrapper_code for top-level functions
+    // (regression for NameError when module-level call executes at import time)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_module_code_precedes_wrapper_top_level() {
+        // INV-2: For a top-level function, mangled orig (module_code) must be
+        // defined BEFORE the wrapper (wrapper_code) that references it.
+        // This ensures that even if nothing calls the function at module level,
+        // the output is always in the correct order.
+        let source = "def add(a, b):\n    return a + b\n";
+        let result = mutate_file(source, "m").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let orig_pos = lines
+            .iter()
+            .position(|l| l.starts_with("def x_add__irradiate_orig("))
+            .expect("mangled orig must be defined");
+
+        let wrapper_pos = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def add(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def add( should exist");
+
+        assert!(
+            orig_pos < wrapper_pos,
+            "mangled orig (line {orig_pos}) must appear before wrapper (line {wrapper_pos})\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_mangled_orig_defined_before_module_level_call() {
+        // INV-1: Full chain: mangled orig → wrapper → module-level call.
+        // Before this fix, module_code was deferred to EOF but the wrapper was
+        // emitted inline. When the module-level call executed the wrapper body,
+        // x_func__irradiate_orig was not yet defined → NameError.
+        let source = "\
+def make_cached_stream_func(stream):
+    return stream + 1
+
+CACHED = make_cached_stream_func(42)
+";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let orig_pos = lines
+            .iter()
+            .position(|l| l.starts_with("def x_make_cached_stream_func__irradiate_orig("))
+            .expect("mangled orig must be defined");
+
+        let wrapper_pos = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def make_cached_stream_func(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def make_cached_stream_func( should exist");
+
+        let call_pos = lines
+            .iter()
+            .position(|l| l.contains("CACHED = make_cached_stream_func("))
+            .expect("module-level call should be preserved");
+
+        assert!(
+            orig_pos < wrapper_pos,
+            "mangled orig (line {orig_pos}) must appear before wrapper (line {wrapper_pos})\n{}",
+            result.source
+        );
+        assert!(
+            wrapper_pos < call_pos,
+            "wrapper (line {wrapper_pos}) must appear before module-level call (line {call_pos})\n{}",
             result.source
         );
     }
