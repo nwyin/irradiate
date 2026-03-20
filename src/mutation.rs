@@ -663,16 +663,18 @@ fn collect_small_statement_mutations(
             let full_text = codegen_node(aug);
             let aug_span = find_expr_span(source, *cursor, &full_text);
 
-            // The operator immediately follows the target.
-            let target_text = codegen_node(&aug.target);
+            // Find operator keyword in source (handles multi-line whitespace).
             let op_text = codegen_node(&aug.operator);
-            let op_start = aug_span.map(|(s, _)| s + target_text.len());
+            let op_trimmed = op_text.trim();
+            let op_start = aug_span.and_then(|(s, src_len)| {
+                source[s..s + src_len].find(op_trimmed).map(|p| s + p)
+            });
 
             collect_expr_mutations(&aug.value, source, cursor, mutations, ignored);
 
             // AugAssign operator swap (e.g. += → -=)
             if let Some(op_s) = op_start {
-                add_augop_mutation_at(&aug.operator, &op_text, op_s, mutations);
+                add_augop_mutation_at(&aug.operator, op_trimmed, op_s, mutations);
             }
             // AugAssign → plain Assign (e.g. a += b → a = b)
             if let Some((start, src_len)) = aug_span {
@@ -759,19 +761,24 @@ fn collect_expr_mutations(
 
     match expr {
         Expression::BinaryOperation(binop) => {
-            // Process left; local advances to op_start.
+            // Process left; local advances past it in source.
             collect_expr_mutations(&binop.left, source, &mut local, mutations, ignored);
-            // Operator starts where the left child ended.
+            // Find operator keyword in source (handles multi-line whitespace).
             let op_text = codegen_node(&binop.operator);
-            add_binop_mutation_at(&binop.operator, &op_text, local, mutations);
-            local += op_text.len();
+            let op_trimmed = op_text.trim();
+            let op_kw_start = source[local..].find(op_trimmed).map(|p| local + p).unwrap_or(local);
+            add_binop_mutation_at(&binop.operator, op_trimmed, op_kw_start, mutations);
+            local = op_kw_start + op_trimmed.len();
             collect_expr_mutations(&binop.right, source, &mut local, mutations, ignored);
         }
         Expression::BooleanOperation(boolop) => {
             collect_expr_mutations(&boolop.left, source, &mut local, mutations, ignored);
+            // Find operator keyword in source (handles multi-line whitespace).
             let op_text = codegen_node(&boolop.operator);
-            add_boolop_mutation_at(&boolop.operator, &op_text, local, mutations);
-            local += op_text.len();
+            let op_trimmed = op_text.trim();
+            let op_kw_start = source[local..].find(op_trimmed).map(|p| local + p).unwrap_or(local);
+            add_boolop_mutation_at(&boolop.operator, op_trimmed, op_kw_start, mutations);
+            local = op_kw_start + op_trimmed.len();
             collect_expr_mutations(&boolop.right, source, &mut local, mutations, ignored);
         }
         Expression::UnaryOperation(unop) => {
@@ -782,9 +789,12 @@ fn collect_expr_mutations(
         Expression::Comparison(cmp) => {
             collect_expr_mutations(&cmp.left, source, &mut local, mutations, ignored);
             for target in &cmp.comparisons {
+                // Find operator keyword in source (handles multi-line whitespace).
                 let op_text = codegen_node(&target.operator);
-                add_compop_mutation_at(&target.operator, &op_text, local, mutations);
-                local += op_text.len();
+                let op_trimmed = op_text.trim();
+                let op_kw_start = source[local..].find(op_trimmed).map(|p| local + p).unwrap_or(local);
+                add_compop_mutation_at(&target.operator, op_trimmed, op_kw_start, mutations);
+                local = op_kw_start + op_trimmed.len();
                 collect_expr_mutations(&target.comparator, source, &mut local, mutations, ignored);
             }
         }
