@@ -4412,6 +4412,37 @@ mod return_value_tests {
         );
     }
 
+    // INV-9: `return 42` emits a return_value mutation replacing "42" with "None".
+    // This directly exercises the guard: if the condition flips from `>` to `<`,
+    // add_return_value_mutation called with ret_text that has trailing content would
+    // incorrectly suppress valid mutations.
+    #[test]
+    fn test_return_value_guard_emits_mutation() {
+        // Direct unit test of add_return_value_mutation with trailing whitespace in ret_text.
+        // val_offset(7) + val_text.len(2) = 9 < ret_text.len(10)
+        // With correct guard `>`: 9 > 10 = false → mutation IS emitted
+        // With mutant guard `<`: 9 < 10 = true → mutation suppressed (bug!)
+        let mut mutations = Vec::new();
+        add_return_value_mutation("42", "return 42 ", 0, &mut mutations);
+        assert_eq!(mutations.len(), 1, "guard must not suppress valid mutation when ret_text has trailing content");
+        assert_eq!(mutations[0].replacement, "None");
+        assert_eq!(mutations[0].original, "42");
+    }
+
+    // INV-10: `return None` emits a return_value mutation replacing "None" with `""`.
+    // Same guard boundary test for the None→"" path.
+    #[test]
+    fn test_return_value_none_emits_empty_string() {
+        // val_offset(7) + val_text.len(4) = 11 < ret_text.len(12)
+        // With correct guard `>`: 11 > 12 = false → mutation IS emitted
+        // With mutant guard `<`: 11 < 12 = true → mutation suppressed (bug!)
+        let mut mutations = Vec::new();
+        add_return_value_mutation("None", "return None ", 0, &mut mutations);
+        assert_eq!(mutations.len(), 1, "None→\"\" mutation must be emitted even when ret_text has trailing content");
+        assert_eq!(mutations[0].replacement, "\"\"");
+        assert_eq!(mutations[0].original, "None");
+    }
+
     // =====================================================================
     // Decorator removal tests
     // =====================================================================
