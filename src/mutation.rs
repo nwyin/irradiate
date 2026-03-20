@@ -601,15 +601,32 @@ fn collect_small_statement_mutations(
 
                 collect_expr_mutations(val, source, cursor, mutations, ignored);
 
-                // Return value mutation: `return x → return None` or `return None → return ""`
                 if let Some(start) = ret_start {
                     let val_text = codegen_node(val);
+                    // Return value mutation: `return x → return None` or `return None → return ""`
                     add_return_value_mutation(&val_text, &ret_text, start, mutations);
+                    // Statement deletion: `return expr` → `return None` (skip if already None)
+                    if val_text.trim() != "None" {
+                        record_mutation(&ret_text, "return None", "statement_deletion", start, mutations);
+                    }
                 }
             }
         }
         SmallStatement::Expr(e) => {
+            // Pre-find the full expression text before descending so we have its start position.
+            let expr_text = codegen_node(e);
+            let expr_start = source[*cursor..].find(&expr_text).map(|p| *cursor + p);
+
             collect_expr_mutations(&e.value, source, cursor, mutations, ignored);
+
+            // Statement deletion: foo() → pass (skip docstrings — string-literal expr stmts)
+            let is_docstring = matches!(&e.value, Expression::SimpleString(s)
+                if s.value.contains("\"\"\"") || s.value.contains("'''"));
+            if !is_docstring {
+                if let Some(start) = expr_start {
+                    record_mutation(&expr_text, "pass", "statement_deletion", start, mutations);
+                }
+            }
         }
         SmallStatement::Assign(a) => {
             // Pre-find the full assignment text before descending so we have its start position.
@@ -618,9 +635,24 @@ fn collect_small_statement_mutations(
 
             collect_expr_mutations(&a.value, source, cursor, mutations, ignored);
 
-            // Assignment mutation: a = x → a = None
             if let Some(start) = assign_start {
+                // Assignment mutation: a = x → a = None
                 add_assignment_mutation_at(a, &assign_text, start, mutations);
+                // Statement deletion: x = expr → pass (skip self.* assignments — structural)
+                if !assign_text.starts_with("self.") {
+                    record_mutation(&assign_text, "pass", "statement_deletion", start, mutations);
+                }
+            }
+        }
+        SmallStatement::Raise(r) => {
+            if r.exc.is_some() {
+                // Only delete explicit raises; bare `raise` (re-raise in except) is skipped.
+                let raise_text = codegen_node(r);
+                if let Some(pos) = source[*cursor..].find(&raise_text) {
+                    let start = *cursor + pos;
+                    record_mutation(&raise_text, "pass", "statement_deletion", start, mutations);
+                    *cursor = start + raise_text.len();
+                }
             }
         }
         SmallStatement::AugAssign(aug) => {
@@ -2694,37 +2726,36 @@ mod tests {
     fn test_len_call_not_mutated() {
         let source = "def foo(x):\n    return len(x)\n";
         let fms = collect_file_mutations(source);
-        // len(x) should produce 0 mutations total (no arg_removal, no method_swap, x not visited).
-        // NOTE: return_value mutations on the return statement are acceptable — only the
-        // call-level arg_removal/method_swap mutations should be suppressed.
-        let non_rv_mutations: Vec<_> = fms
+        // len(x) should produce 0 call-level mutations (no arg_removal, no method_swap, x not visited).
+        // return_value and statement_deletion on the enclosing return statement are acceptable.
+        let call_level_muts: Vec<_> = fms
             .iter()
             .flat_map(|fm| fm.mutations.iter())
-            .filter(|m| m.operator != "return_value")
+            .filter(|m| m.operator != "return_value" && m.operator != "statement_deletion")
             .collect();
         assert!(
-            non_rv_mutations.is_empty(),
-            "len(x) must produce 0 non-return_value mutations, got: {:?}",
-            non_rv_mutations
+            call_level_muts.is_empty(),
+            "len(x) must produce 0 call-level mutations, got: {:?}",
+            call_level_muts
         );
     }
 
-    // INV-6: isinstance(x, int) produces 0 mutations.
+    // INV-6: isinstance(x, int) produces 0 call-level mutations.
     #[test]
     fn test_isinstance_call_not_mutated() {
         let source = "def foo(x):\n    return isinstance(x, int)\n";
         let fms = collect_file_mutations(source);
         // isinstance(x, int) should produce 0 call-level mutations — only return_value
-        // mutations on the enclosing return statement are acceptable.
-        let non_rv_mutations: Vec<_> = fms
+        // and statement_deletion mutations on the enclosing return statement are acceptable.
+        let call_level_muts: Vec<_> = fms
             .iter()
             .flat_map(|fm| fm.mutations.iter())
-            .filter(|m| m.operator != "return_value")
+            .filter(|m| m.operator != "return_value" && m.operator != "statement_deletion")
             .collect();
         assert!(
-            non_rv_mutations.is_empty(),
-            "isinstance(x, int) must produce 0 non-return_value mutations, got: {:?}",
-            non_rv_mutations
+            call_level_muts.is_empty(),
+            "isinstance(x, int) must produce 0 call-level mutations, got: {:?}",
+            call_level_muts
         );
     }
 
@@ -5943,5 +5974,135 @@ mod loop_mutation_tests {
         let source = "def f():\n    for x in []:\n        pass\n";
         let pairs = loop_mutations_for(source);
         assert_eq!(pairs.len(), 0, "for x in [] must not generate a loop_mutation (no-op)");
+    }
+}
+
+#[cfg(test)]
+mod statement_deletion_tests {
+    use super::*;
+    use libcst_native::parse_module;
+
+    fn statement_deletion_mutations(source: &str) -> Vec<Mutation> {
+        let fms = collect_file_mutations(source);
+        fms.into_iter()
+            .flat_map(|fm| fm.mutations.into_iter())
+            .filter(|m| m.operator == "statement_deletion")
+            .collect()
+    }
+
+    // INV-1: simple assignment `x = foo()` → 1 statement_deletion with replacement "pass"
+    #[test]
+    fn test_stmt_del_assignment() {
+        let source = "def f():\n    x = foo()\n    return x\n";
+        let muts = statement_deletion_mutations(source);
+        let assign_del: Vec<_> = muts.iter().filter(|m| m.original.contains("x = foo()")).collect();
+        assert_eq!(assign_del.len(), 1, "x = foo() must produce exactly 1 statement_deletion");
+        assert_eq!(assign_del[0].replacement, "pass");
+    }
+
+    // INV-2: `return result` → 1 statement_deletion with replacement "return None"
+    #[test]
+    fn test_stmt_del_return() {
+        let source = "def f(x):\n    return x + 1\n";
+        let muts = statement_deletion_mutations(source);
+        let ret_del: Vec<_> = muts.iter().filter(|m| m.replacement == "return None").collect();
+        assert_eq!(ret_del.len(), 1, "return expr must produce exactly 1 statement_deletion");
+        assert_eq!(ret_del[0].operator, "statement_deletion");
+    }
+
+    // INV-3: `print(x)` → 1 statement_deletion with replacement "pass"
+    #[test]
+    fn test_stmt_del_expr_statement() {
+        let source = "def f(x):\n    print(x)\n";
+        let muts = statement_deletion_mutations(source);
+        assert_eq!(muts.len(), 1, "print(x) must produce exactly 1 statement_deletion");
+        assert_eq!(muts[0].replacement, "pass");
+        assert!(muts[0].original.contains("print(x)"));
+    }
+
+    // INV-3: `raise ValueError("bad")` → 1 statement_deletion with replacement "pass"
+    #[test]
+    fn test_stmt_del_raise() {
+        let source = "def f():\n    raise ValueError(\"bad\")\n";
+        let muts = statement_deletion_mutations(source);
+        assert_eq!(muts.len(), 1, "raise must produce exactly 1 statement_deletion");
+        assert_eq!(muts[0].replacement, "pass");
+        assert!(muts[0].original.starts_with("raise"));
+    }
+
+    // Failure mode: bare `return` must NOT generate statement_deletion
+    #[test]
+    fn test_stmt_del_bare_return_skipped() {
+        let source = "def f():\n    return\n";
+        let muts = statement_deletion_mutations(source);
+        assert!(muts.is_empty(), "bare return must not produce statement_deletion");
+    }
+
+    // Failure mode: bare `raise` (re-raise) must NOT generate statement_deletion
+    #[test]
+    fn test_stmt_del_bare_raise_skipped() {
+        let source = "def f():\n    try:\n        pass\n    except Exception:\n        raise\n";
+        let muts = statement_deletion_mutations(source);
+        assert!(muts.is_empty(), "bare raise must not produce statement_deletion");
+    }
+
+    // Failure mode: docstring expression must NOT generate statement_deletion
+    #[test]
+    fn test_stmt_del_docstring_skipped() {
+        let source = "def f():\n    \"\"\"This is a docstring.\"\"\"\n    return 1\n";
+        let muts = statement_deletion_mutations(source);
+        let docstring_del: Vec<_> = muts.iter().filter(|m| m.original.contains("docstring")).collect();
+        assert!(docstring_del.is_empty(), "docstring must not produce statement_deletion");
+    }
+
+    // Failure mode: `self.x = value` in __init__ must NOT generate statement_deletion
+    #[test]
+    fn test_stmt_del_self_assign_skipped() {
+        let source = "class C:\n    def __init__(self, x):\n        self.x = x\n";
+        let muts = statement_deletion_mutations(source);
+        assert!(muts.is_empty(), "self.x assignment must not produce statement_deletion");
+    }
+
+    // Failure mode: augmented assign `x += 1` must NOT generate statement_deletion
+    #[test]
+    fn test_stmt_del_augassign_skipped() {
+        let source = "def f(x):\n    x += 1\n    return x\n";
+        let muts = statement_deletion_mutations(source);
+        let aug_del: Vec<_> = muts.iter().filter(|m| m.original.contains("+=")).collect();
+        assert!(aug_del.is_empty(), "augmented assign must not produce statement_deletion");
+    }
+
+    // Multiple eligible statements: each gets its own independent mutation
+    #[test]
+    fn test_stmt_del_multiple_statements() {
+        let source = "def f(x):\n    y = x + 1\n    print(y)\n    raise ValueError(\"e\")\n    return y\n";
+        let muts = statement_deletion_mutations(source);
+        assert_eq!(muts.len(), 4, "four eligible statements must produce 4 statement_deletion mutations");
+    }
+
+    // INV-1+2+3: Every generated mutation must produce parseable Python when applied
+    #[test]
+    fn test_stmt_del_all_produce_parseable_python() {
+        let sources = [
+            "def f():\n    x = foo()\n    return x\n",
+            "def f(x):\n    return x + 1\n",
+            "def f(x):\n    print(x)\n",
+            "def f():\n    raise ValueError(\"bad\")\n",
+        ];
+        for source in &sources {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "statement_deletion") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "statement_deletion '{}' → '{}' produced unparseable Python:\n{}",
+                        m.original,
+                        m.replacement,
+                        mutated
+                    );
+                }
+            }
+        }
     }
 }
