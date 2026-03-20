@@ -177,14 +177,20 @@ fn collect_function_mutations(
         .iter()
         .any(|dec| codegen_node(&dec.decorator).trim() == "staticmethod");
 
-    // Skip property descriptors and setter/deleter — these produce non-function
-    // objects that cannot be trampolined (property has no writable __name__,
-    // and @x.setter / @x.deleter reference the property by its original name).
+    // Skip decorators that transform the function object into something else —
+    // these cannot be trampolined because the renamed orig also carries the
+    // decorator, so calling orig() returns the transformed object (e.g.
+    // _GeneratorContextManager) rather than a plain callable/generator.
+    //
+    // - property / cached_property: no writable __name__, can't trampoline
+    // - @x.setter / @x.deleter: reference property by its original name
+    // - contextmanager / asynccontextmanager: orig() returns _GeneratorContextManager,
+    //   which is not iterable via `yield from`
     for dec in &func.decorators {
         let dec_text = codegen_node(&dec.decorator);
         let trimmed = dec_text.trim();
         let base = trimmed.rsplit('.').next().unwrap_or(trimmed);
-        if matches!(base, "property" | "cached_property")
+        if matches!(base, "property" | "cached_property" | "contextmanager" | "asynccontextmanager")
             || trimmed.ends_with(".setter")
             || trimmed.ends_with(".deleter")
         {
@@ -6757,6 +6763,63 @@ mod statement_deletion_tests {
         let source = "class C:\n    @property\n    @some_other\n    def x(self):\n        return 1\n";
         let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "@property with additional decorator must still be skipped");
+    }
+}
+
+// --- contextmanager / asynccontextmanager skip tests ---
+#[cfg(test)]
+mod contextmanager_skip_tests {
+    use super::*;
+
+    // INV-1: @contextmanager-decorated functions produce NO mutations.
+    #[test]
+    fn test_contextmanager_skipped() {
+        let source = concat!(
+            "from contextlib import contextmanager\n",
+            "@contextmanager\n",
+            "def request_context(request=None):\n",
+            "    yield\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@contextmanager function must be skipped");
+    }
+
+    // INV-2: @asynccontextmanager-decorated functions produce NO mutations.
+    #[test]
+    fn test_asynccontextmanager_skipped() {
+        let source = concat!(
+            "from contextlib import asynccontextmanager\n",
+            "@asynccontextmanager\n",
+            "async def async_ctx():\n",
+            "    yield 1 + 2\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@asynccontextmanager function must be skipped");
+    }
+
+    // INV-3: @contextlib.contextmanager (dotted) is also skipped.
+    #[test]
+    fn test_contextlib_dotted_contextmanager_skipped() {
+        let source = concat!(
+            "import contextlib\n",
+            "@contextlib.contextmanager\n",
+            "def request_context(request=None):\n",
+            "    yield\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@contextlib.contextmanager function must be skipped");
+    }
+
+    // INV-4: Regular generator functions (no decorator) are still mutated (regression).
+    #[test]
+    fn test_plain_generator_still_mutated() {
+        let source = concat!(
+            "def gen_values(n):\n",
+            "    for i in range(n):\n",
+            "        yield i + 1\n",
+        );
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty(), "plain generator function must still produce mutations");
     }
 }
 
