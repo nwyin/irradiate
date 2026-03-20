@@ -1497,10 +1497,9 @@ proptest! {
 
 /// Generate Python functions with 0–3 decorators from a fixed set.
 ///
-/// Exercises decorator_removal: each non-skipped decorator produces one removal mutation,
-/// and skipped decorators (@abstractmethod, @override) produce zero.
+/// Decorated functions are entirely skipped (matching mutmut behavior).
+/// This strategy generates functions with 0..3 decorators to verify the skip.
 fn decorator_strategy() -> impl Strategy<Value = String> {
-    // Decorators to choose from; abstractmethod and override are in the skip list.
     let n_decorators = 0usize..=3usize;
     let decorator_names = prop::sample::select(vec![
         "cache", "staticmethod", "property", "custom_dec",
@@ -1513,65 +1512,24 @@ fn decorator_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    /// Decorated functions satisfy all core invariants (INV-2..5).
-    ///
-    /// Guards against offset bugs when decorator text is prepended to func_source:
-    /// both decorator_removal spans and body mutation spans must be valid.
+    /// Decorated functions produce zero mutations (blanket skip).
+    /// Undecorated functions still produce mutations.
     #[test]
-    fn decorator_removal_all_invariants(source in decorator_strategy()) {
+    fn decorated_functions_skipped_entirely(source in decorator_strategy()) {
         let fms = collect_file_mutations(&source);
-        assert_core_invariants!(fms);
-    }
-
-    /// INV-extra: N non-skipped decorators produce exactly N decorator_removal mutations.
-    ///
-    /// This catches both double-emit (> N) and silent-skip (< N) bugs.
-    /// Skipped decorators (@abstractmethod, @override) produce 0 — tested separately.
-    #[test]
-    fn decorator_removal_count_matches_decorators(source in decorator_strategy()) {
-        let fms = collect_file_mutations(&source);
-        let removal_count: usize = fms
-            .iter()
-            .flat_map(|fm| fm.mutations.iter())
-            .filter(|m| m.operator == "decorator_removal")
-            .count();
-
-        // Count non-skipped decorators in the source by counting "@" lines that are
-        // not @abstractmethod or @override.
-        let expected: usize = source
-            .lines()
-            .filter(|line| {
-                let t = line.trim();
-                t.starts_with('@')
-                    && t != "@abstractmethod"
-                    && t != "@override"
-            })
-            .count();
-
-        prop_assert_eq!(
-            removal_count,
-            expected,
-            "decorator_removal count must match non-skipped decorators; source:\n{}",
-            source
-        );
-    }
-
-    /// INV-extra: Applying a decorator_removal mutation produces valid Python.
-    ///
-    /// Removes a decorator line and verifies the result parses without error.
-    #[test]
-    fn decorator_removal_produces_valid_python(source in decorator_strategy()) {
-        let fms = collect_file_mutations(&source);
-        for fm in &fms {
-            for m in fm.mutations.iter().filter(|m| m.operator == "decorator_removal") {
-                let mutated = apply_mutation(&fm.source, m);
-                prop_assert!(
-                    parse_module(&mutated, None).is_ok(),
-                    "decorator_removal of '{}' produced unparseable Python:\n{}",
-                    m.original,
-                    mutated
-                );
-            }
+        let has_decorator = source.lines().any(|l| l.trim().starts_with('@'));
+        if has_decorator {
+            prop_assert!(
+                fms.is_empty(),
+                "decorated function must produce no mutations; source:\n{}",
+                source
+            );
+        } else {
+            prop_assert!(
+                !fms.is_empty(),
+                "undecorated function must produce mutations; source:\n{}",
+                source
+            );
         }
     }
 }
