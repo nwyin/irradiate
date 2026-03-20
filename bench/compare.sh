@@ -209,11 +209,14 @@ echo
 
 # ── Run mutmut (N children) ───────────────────────────────────────────────
 # mutmut 2.5.1 pinned — see header comment for apples-to-oranges context.
-# mutmut 2.5.1 is sequential (no --max-children). We prepend the bench venv
-# bin to PATH so mutmut's subprocess can find `python` for test execution.
+# mutmut 2.5.1 is sequential (no --max-children) and takes 60+ minutes on
+# CI. Skip on CI by default; set BENCH_MUTMUT=1 to force.
 MUTMUT_PYTHON="$BENCH_DIR/.venv/bin/python"
 MUTMUT_PATH="$BENCH_DIR/.venv/bin:$PATH"
-if [ ! -x "$MUTMUT_PYTHON" ]; then
+BENCH_MUTMUT="${BENCH_MUTMUT:-}"
+if [ -n "${CI:-}" ] && [ "$BENCH_MUTMUT" != "1" ]; then
+    echo "--- mutmut_1c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
+elif [ ! -x "$MUTMUT_PYTHON" ]; then
     echo "Warning: $MUTMUT_PYTHON not found — skipping mutmut benchmarks." >&2
     echo "  Run: bash bench/setup.sh" >&2
 else
