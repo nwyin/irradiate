@@ -181,8 +181,17 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
                     let indented_module = indent_code(&trampolines[idx].module_code, func_indent);
                     output.push_str(&indented_module);
                     output.push('\n');
+                } else {
+                    // For top-level functions: emit the wrapper INLINE here (at the same
+                    // position as the original def) so that module-level code following
+                    // the definition can call the function without a NameError.
+                    //
+                    // module_code (orig, variants, dict) is still appended at the end —
+                    // those are only accessed when the wrapper is *called* (at runtime),
+                    // not when the wrapper *def* is executed, so forward-reference is safe.
+                    output.push_str(&trampolines[idx].wrapper_code);
+                    output.push('\n');
                 }
-                // For top-level functions: wrapper and module_code are emitted after the walk.
                 continue;
             }
         }
@@ -192,21 +201,19 @@ pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
         i += 1;
     }
 
-    // Append module-level code and wrappers for TOP-LEVEL functions only.
+    // Append module_code (mangled orig, variants, lookup dict) for TOP-LEVEL functions only.
     // For class methods, both module_code and wrapper_code were already emitted
     // inside the class body during the walk above (to preserve the __class__ cell
     // so that super() works correctly).
+    //
+    // For top-level functions, the wrapper_code was already emitted inline (in source
+    // order) during the walk to preserve definition-before-use for module-level calls.
+    // The module_code is safe to append here because it is only accessed when the
+    // wrapper is *called* (at runtime), not when the wrapper *def* is executed.
     output.push('\n');
     for (idx, fm) in function_mutations.iter().enumerate() {
         if fm.class_name.is_none() {
             output.push_str(&trampolines[idx].module_code);
-            output.push_str("\n\n");
-        }
-    }
-
-    for (idx, fm) in function_mutations.iter().enumerate() {
-        if fm.class_name.is_none() {
-            output.push_str(&trampolines[idx].wrapper_code);
             output.push_str("\n\n");
         }
     }
@@ -1051,6 +1058,132 @@ class Single:
         assert!(
             t.starts_with("def only(") && !t.contains("mutmut"),
             "First line of class body after stripping should be the wrapper, got: {first_body_line:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // INV: wrapper must precede module-level calls (NameError regression)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_wrapper_precedes_module_level_call() {
+        // INV-1: When a module-level statement calls a trampolined function,
+        // the wrapper `def` must appear BEFORE that call in the output.
+        // Regression: before the fix, the wrapper was appended at EOF but the
+        // call was emitted inline — causing NameError at import time.
+        let source = "\
+def make_value(x):
+    return x + 1
+
+RESULT = make_value(42)
+";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let wrapper_pos = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def make_value(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def make_value( should exist");
+
+        let call_pos = lines
+            .iter()
+            .position(|l| l.contains("RESULT = make_value("))
+            .expect("module-level call should be preserved");
+
+        assert!(
+            wrapper_pos < call_pos,
+            "wrapper (line {wrapper_pos}) must appear before module-level call (line {call_pos})\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_multiple_wrappers_precede_their_calls() {
+        // INV-2: Multiple trampolined functions, each called at module level —
+        // every wrapper must appear before its respective call.
+        let source = "\
+def make_a(x):
+    return x + 1
+
+def make_b(x):
+    return x - 1
+
+A = make_a(10)
+B = make_b(20)
+";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let wrapper_a = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def make_a(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def make_a( should exist");
+
+        let call_a = lines
+            .iter()
+            .position(|l| l.contains("A = make_a("))
+            .expect("call to make_a should be preserved");
+
+        let wrapper_b = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def make_b(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def make_b( should exist");
+
+        let call_b = lines
+            .iter()
+            .position(|l| l.contains("B = make_b("))
+            .expect("call to make_b should be preserved");
+
+        assert!(
+            wrapper_a < call_a,
+            "make_a wrapper (line {wrapper_a}) must be before call (line {call_a})\n{}",
+            result.source
+        );
+        assert!(
+            wrapper_b < call_b,
+            "make_b wrapper (line {wrapper_b}) must be before call (line {call_b})\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_wrapper_immediately_before_call_no_gap() {
+        // INV-3: Wrapper is emitted inline even when the module-level call
+        // appears immediately after the function definition (no other code between them).
+        let source = "\
+def factory(n):
+    return n * 2
+X = factory(5)
+";
+        let result = mutate_file(source, "mod").unwrap();
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        let wrapper_pos = lines
+            .iter()
+            .position(|l| {
+                let t = l.trim_start();
+                t.starts_with("def factory(") && !t.contains("irradiate_orig")
+            })
+            .expect("wrapper def factory( should exist");
+
+        let call_pos = lines
+            .iter()
+            .position(|l| l.contains("X = factory("))
+            .expect("module-level call to factory should be preserved");
+
+        assert!(
+            wrapper_pos < call_pos,
+            "wrapper (line {wrapper_pos}) must be before call (line {call_pos})\n{}",
+            result.source
         );
     }
 
