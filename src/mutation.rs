@@ -659,7 +659,7 @@ fn collect_small_statement_mutations(
             let text = codegen_node(b);
             if let Some(pos) = source[*cursor..].find(&text) {
                 let start = *cursor + pos;
-                record_mutation(&text, "return", "keyword_swap", start, mutations);
+                record_mutation(&text, "continue", "keyword_swap", start, mutations);
                 *cursor = start + text.len();
             }
         }
@@ -4196,9 +4196,9 @@ mod yield_detection_tests {
 mod keyword_swap_tests {
     use super::*;
 
-    // INV-1: `while True: break` → break is replaced with return.
+    // INV-1: `while True: break` → break is replaced with continue.
     #[test]
-    fn test_break_to_return() {
+    fn test_break_to_continue() {
         let source = "def f():\n    while True:\n        break\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "should collect mutations from function");
@@ -4207,7 +4207,7 @@ mod keyword_swap_tests {
         assert!(!kw.is_empty(), "break inside while should produce a keyword_swap mutation");
         let m = kw[0];
         assert_eq!(m.original, "break", "original must be 'break'");
-        assert_eq!(m.replacement, "return", "replacement must be 'return'");
+        assert_eq!(m.replacement, "continue", "replacement must be 'continue'");
     }
 
     // INV-2: `for x in y: continue` → continue is replaced with break.
@@ -4234,7 +4234,41 @@ mod keyword_swap_tests {
         let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
         assert!(!kw.is_empty(), "break inside nested if should still produce keyword_swap");
         assert_eq!(kw[0].original, "break");
-        assert_eq!(kw[0].replacement, "return");
+        assert_eq!(kw[0].replacement, "continue");
+    }
+
+    // INV-3: Loop with both break and continue generates 2 keyword_swap mutations.
+    #[test]
+    fn test_break_and_continue_both_swapped() {
+        let source = "def f(items, cond):\n    for x in items:\n        if cond:\n            break\n        else:\n            continue\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+        assert_eq!(kw.len(), 2, "loop with break and continue must produce 2 keyword_swap mutations");
+        let originals: Vec<&str> = kw.iter().map(|m| m.original.as_str()).collect();
+        assert!(originals.contains(&"break"), "must have break mutation");
+        assert!(originals.contains(&"continue"), "must have continue mutation");
+        for m in &kw {
+            if m.original == "break" {
+                assert_eq!(m.replacement, "continue");
+            } else {
+                assert_eq!(m.replacement, "break");
+            }
+        }
+    }
+
+    // INV-3: Nested loops generate keyword_swap mutations at each nesting level independently.
+    #[test]
+    fn test_break_continue_nested_loops() {
+        let source = "def f(outer, inner):\n    for x in outer:\n        break\n        for y in inner:\n            continue\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
+        let fm = &fms[0];
+        let kw: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "keyword_swap").collect();
+        assert_eq!(kw.len(), 2, "nested loops with break and continue must produce 2 keyword_swap mutations");
+        // Verify each is at a distinct position
+        assert_ne!(kw[0].start, kw[1].start, "break and continue must be at distinct positions");
     }
 
     // INV-4: All keyword_swap mutations produce valid Python (parse_module succeeds).
