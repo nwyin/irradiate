@@ -59,9 +59,9 @@ jobs:
         if: github.event_name != 'push'
         run: bash bench/setup.sh
 
-      - name: Run benchmark (synth target, 3 runs)
+      - name: Run benchmark (synth target, 1 run)
         if: github.event_name != 'push'
-        run: bash bench/compare.sh synth --runs 3
+        run: bash bench/compare.sh synth --runs 1
 
       # Vendor tests: run irradiate on real open-source Python libraries.
       # bench/setup.sh (run above) already bootstraps corpora and sets up their venvs.

@@ -185,27 +185,33 @@ done
 echo
 
 # ── Run irradiate isolate ─────────────────────────────────────────────────
-CONFIG="irradiate_isolate"
-echo "--- $CONFIG ---"
-warmup_run "$CONFIG" \
-    "$IRRADIATE_BIN" run \
-        --paths-to-mutate "$PATHS_TO_MUTATE" \
-        --tests-dir "$TESTS_DIR" \
-        --isolate \
-        --python "$PYTHON"
+# Isolate mode spawns a fresh subprocess per mutant — very slow on CI.
+# Skipped on CI by default; set BENCH_ISOLATE=1 to force.
+if [ -n "${CI:-}" ] && [ "${BENCH_ISOLATE:-}" != "1" ]; then
+    echo "--- irradiate_isolate --- (skipped on CI — set BENCH_ISOLATE=1 to enable)" >&2
+else
+    CONFIG="irradiate_isolate"
+    echo "--- $CONFIG ---"
+    warmup_run "$CONFIG" \
+        "$IRRADIATE_BIN" run \
+            --paths-to-mutate "$PATHS_TO_MUTATE" \
+            --tests-dir "$TESTS_DIR" \
+            --isolate \
+            --python "$PYTHON"
 
-for i in $(seq 1 "$RUNS"); do
-    (
-        cd "$PROJECT_DIR"
-        run_config "$CONFIG" "$i" \
-            "$IRRADIATE_BIN" run \
-                --paths-to-mutate "$PATHS_TO_MUTATE" \
-                --tests-dir "$TESTS_DIR" \
-                --isolate \
-                --python "$PYTHON"
-    )
-done
-echo
+    for i in $(seq 1 "$RUNS"); do
+        (
+            cd "$PROJECT_DIR"
+            run_config "$CONFIG" "$i" \
+                "$IRRADIATE_BIN" run \
+                    --paths-to-mutate "$PATHS_TO_MUTATE" \
+                    --tests-dir "$TESTS_DIR" \
+                    --isolate \
+                    --python "$PYTHON"
+        )
+    done
+    echo
+fi
 
 # ── Run mutmut (N children) ───────────────────────────────────────────────
 # mutmut 2.5.1 pinned — see header comment for apples-to-oranges context.
