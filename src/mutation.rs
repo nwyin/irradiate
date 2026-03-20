@@ -141,6 +141,9 @@ fn collect_function_mutations(
 
     let mut mutations = Vec::new();
 
+    // Collect mutations on default argument values in the function signature.
+    collect_default_arg_mutations(&func.params, &func_source, &mut mutations);
+
     collect_suite_mutations(
         &func.body,
         &func_source,
@@ -184,6 +187,151 @@ fn collect_function_mutations(
         is_generator,
         mutations,
     })
+}
+
+// --- Default argument value mutations ---
+
+/// Collect mutations for default argument values in a function's parameter list.
+///
+/// For each parameter with a default value, generates one mutation that changes
+/// the default to a different valid Python value. The mutation offset is computed
+/// relative to `func_source` (the full function definition text).
+///
+/// Strategy: codegen the full params text, then use a monotonic cursor to find each
+/// default value in left-to-right order (handles duplicate default values correctly).
+fn collect_default_arg_mutations(
+    params: &cst::Parameters,
+    func_source: &str,
+    mutations: &mut Vec<Mutation>,
+) {
+    let params_text = codegen_node(params);
+
+    // Empty params: nothing to do.
+    if params_text.is_empty() {
+        return;
+    }
+
+    // Find where the params text appears in the function source.
+    // The params sit inside "def name(HERE):" so the first occurrence is always correct.
+    let params_start = match func_source.find(&params_text) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Process positional-only, regular, and keyword-only params (those that can have defaults).
+    // Skip star_arg (*args) and star_kwarg (**kwargs): they cannot have defaults in Python.
+    let all_params = params
+        .posonly_params
+        .iter()
+        .chain(params.params.iter())
+        .chain(params.kwonly_params.iter());
+
+    let mut cursor = 0usize; // monotonic cursor within params_text
+
+    for param in all_params {
+        let default_expr = match &param.default {
+            Some(d) => d,
+            None => {
+                // No default: advance cursor past the param name to ensure the next
+                // name search doesn't backtrack.
+                let name = param.name.value;
+                if let Some(pos) = params_text[cursor..].find(name) {
+                    cursor += pos + name.len();
+                }
+                continue;
+            }
+        };
+
+        let default_text = codegen_node(default_expr);
+
+        // Advance cursor past the param name (and optional annotation) before
+        // searching for the default. This prevents false matches of the default
+        // text in the param name or annotation.
+        let name = param.name.value;
+        if let Some(name_pos) = params_text[cursor..].find(name) {
+            cursor += name_pos + name.len();
+        }
+
+        // Find the default text in params_text from the current cursor position.
+        let default_pos_in_params = match params_text[cursor..].find(&default_text) {
+            Some(p) => cursor + p,
+            None => continue,
+        };
+
+        cursor = default_pos_in_params + default_text.len();
+
+        let abs_offset = params_start + default_pos_in_params;
+
+        if let Some(replacement) = compute_default_replacement(&default_text) {
+            if replacement != default_text {
+                record_mutation(&default_text, &replacement, "default_arg", abs_offset, mutations);
+            }
+        }
+    }
+}
+
+/// Compute the mutation replacement for a default argument value.
+///
+/// Rules (applied in order):
+/// - `None`           → `""`
+/// - `True`           → `False`
+/// - `False`          → `True`
+/// - integer literal  → `n + 1`
+/// - float literal    → `n + 1.0`
+/// - string literal   → `"XX{inner}XX"` (or `"XX"` for empty strings)
+/// - anything else    → `None`
+fn compute_default_replacement(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+
+    if trimmed == "None" {
+        return Some("\"\"".to_string());
+    }
+    if trimmed == "True" {
+        return Some("False".to_string());
+    }
+    if trimmed == "False" {
+        return Some("True".to_string());
+    }
+
+    // Integer: try parsing without underscores (Python allows 1_000 etc.)
+    if let Ok(n) = trimmed.replace('_', "").parse::<i64>() {
+        let r = (n + 1).to_string();
+        if r.as_str() != trimmed {
+            return Some(r);
+        }
+    }
+
+    // Float: only try parsing if it looks like a float (contains `.` or `e`/`E`).
+    if trimmed.contains('.') || trimmed.to_lowercase().contains('e') {
+        if let Ok(n) = trimmed.parse::<f64>() {
+            let r = format!("{}", n + 1.0);
+            if r != trimmed {
+                return Some(r);
+            }
+        }
+    }
+
+    // String literal: detect quoted form (with optional prefix like r, b, f).
+    if let Some(prefix_end) = trimmed.find(['"', '\'']) {
+        let quote_char = trimmed.as_bytes()[prefix_end] as char;
+        let rest = &trimmed[prefix_end..];
+        // Only single-quoted (not triple-quoted): a triple-quoted string starts with """/'''.
+        let triple = if quote_char == '"' { "\"\"\"" } else { "'''" };
+        if !rest.starts_with(triple) && trimmed.ends_with(quote_char) && trimmed.len() >= 2 {
+            let prefix = &trimmed[..prefix_end];
+            let inner = &trimmed[prefix_end + 1..trimmed.len() - 1];
+            if !inner.contains(quote_char) {
+                if inner.is_empty() {
+                    return Some(format!("{prefix}{quote_char}XX{quote_char}"));
+                } else {
+                    return Some(format!("{prefix}{quote_char}XX{inner}XX{quote_char}"));
+                }
+            }
+        }
+    }
+
+    // Fallback: replace with None (unless it's already None, handled above).
+    Some("None".to_string())
 }
 
 // --- Generator detection ---
@@ -2230,9 +2378,17 @@ mod tests {
         let source = "def foo(x):\n    return len(x)\n";
         let fms = collect_file_mutations(source);
         // len(x) should produce 0 mutations total (no arg_removal, no method_swap, x not visited).
+        // NOTE: return_value mutations on the return statement are acceptable — only the
+        // call-level arg_removal/method_swap mutations should be suppressed.
+        let non_rv_mutations: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator != "return_value")
+            .collect();
         assert!(
-            fms.is_empty() || fms[0].mutations.is_empty(),
-            "len(x) must produce 0 mutations"
+            non_rv_mutations.is_empty(),
+            "len(x) must produce 0 non-return_value mutations, got: {:?}",
+            non_rv_mutations
         );
     }
 
@@ -2241,9 +2397,17 @@ mod tests {
     fn test_isinstance_call_not_mutated() {
         let source = "def foo(x):\n    return isinstance(x, int)\n";
         let fms = collect_file_mutations(source);
+        // isinstance(x, int) should produce 0 call-level mutations — only return_value
+        // mutations on the enclosing return statement are acceptable.
+        let non_rv_mutations: Vec<_> = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator != "return_value")
+            .collect();
         assert!(
-            fms.is_empty() || fms[0].mutations.is_empty(),
-            "isinstance(x, int) must produce 0 mutations"
+            non_rv_mutations.is_empty(),
+            "isinstance(x, int) must produce 0 non-return_value mutations, got: {:?}",
+            non_rv_mutations
         );
     }
 
@@ -3622,6 +3786,134 @@ mod yield_detection_tests {
             !outer.is_generator,
             "outer must not be is_generator just because nested def has yield"
         );
+    }
+
+    // --- default_arg tests ---
+
+    #[test]
+    fn test_default_int_incremented() {
+        let source = "def f(x=0):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "default_arg")
+            .expect("should find default_arg mutation");
+        assert_eq!(m.original, "0");
+        assert_eq!(m.replacement, "1");
+        // Offset correctness: the `0` default is at position 8 in "def f(x=0):\n    return x\n"
+        assert_eq!(&fms[0].source[m.start..m.end], "0", "source slice must equal original");
+    }
+
+    #[test]
+    fn test_default_none_to_empty_string() {
+        let source = "def f(x=None):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "default_arg")
+            .expect("should find default_arg mutation");
+        assert_eq!(m.original, "None");
+        assert_eq!(m.replacement, "\"\"");
+        assert_eq!(&fms[0].source[m.start..m.end], "None");
+    }
+
+    #[test]
+    fn test_default_string_to_xx() {
+        let source = "def f(x=\"hello\"):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "default_arg")
+            .expect("should find default_arg mutation");
+        assert_eq!(m.original, "\"hello\"");
+        assert_eq!(m.replacement, "\"XXhelloXX\"");
+        assert_eq!(&fms[0].source[m.start..m.end], "\"hello\"");
+    }
+
+    #[test]
+    fn test_default_bool_swapped() {
+        let source = "def f(x=True):\n    return x\n";
+        let fms = collect_file_mutations(source);
+        let m = fms[0].mutations.iter().find(|m| m.operator == "default_arg")
+            .expect("should find default_arg mutation");
+        assert_eq!(m.original, "True");
+        assert_eq!(m.replacement, "False");
+        assert_eq!(&fms[0].source[m.start..m.end], "True");
+    }
+
+    #[test]
+    fn test_no_default_no_mutation() {
+        let source = "def f(x):\n    return x + 1\n";
+        let fms = collect_file_mutations(source);
+        let default_muts: Vec<_> = fms[0].mutations.iter()
+            .filter(|m| m.operator == "default_arg")
+            .collect();
+        assert!(default_muts.is_empty(), "param without default should produce no default_arg mutation");
+    }
+
+    #[test]
+    fn test_multiple_defaults_independent() {
+        let source = "def f(x=0, y=1):\n    return x + y\n";
+        let fms = collect_file_mutations(source);
+        let default_muts: Vec<_> = fms[0].mutations.iter()
+            .filter(|m| m.operator == "default_arg")
+            .collect();
+        assert_eq!(default_muts.len(), 2, "two params with defaults → two mutations");
+        // x=0 → x=1
+        let mx = default_muts.iter().find(|m| m.original == "0").expect("mutation for x=0");
+        assert_eq!(mx.replacement, "1");
+        assert_eq!(&fms[0].source[mx.start..mx.end], "0");
+        // y=1 → y=2
+        let my = default_muts.iter().find(|m| m.original == "1").expect("mutation for y=1");
+        assert_eq!(my.replacement, "2");
+        assert_eq!(&fms[0].source[my.start..my.end], "1");
+    }
+
+    #[test]
+    fn test_default_arg_span_correctness() {
+        // Verify that applying each default_arg mutation to func_source produces valid output.
+        let sources = [
+            "def f(x=0):\n    return x\n",
+            "def f(x=None):\n    return x\n",
+            "def f(x=\"hello\"):\n    return x\n",
+            "def f(x=True):\n    return x\n",
+            "def f(x=0, y=1):\n    return x + y\n",
+        ];
+        for source in sources {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "default_arg") {
+                    // Span correctness: source[start..end] == original
+                    assert_eq!(
+                        &fm.source[m.start..m.end], m.original.as_str(),
+                        "span mismatch for source: {source}"
+                    );
+                    // Replacement differs
+                    assert_ne!(m.original, m.replacement, "replacement must differ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_arg_parseable() {
+        // After applying each default_arg mutation, the resulting function must parse as valid Python.
+        let sources = [
+            "def f(x=0):\n    return x\n",
+            "def f(x=None):\n    return x\n",
+            "def f(x=\"hello\"):\n    return x\n",
+            "def f(x=True):\n    return x\n",
+            "def f(x=False):\n    return x\n",
+            "def f(x=3.14):\n    return x\n",
+            "def f(x=0, y=1):\n    return x\n",
+        ];
+        for source in sources {
+            let fms = collect_file_mutations(source);
+            for fm in &fms {
+                for m in fm.mutations.iter().filter(|m| m.operator == "default_arg") {
+                    let mutated = apply_mutation(&fm.source, m);
+                    assert!(
+                        parse_module(&mutated, None).is_ok(),
+                        "mutated source must parse as valid Python:\n{mutated}\n(original: {source})"
+                    );
+                }
+            }
+        }
     }
 }
 

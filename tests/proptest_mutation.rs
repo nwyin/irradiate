@@ -349,6 +349,30 @@ fn return_value_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+/// Generate function signatures with various default value types.
+///
+/// Covers the main branches of `compute_default_replacement`:
+/// - int literal (→ n+1)
+/// - None literal (→ "")
+/// - bool literal (→ swapped bool)
+/// - string literal (→ "XX{inner}XX")
+///
+/// The function body uses the parameter so the function is not filtered out.
+fn default_arg_strategy() -> impl Strategy<Value = String> {
+    let kind = prop::sample::select(vec!["int", "none", "bool_true", "bool_false", "string"]);
+    let int_val = int_vals();
+    let str_content = prop::sample::select(vec!["hello", "world", "test", "abc"]);
+
+    (kind, int_val, str_content).prop_map(|(kind, int_val, str_content)| match kind {
+        "int" => format!("def f(x={int_val}):\n    return x\n"),
+        "none" => "def f(x=None):\n    return x\n".to_string(),
+        "bool_true" => "def f(x=True):\n    return x\n".to_string(),
+        "bool_false" => "def f(x=False):\n    return x\n".to_string(),
+        "string" => format!("def f(x=\"{str_content}\"):\n    return x\n"),
+        _ => unreachable!(),
+    })
+}
+
 /// Helper: check all core invariants for a set of FunctionMutations.
 ///
 /// Used by tests that only need to verify offsets/content, not generator status.
@@ -1076,6 +1100,39 @@ proptest! {
             total_rv,
             1usize,
             "single return-with-value must produce exactly 1 return_value mutation; source:\n{}",
+            source
+        );
+    }
+
+    // --- Default arg tests ---
+
+    /// Default arg mutations satisfy all core invariants (INV-2..5).
+    ///
+    /// Exercises `collect_default_arg_mutations`: the byte span of each mutation must
+    /// be within the function source, and the source slice at [start..end] must equal
+    /// the stored original. A span bug here would corrupt the mutated source.
+    #[test]
+    fn default_arg_all_invariants(source in default_arg_strategy()) {
+        let fms = collect_file_mutations(&source);
+        assert_core_invariants!(fms);
+    }
+
+    /// Each function with exactly one defaulted parameter produces exactly one default_arg mutation.
+    ///
+    /// INV-extra: one default → one mutation. Guards against the loop silently skipping
+    /// default-bearing params or emitting duplicate mutations for the same param.
+    #[test]
+    fn default_arg_single_param_produces_one_mutation(source in default_arg_strategy()) {
+        let fms = collect_file_mutations(&source);
+        let default_arg_count: usize = fms
+            .iter()
+            .flat_map(|fm| fm.mutations.iter())
+            .filter(|m| m.operator == "default_arg")
+            .count();
+        prop_assert_eq!(
+            default_arg_count,
+            1,
+            "single-default function must produce exactly 1 default_arg mutation; source:\n{}",
             source
         );
     }
