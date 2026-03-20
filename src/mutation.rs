@@ -537,12 +537,16 @@ fn collect_statement_mutations(
             CompoundStatement::While(w) => {
                 let cond_cursor = pos_after_keyword(source, *cursor, "while ");
                 add_condition_negation_mutation(&w.test, source, cond_cursor, mutations);
+                let cursor_before = *cursor;
                 collect_expr_mutations(&w.test, source, cursor, mutations, ignored);
                 collect_suite_mutations(&w.body, source, cursor, mutations, ignored);
+                add_while_loop_mutation(w, source, cursor_before, mutations);
             }
             CompoundStatement::For(f) => {
+                let cursor_before = *cursor;
                 collect_expr_mutations(&f.iter, source, cursor, mutations, ignored);
                 collect_suite_mutations(&f.body, source, cursor, mutations, ignored);
+                add_for_loop_mutation(f, source, cursor_before, mutations);
             }
             CompoundStatement::With(w) => {
                 for item in &w.items {
@@ -1611,6 +1615,68 @@ fn find_block_end(source: &str, from: usize, block_indent_len: usize) -> usize {
 ///
 /// Byte offset computation: for each handler, we construct the exact `except<ws><type>` text
 /// using the CST-stored `whitespace_after_except` field and search forward from `cursor_before`
+/// For-loop iterable replacement: `for x in items:` → `for x in []:`
+///
+/// Finds the iterable text via the whitespace fields stored in the CST node, then emits a
+/// single `loop_mutation` that replaces the iterable with `[]`.  The `cursor_before` must be
+/// the cursor value saved *before* any expression/suite recursion on this For node.
+///
+/// Skips the mutation if the iterable is already `[]` (would be a no-op).
+fn add_for_loop_mutation<'a>(
+    for_stmt: &cst::For<'a>,
+    source: &str,
+    cursor_before: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let iter_text = codegen_node(&for_stmt.iter);
+
+    // Skip no-op: iterable is already [].
+    if iter_text.trim() == "[]" {
+        return;
+    }
+
+    let target_text = codegen_node(&for_stmt.target);
+    let ws_after_for = for_stmt.whitespace_after_for.0;
+    let ws_before_in = for_stmt.whitespace_before_in.0;
+    let ws_after_in = for_stmt.whitespace_after_in.0;
+
+    // Build a search pattern that uniquely anchors the `for` keyword plus everything up to
+    // (but not including) the iterable.  Searching forward from cursor_before ensures that
+    // nested for-loops (processed with their own saved cursor) are found at the right offset.
+    let prefix = format!("for{ws_after_for}{target_text}{ws_before_in}in{ws_after_in}");
+    let pos = match source[cursor_before..].find(&prefix) {
+        Some(p) => cursor_before + p,
+        None => return,
+    };
+
+    let iter_start = pos + prefix.len();
+    record_mutation(&iter_text, "[]", "loop_mutation", iter_start, mutations);
+}
+
+/// While-loop condition replacement: `while cond:` → `while False:`
+///
+/// Finds the condition text via the whitespace field stored in the CST node, then emits a
+/// single `loop_mutation` that replaces the condition with `False`.  The `cursor_before` must
+/// be the cursor value saved *before* any expression/suite recursion on this While node.
+fn add_while_loop_mutation<'a>(
+    while_stmt: &cst::While<'a>,
+    source: &str,
+    cursor_before: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let test_text = codegen_node(&while_stmt.test);
+    let ws_after_while = while_stmt.whitespace_after_while.0;
+
+    let prefix = format!("while{ws_after_while}");
+    let pos = match source[cursor_before..].find(&prefix) {
+        Some(p) => cursor_before + p,
+        None => return,
+    };
+
+    let test_start = pos + prefix.len();
+    record_mutation(&test_text, "False", "loop_mutation", test_start, mutations);
+}
+
 /// (which is at or before the try block in the function source). A sub-cursor advances through
 /// each handler header so that repeated handler types (e.g. two `except ValueError:`) are
 /// located at their correct respective positions.
@@ -5688,5 +5754,194 @@ mod ternary_swap_tests {
                 m.start, m.end, m.original, slice
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_mutation_tests {
+    use super::*;
+    use libcst_native::parse_module;
+
+    /// Extract all loop_mutation mutations from a source string, returning (fm, mutation) pairs.
+    fn loop_mutations_for(source: &str) -> Vec<(FunctionMutations, Mutation)> {
+        collect_file_mutations(source)
+            .into_iter()
+            .flat_map(|fm| {
+                let pairs: Vec<_> = fm
+                    .mutations
+                    .iter()
+                    .filter(|m| m.operator == "loop_mutation")
+                    .map(|m| (fm.clone(), m.clone()))
+                    .collect();
+                pairs
+            })
+            .collect()
+    }
+
+    /// Apply a mutation to function source and verify the result parses as valid Python.
+    fn mutated_source_parses(fm: &FunctionMutations, m: &Mutation) -> bool {
+        let mut result = fm.source.clone();
+        result.replace_range(m.start..m.end, &m.replacement);
+        parse_module(&result, None).is_ok()
+    }
+
+    // INV-1 helper: all loop_mutation results must produce parseable Python.
+    fn assert_all_parse(pairs: &[(FunctionMutations, Mutation)]) {
+        for (fm, m) in pairs {
+            assert!(
+                mutated_source_parses(fm, m),
+                "mutated source must parse: original='{}' replacement='{}'",
+                m.original,
+                m.replacement
+            );
+        }
+    }
+
+    // INV-2 / INV-3 helper: verify operator name and span correctness.
+    fn assert_span_correct(pairs: &[(FunctionMutations, Mutation)]) {
+        for (fm, m) in pairs {
+            assert_eq!(m.operator, "loop_mutation", "INV-2: operator must be loop_mutation");
+            assert_eq!(
+                &fm.source[m.start..m.end],
+                m.original.as_str(),
+                "INV-3: span [{}..{}] must equal original '{}'",
+                m.start,
+                m.end,
+                m.original
+            );
+        }
+    }
+
+    #[test]
+    fn test_for_range_iterable_replaced_with_empty_list() {
+        // INV-3: for-loop mutation replaces iterable with [].
+        let source = "def f():\n    for x in range(10):\n        pass\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "exactly one loop_mutation expected");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.replacement, "[]", "replacement must be []");
+        assert_eq!(m.original, "range(10)", "original must be the iterable");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+        let _ = fm;
+    }
+
+    #[test]
+    fn test_for_tuple_unpack_iterable_replaced() {
+        // for k, v in items.items() — tuple target, attribute-call iterable.
+        let source = "def f(d):\n    for k, v in d.items():\n        pass\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "exactly one loop_mutation expected");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.replacement, "[]");
+        assert_eq!(m.original, "d.items()");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_while_condition_replaced_with_false() {
+        // INV-3: while-loop mutation replaces condition with False.
+        let source = "def f(q):\n    while q:\n        q.pop()\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "exactly one loop_mutation expected");
+        let (fm, m) = &pairs[0];
+        assert_eq!(m.replacement, "False", "replacement must be False");
+        assert_eq!(m.original, "q", "original must be the condition");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+        let _ = fm;
+    }
+
+    #[test]
+    fn test_while_true_generates_mutation() {
+        // `while True:` → `while False:` is valid and catches real bugs.
+        let source = "def f():\n    while True:\n        break\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "while True must generate one loop_mutation");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.replacement, "False");
+        assert_eq!(m.original, "True");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_async_for_generates_mutation() {
+        // async for x in aiter — must generate one loop_mutation.
+        let source = "async def f(aiter):\n    async for x in aiter:\n        pass\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "async for must generate one loop_mutation");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.replacement, "[]");
+        assert_eq!(m.original, "aiter");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_nested_for_loops_each_get_mutation() {
+        // Each loop gets its own independent mutation.
+        let source = concat!(
+            "def f(outer, inner):\n",
+            "    for x in outer:\n",
+            "        for y in inner:\n",
+            "            pass\n",
+        );
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 2, "each for-loop must get its own mutation");
+        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
+        assert!(originals.contains(&"outer"), "outer loop must be mutated");
+        assert!(originals.contains(&"inner"), "inner loop must be mutated");
+        // Distinct positions.
+        assert_ne!(pairs[0].1.start, pairs[1].1.start, "mutations must target distinct positions");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_for_else_mutation_targets_iterable_only() {
+        // for-else: mutation replaces the iterable, else block is preserved.
+        let source = concat!(
+            "def f(items):\n",
+            "    for x in items:\n",
+            "        pass\n",
+            "    else:\n",
+            "        pass\n",
+        );
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one loop_mutation expected");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.replacement, "[]");
+        assert_eq!(m.original, "items");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_while_else_mutation_targets_condition_only() {
+        // while-else: mutation replaces the condition, else block is preserved.
+        let source = concat!(
+            "def f(q):\n",
+            "    while q:\n",
+            "        q.pop()\n",
+            "    else:\n",
+            "        pass\n",
+        );
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "one loop_mutation expected");
+        let (_, m) = &pairs[0];
+        assert_eq!(m.replacement, "False");
+        assert_eq!(m.original, "q");
+        assert_all_parse(&pairs);
+        assert_span_correct(&pairs);
+    }
+
+    #[test]
+    fn test_for_already_empty_list_skipped() {
+        // `for x in []: pass` — iterable is already [], skip to avoid no-op mutation.
+        let source = "def f():\n    for x in []:\n        pass\n";
+        let pairs = loop_mutations_for(source);
+        assert_eq!(pairs.len(), 0, "for x in [] must not generate a loop_mutation (no-op)");
     }
 }
