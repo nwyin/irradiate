@@ -1,10 +1,11 @@
 name: Report
 
 on:
-  push:
-    branches: [main]
-  schedule:
-    - cron: "0 6 * * 1"  # weekly Monday 6am UTC
+  # Disabled until scripts/generate_report.py and bench/ scaffolding exist.
+  # push:
+  #   branches: [main]
+  # schedule:
+  #   - cron: "0 6 * * 1"  # weekly Monday 6am UTC
   workflow_dispatch:
 
 permissions:
