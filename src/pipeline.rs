@@ -285,6 +285,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 &harness_dir,
                 &mutants_dir,
                 test_stats.as_ref(),
+                &project_dir,
             )
             .await?
         } else {
@@ -360,6 +361,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 &harness_dir,
                 &mutants_dir,
                 test_stats.as_ref(),
+                &project_dir,
             )
             .await?;
 
@@ -532,15 +534,15 @@ const MIN_ISOLATED_TIMEOUT_SECS: f64 = 10.0;
 /// pytest session state — each process starts clean.
 ///
 /// Slower than the worker pool but provides perfect isolation and is useful for debugging.
-async fn run_isolated(
+pub async fn run_isolated(
     config: &RunConfig,
     work_items: Vec<WorkItem>,
     harness_dir: &Path,
     mutants_dir: &Path,
     test_stats: Option<&TestStats>,
+    project_dir: &Path,
 ) -> Result<Vec<MutantResult>> {
     let mut results = Vec::new();
-    let project_dir = std::env::current_dir()?;
     let pythonpath = build_pythonpath(harness_dir, &config.paths_to_mutate);
 
     for item in work_items {
@@ -571,7 +573,7 @@ async fn run_isolated(
             .env("PYTHONPATH", &pythonpath)
             .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
             .env("IRRADIATE_ACTIVE_MUTANT", &item.mutant_name)
-            .current_dir(&project_dir)
+            .current_dir(project_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1996,5 +1998,168 @@ mod tests {
             !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
         );
+    }
+
+    // --- subprocess validation helpers (validate_clean_run, validate_fail_run, discover_tests) ---
+    //
+    // These tests spawn real Python subprocesses against the simple_project fixture.
+    // They require that the venv at tests/fixtures/simple_project/.venv exists.
+    // Run `cd tests/fixtures/simple_project && uv venv && uv pip install pytest` to set up.
+
+    fn subprocess_fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple_project")
+    }
+
+    fn subprocess_fixture_python() -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let venv = root.join("tests/fixtures/simple_project/.venv/bin/python3");
+        if venv.exists() {
+            venv
+        } else {
+            std::path::PathBuf::from("python3")
+        }
+    }
+
+    /// INV-4: validate_clean_run returns Ok when all tests pass.
+    #[test]
+    fn test_validate_clean_run_passing_project() {
+        let fixture = subprocess_fixture_dir();
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests");
+        assert!(
+            result.is_ok(),
+            "Clean project should pass validate_clean_run: {result:?}"
+        );
+    }
+
+    /// validate_clean_run returns Err when any test fails.
+    #[test]
+    fn test_validate_clean_run_fails_for_failing_tests() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        std::fs::write(
+            project.path().join("tests/test_fail.py"),
+            "def test_always_fails():\n    assert False\n",
+        )
+        .unwrap();
+
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
+        // paths_to_mutate parent doesn't matter for this test — no imports needed
+        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests");
+        assert!(
+            result.is_err(),
+            "Project with failing tests should return Err from validate_clean_run"
+        );
+    }
+
+    /// INV: validate_fail_run returns Ok when the harness correctly makes tests fail
+    /// under IRRADIATE_ACTIVE_MUTANT=fail. This confirms the trampoline is wired.
+    ///
+    /// The `fail` sentinel is checked inside the generated trampoline code, which lives
+    /// in the mutants dir. We must generate real mutants first so the import hook finds
+    /// the trampoline; an empty mutants dir would leave the original source in place and
+    /// the fail check would never run (tests would pass, causing validate_fail_run to Err).
+    #[test]
+    fn test_validate_fail_run_harness_kills_tests() {
+        let fixture = subprocess_fixture_dir();
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+
+        // Generate real mutants — the trampoline `if active == 'fail': raise …` must be present.
+        let tmp_mutants = tempfile::tempdir().unwrap();
+        generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[])
+            .expect("mutant generation should succeed for fixture");
+
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests");
+        assert!(
+            result.is_ok(),
+            "validate_fail_run should succeed (harness must cause failure under active_mutant='fail'): {result:?}"
+        );
+    }
+
+    /// INV-4: discover_tests returns non-empty list of valid pytest node IDs for a
+    /// project that has tests.
+    #[test]
+    fn test_discover_tests_finds_test_ids() {
+        let fixture = subprocess_fixture_dir();
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests")
+            .expect("discover_tests should not fail for a valid project");
+
+        assert!(!tests.is_empty(), "Should find at least one test");
+        // INV-4: every returned ID must contain '::' (pytest node ID format)
+        for id in &tests {
+            assert!(
+                id.contains("::"),
+                "Test ID must be a pytest node ID containing '::': {id}"
+            );
+        }
+        // Fixture has test_add, test_is_positive, test_greet — verify at least one is present
+        assert!(
+            tests.iter().any(|t| t.contains("test_")),
+            "Should find functions with 'test_' prefix"
+        );
+    }
+
+    /// discover_tests returns an empty list when there are no test files.
+    #[test]
+    fn test_discover_tests_no_tests() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("empty_tests")).unwrap();
+
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
+        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let tests = discover_tests(
+            &python,
+            project.path(),
+            &pythonpath,
+            tmp_mutants.path(),
+            "empty_tests",
+        )
+        .expect("discover_tests should not fail for empty test dir");
+
+        assert!(
+            tests.is_empty(),
+            "Empty test dir should produce no test IDs, got: {tests:?}"
+        );
+    }
+
+    /// compute_timeout: very small multiplier still produces at least MIN_ISOLATED_TIMEOUT_SECS.
+    #[test]
+    fn test_compute_timeout_very_small_multiplier() {
+        // multiplier=0.001, estimated=0.0 → max(0.001*0, 0.001*30, 10) = max(0, 0.03, 10) = 10
+        let t = compute_timeout(0.001, 0.0);
+        assert!(
+            (t - MIN_ISOLATED_TIMEOUT_SECS).abs() < 1e-9,
+            "very small multiplier should fall back to MIN floor: got {t}"
+        );
+    }
+
+    /// compute_timeout: estimated duration dominates when it's large enough.
+    #[test]
+    fn test_compute_timeout_large_estimated_dominates() {
+        // multiplier=5, estimated=1000 → 5*1000=5000 >> max(5*30, 10) = 150 → 5000
+        let t = compute_timeout(5.0, 1000.0);
+        assert!(
+            (t - 5000.0).abs() < 1e-9,
+            "large estimated_secs should dominate: got {t}"
+        );
+        assert!(t >= MIN_ISOLATED_TIMEOUT_SECS);
     }
 }

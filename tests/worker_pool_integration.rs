@@ -987,3 +987,204 @@ async fn test_stats_collection() {
         println!("Tests covering add: {:?}", add_tests);
     }
 }
+
+// --- run_isolated tests ---
+//
+// These tests exercise the isolated subprocess runner (used by --isolate and --verify-survivors).
+// Each test spawns real Python processes; they require the simple_project fixture venv.
+
+/// Build a minimal RunConfig for run_isolated tests.
+fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipeline::RunConfig {
+    irradiate::pipeline::RunConfig {
+        paths_to_mutate,
+        tests_dir: "tests".to_string(),
+        workers: 1,
+        timeout_multiplier: 10.0,
+        no_stats: true,
+        covered_only: false,
+        python,
+        mutant_filter: None,
+        worker_recycle_after: None,
+        max_worker_memory_mb: 0,
+        isolate: true,
+        verify_survivors: false,
+        do_not_mutate: vec![],
+    }
+}
+
+/// INV-1: run_isolated returns Killed when a real mutant is caught by its test.
+#[tokio::test]
+async fn test_run_isolated_killed_mutant() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+    let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    let config = make_run_config(python, fixture.join("src"));
+    let work_items = vec![WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+        estimated_duration_secs: 0.0,
+        timeout_secs: 300.0,
+    }];
+
+    let results = irradiate::pipeline::run_isolated(
+        &config,
+        work_items,
+        &harness_dir,
+        _tmp.path(),
+        None,
+        &fixture,
+    )
+    .await
+    .expect("run_isolated should complete");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status,
+        MutantStatus::Killed,
+        "Add mutant must be killed by test_add: {:?}",
+        results[0]
+    );
+}
+
+/// INV-1: run_isolated returns Survived when a nonexistent mutant key is used
+/// (trampoline falls through to the original function, so all tests pass).
+#[tokio::test]
+async fn test_run_isolated_survived_nonexistent_mutant() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, _) = generate_test_mutants();
+    let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
+
+    let config = make_run_config(python, fixture.join("src"));
+    let work_items = vec![WorkItem {
+        mutant_name: "simple_lib.x_nonexistent__irradiate_99".to_string(),
+        test_ids: vec![
+            "tests/test_simple.py::test_add".to_string(),
+            "tests/test_simple.py::test_is_positive".to_string(),
+            "tests/test_simple.py::test_greet".to_string(),
+        ],
+        estimated_duration_secs: 0.0,
+        timeout_secs: 300.0,
+    }];
+
+    let results = irradiate::pipeline::run_isolated(
+        &config,
+        work_items,
+        &harness_dir,
+        _tmp.path(),
+        None,
+        &fixture,
+    )
+    .await
+    .expect("run_isolated should complete");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status,
+        MutantStatus::Survived,
+        "Nonexistent mutant must survive (trampoline calls original): {:?}",
+        results[0]
+    );
+}
+
+/// INV-1: run_isolated processes multiple mutants in order, returning one result per work item.
+#[tokio::test]
+async fn test_run_isolated_multiple_items() {
+    let fixture = fixture_dir();
+    let python = fixture_python();
+    let (_tmp, mutant_names) = generate_test_mutants();
+    let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
+
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    let config = make_run_config(python, fixture.join("src"));
+    let work_items = vec![
+        // Killed: real mutant caught by its test
+        WorkItem {
+            mutant_name: add_mutant.clone(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+        // Survived: nonexistent mutant → trampoline calls original
+        WorkItem {
+            mutant_name: "simple_lib.x_nonexistent__irradiate_1".to_string(),
+            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        },
+    ];
+
+    let results = irradiate::pipeline::run_isolated(
+        &config,
+        work_items,
+        &harness_dir,
+        _tmp.path(),
+        None,
+        &fixture,
+    )
+    .await
+    .expect("run_isolated should complete");
+
+    assert_eq!(results.len(), 2, "Should have one result per work item");
+    assert_eq!(results[0].status, MutantStatus::Killed, "First mutant must be killed");
+    assert_eq!(results[1].status, MutantStatus::Survived, "Second mutant must survive");
+}
+
+/// INV-2 + INV-3: The verify-survivors cache correction pipeline.
+///
+/// When verify-survivors detects a false negative (a mutant that survived the warm
+/// session but is killed in isolation), it calls force_update_entry to correct the
+/// stale Survived cache entry. This test verifies the cache is updated correctly.
+#[test]
+fn test_verify_survivors_cache_correction_pipeline() {
+    use irradiate::cache;
+    use irradiate::protocol::MutantStatus;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Simulate: warm-session run stored a Survived result in the cache
+    cache::store_entry(tmp.path(), "abc123def456", 0, 2.0, MutantStatus::Survived).unwrap();
+
+    let before = cache::load_entry(tmp.path(), "abc123def456")
+        .unwrap()
+        .expect("Entry should exist after store");
+    assert_eq!(before.status, MutantStatus::Survived, "Initial status must be Survived");
+
+    // Simulate: verify-survivors isolated run finds the mutant is actually Killed.
+    // The pipeline calls force_update_entry to correct the stale cache entry.
+    cache::force_update_entry(tmp.path(), "abc123def456", 1, 0.8, MutantStatus::Killed).unwrap();
+
+    // INV-3: Cache must now return Killed
+    let after = cache::load_entry(tmp.path(), "abc123def456")
+        .unwrap()
+        .expect("Entry should exist after force_update");
+    assert_eq!(
+        after.status,
+        MutantStatus::Killed,
+        "INV-3: force_update_entry must flip Survived→Killed for future cache hits"
+    );
+    assert_eq!(after.exit_code, 1);
+
+    // INV-3: A second store (simulating a new warm-session run) must not overwrite
+    // the already-corrected Killed entry (store_entry is immutable).
+    cache::store_entry(tmp.path(), "abc123def456", 0, 5.0, MutantStatus::Survived).unwrap();
+    let still_killed = cache::load_entry(tmp.path(), "abc123def456")
+        .unwrap()
+        .expect("Entry must still exist");
+    assert_eq!(
+        still_killed.status,
+        MutantStatus::Killed,
+        "store_entry must not overwrite an existing corrected entry"
+    );
+}
