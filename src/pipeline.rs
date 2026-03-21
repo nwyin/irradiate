@@ -634,12 +634,12 @@ pub fn show(mutant_name: &str) -> Result<()> {
 /// Minimum estimated duration (seconds) used as a floor before applying the multiplier.
 /// Prevents near-zero estimated durations from producing sub-second timeouts.
 /// Even trivially fast tests need a few seconds for pytest overhead.
-const MIN_ESTIMATED_SECS: f64 = 2.0;
+const MIN_ESTIMATED_SECS: f64 = 0.5;
 
 /// Absolute minimum timeout (seconds) regardless of multiplier or estimate.
 /// Protects against edge cases where multiplier * estimate is still too small
 /// for subprocess startup + pytest collection.
-const MIN_TIMEOUT_SECS: f64 = 10.0;
+const MIN_TIMEOUT_SECS: f64 = 5.0;
 
 /// Timeout (seconds) for validation subprocess calls (validate_clean_run, validate_fail_run,
 /// discover_tests). If pytest hangs during validation, the pipeline would block indefinitely
@@ -1226,7 +1226,7 @@ fn compute_timeout(multiplier: f64, estimated_secs: f64) -> f64 {
     // a reasonable timeout, then apply the multiplier, then enforce an absolute minimum.
     //
     // Old formula: max(mult * est, mult * 30, 10) → 300s floor at default multiplier.
-    // New formula: max(mult * max(est, 2), 10) → 20s floor at default multiplier.
+    // New formula: max(mult * max(est, 0.5), 5) → 5s floor at default multiplier.
     (multiplier * estimated_secs.max(MIN_ESTIMATED_SECS)).max(MIN_TIMEOUT_SECS)
 }
 
@@ -1546,11 +1546,11 @@ mod tests {
     fn test_per_mutant_timeout_formula_zero_duration() {
         // INV: timeout >= MIN_TIMEOUT_SECS always.
         // INV: timeout >= multiplier * MIN_ESTIMATED_SECS when estimated=0.
-        // multiplier(10) * MIN_ESTIMATED(2) = 20
+        // multiplier(10) * MIN_ESTIMATED(0.5) = 5.0 = MIN_TIMEOUT_SECS
         let timeout = compute_timeout(10.0, 0.0);
         assert!(
-            (timeout - 20.0).abs() < 1e-9,
-            "expected 20.0, got {timeout}"
+            (timeout - 5.0).abs() < 1e-9,
+            "expected 5.0, got {timeout}"
         );
         assert!(timeout >= MIN_TIMEOUT_SECS);
     }
@@ -1568,8 +1568,8 @@ mod tests {
 
     #[test]
     fn test_per_mutant_timeout_formula_min_floor() {
-        // With multiplier=1 and tiny suite, MIN_ESTIMATED dominates.
-        // multiplier(1) * max(0.001, MIN_ESTIMATED(2)) = 2; 2 < MIN(10) → 10
+        // With multiplier=1 and tiny suite, MIN_TIMEOUT_SECS floor applies.
+        // multiplier(1) * max(0.001, MIN_ESTIMATED(0.5)) = 0.5; 0.5 < MIN(5) → 5
         let timeout = compute_timeout(1.0, 0.001);
         assert!(
             (timeout - MIN_TIMEOUT_SECS).abs() < 1e-9,
@@ -2551,7 +2551,7 @@ mod tests {
     /// compute_timeout: very small multiplier still produces at least MIN_TIMEOUT_SECS.
     #[test]
     fn test_compute_timeout_very_small_multiplier() {
-        // multiplier=0.001, estimated=0.0 → max(0.001*0, 0.001*30, 10) = max(0, 0.03, 10) = 10
+        // multiplier=0.001, estimated=0.0 → (0.001*0.5).max(5) = 0.0005.max(5) = 5
         let t = compute_timeout(0.001, 0.0);
         assert!(
             (t - MIN_TIMEOUT_SECS).abs() < 1e-9,
@@ -2562,7 +2562,7 @@ mod tests {
     /// compute_timeout: estimated duration dominates when it's large enough.
     #[test]
     fn test_compute_timeout_large_estimated_dominates() {
-        // multiplier=5, estimated=1000 → 5*1000=5000 >> max(5*30, 10) = 150 → 5000
+        // multiplier=5, estimated=1000 → 5*1000=5000 >> 5 → 5000
         let t = compute_timeout(5.0, 1000.0);
         assert!(
             (t - 5000.0).abs() < 1e-9,
