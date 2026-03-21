@@ -1,5 +1,7 @@
 # Import Hook Design: Replacing PYTHONPATH Shadowing
 
+This document describes the design for replacing irradiate's PYTHONPATH-based import shadowing with a custom Python import hook. It's useful for contributors working on import system reliability or understanding why import resolution works the way it does.
+
 ## The problem
 
 irradiate currently uses PYTHONPATH ordering to make Python import trampolined code from `mutants/` instead of original source. This has produced three bugs in quick succession:

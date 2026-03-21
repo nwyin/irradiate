@@ -1,3 +1,9 @@
+# Architecture
+
+This document describes irradiate's architecture and execution model. It's useful for contributors and anyone curious about how mutation testing works under the hood.
+
+---
+
 # irradiate
 
 Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).

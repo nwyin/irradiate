@@ -33,10 +33,12 @@ markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences
+  - pymdownx.inlinehilite
   - pymdownx.tabbed:
       alternate_style: true
   - pymdownx.details
   - admonition
+  - tables
   - toc:
       permalink: true
   - attr_list
@@ -64,4 +66,16 @@ nav:
     - Installation: getting-started/install.md
     - Quick Start: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
+  - Guide:
+    - Understanding Results: guide/understanding-results.md
+    - CI Integration: guide/ci-integration.md
+    - Comparison: guide/comparison.md
+  - Internals:
+    - Architecture: internals/architecture.md
+    - The Trampoline: internals/trampoline.md
+    - Mutation Operators: internals/mutation-operators.md
+    - Import Hook: internals/import-hook.md
+    - Known Issues: internals/known-issues.md
+  - Reference:
+    - CLI: reference/cli.md
   - Blog: blog/index.md
