@@ -8,3 +8,4 @@ pub mod pipeline;
 pub mod protocol;
 pub mod stats;
 pub mod trampoline;
+pub mod tree_sitter_mutation;
