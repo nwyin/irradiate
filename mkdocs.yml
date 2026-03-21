@@ -47,6 +47,14 @@ markdown_extensions:
 
 plugins:
   - search
+  - blog:
+      blog_dir: blog
+      post_date_format: long
+      post_url_format: "{slug}"
+      categories_allowed:
+        - Mutation Testing
+        - Release Notes
+        - Engineering
   - minify:
       minify_html: true
 
@@ -56,3 +64,4 @@ nav:
     - Installation: getting-started/install.md
     - Quick Start: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
+  - Blog: blog/index.md
