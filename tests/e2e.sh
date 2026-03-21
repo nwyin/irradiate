@@ -25,12 +25,12 @@ rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 RUN_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
 echo "$RUN_OUTPUT"
 
-# Verify forced-fail validation ran
-if ! echo "$RUN_OUTPUT" | grep -q "forced-fail"; then
-    echo "FAIL: Expected 'forced-fail' in pipeline output — forced-fail validation may not have run"
+# Verify stats + validation ran (consolidates clean + fail into one subprocess)
+if ! echo "$RUN_OUTPUT" | grep -q "stats + validation"; then
+    echo "FAIL: Expected 'stats + validation' in pipeline output"
     exit 1
 fi
-echo "  forced-fail validation: OK"
+echo "  stats + validation: OK"
 
 # Verify results
 echo ""

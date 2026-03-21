@@ -2,11 +2,15 @@
 irradiate stats plugin — pytest plugin that records which tests call
 which trampolined functions when active_mutant == "stats".
 
+Also performs in-process fail-path validation at session end, so the
+pipeline needs only a single subprocess for the entire pre-mutation phase.
+
 Usage: pytest --irradiate-stats to enable.
 """
 
 import json
 import os
+import sys
 
 import irradiate_harness
 
@@ -46,17 +50,49 @@ class IrradiateStatsPlugin:
         irradiate_harness.active_mutant = None
 
     def pytest_runtest_makereport(self, item, call):
-        if call.when == "call":
-            self.duration_by_test[item.nodeid] = call.duration
+        # Accumulate setup + call + teardown durations for accurate timing
+        key = item.nodeid
+        self.duration_by_test[key] = self.duration_by_test.get(key, 0.0) + call.duration
+
+    def _verify_fail_path(self):
+        """In-process fail probe: find a trampolined module and verify the fail path fires."""
+        if not self.tests_by_function:
+            return False
+        for mod in sys.modules.values():
+            trampoline = getattr(mod, "_irradiate_trampoline", None)
+            if trampoline is not None:
+                break
+        else:
+            return False
+
+        def dummy():
+            pass
+
+        dummy.__module__ = "probe"
+        dummy.__name__ = "probe"
+        irradiate_harness.active_mutant = "fail"
+        try:
+            trampoline(dummy, {}, (), {})
+            return False
+        except irradiate_harness.ProgrammaticFailException:
+            return True
+        except Exception:
+            return False
+        finally:
+            irradiate_harness.active_mutant = None
 
     def pytest_sessionfinish(self, session, exitstatus):
-        # Write stats to file
         output_path = os.environ.get("IRRADIATE_STATS_OUTPUT", ".irradiate/stats.json")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        fail_validated = self._verify_fail_path()
 
         stats = {
             "tests_by_function": {k: sorted(v) for k, v in self.tests_by_function.items()},
             "duration_by_test": self.duration_by_test,
+            "exit_status": exitstatus,
+            "test_count": len(session.items),
+            "fail_validated": fail_validated,
         }
 
         with open(output_path, "w") as f:

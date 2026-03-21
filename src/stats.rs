@@ -12,6 +12,15 @@ pub struct TestStats {
     pub tests_by_function: HashMap<String, Vec<String>>,
     /// Map from test nodeid to its execution duration in seconds.
     pub duration_by_test: HashMap<String, f64>,
+    /// Pytest exit status from the stats run (0 = pass, 1 = some failures, 2+ = error).
+    #[serde(default)]
+    pub exit_status: Option<i32>,
+    /// Number of test items collected.
+    #[serde(default)]
+    pub test_count: Option<usize>,
+    /// Whether the in-process fail probe succeeded.
+    #[serde(default)]
+    pub fail_validated: Option<bool>,
 }
 
 impl TestStats {
@@ -77,23 +86,20 @@ pub fn collect_stats(
         .output()
         .context("Failed to run pytest for stats collection")?;
 
-    // Pytest exit codes:
-    //   0 = all tests passed
-    //   1 = tests collected and ran, but some failed
-    //   2 = interrupted
-    //   3 = internal error
-    //   4 = usage error
-    //   5 = no tests collected
-    // Exit code 1 is expected for projects with pre-existing test failures.
-    // The stats plugin writes its output in pytest_sessionfinish which runs
-    // regardless of test outcome, so we only need tests to be collected/run.
+    // The stats plugin writes exit_status, test_count, and fail_validated into
+    // the stats JSON. Pipeline reads those fields for validation. We only bail
+    // here if pytest couldn't even start (no output file at all).
     let exit_code = output.status.code().unwrap_or(-1);
     if exit_code > 1 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!(
-            "Stats collection failed (exit code {exit_code}):\nstdout: {stdout}\nstderr: {stderr}",
-        );
+        // pytest_sessionfinish may still have written the file — check before bailing
+        if !stats_output.exists() {
+            anyhow::bail!(
+                "Stats collection failed (exit code {exit_code}):\nstdout: {stdout}\nstderr: {stderr}",
+            );
+        }
+        info!("Stats run exited with code {exit_code} — details in stats.json");
     }
     if exit_code == 1 {
         info!("Stats collection completed with some test failures (exit code 1) — this is OK");
@@ -124,6 +130,7 @@ mod tests {
                 vec!["test_foo".to_string()],
             )]),
             duration_by_test: HashMap::from([("test_foo".to_string(), 0.042)]),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&stats).unwrap();
@@ -141,6 +148,7 @@ mod tests {
                 ("test_b".to_string(), 0.2),
                 ("test_c".to_string(), 0.3),
             ]),
+            ..Default::default()
         };
 
         let duration = stats.estimated_duration(&["test_a".to_string(), "test_b".to_string()]);
@@ -155,6 +163,7 @@ mod tests {
                 vec!["test_a".to_string(), "test_b".to_string()],
             )]),
             duration_by_test: HashMap::new(),
+            ..Default::default()
         };
 
         assert_eq!(stats.tests_for_function("mod.x_foo").len(), 2);

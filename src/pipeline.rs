@@ -114,11 +114,36 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // mutants_dir is handled by the MutantFinder import hook, not PYTHONPATH.
     let pythonpath = build_pythonpath(&harness_dir, &config.paths_to_mutate);
 
-    // Phase 2: Stats collection
+    // Phase 2: Stats collection + validation
+    // When stats are enabled, a single pytest run collects coverage, timing,
+    // and performs an in-process fail probe — replacing the old separate clean
+    // and forced-fail validation subprocesses.
     let test_stats = if config.no_stats {
+        // --no-stats path: run clean + fail validation separately
+        eprintln!("Running clean tests...");
+        validate_clean_run(
+            &config.python,
+            &project_dir,
+            &pythonpath,
+            &mutants_dir,
+            &config.tests_dir,
+        )
+        .await?;
+        eprintln!("  done");
+
+        eprintln!("Running forced-fail validation...");
+        validate_fail_run(
+            &config.python,
+            &project_dir,
+            &pythonpath,
+            &mutants_dir,
+            &config.tests_dir,
+        )
+        .await?;
+        eprintln!("  done");
         None
     } else {
-        eprintln!("Running stats...");
+        eprintln!("Running stats + validation...");
         let start = Instant::now();
         let s = stats::collect_stats(
             &config.python,
@@ -129,31 +154,29 @@ pub async fn run(config: RunConfig) -> Result<()> {
         )
         .context("Stats collection failed")?;
         eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
+
+        // Validate using fields from the stats run
+        if let Some(exit_code) = s.exit_status {
+            if exit_code > 1 {
+                bail!(
+                    "Stats run failed (exit code {exit_code}) — tests could not run with trampolined code"
+                );
+            }
+            if exit_code == 1 {
+                eprintln!("Warning: some tests failed during stats run (pre-existing failures)");
+            }
+        }
+
+        if s.fail_validated == Some(false) {
+            bail!("Trampoline fail path not wired — in-process fail probe did not raise ProgrammaticFailException");
+        }
+
+        if s.tests_by_function.is_empty() && !all_mutants.is_empty() {
+            bail!("No functions were hit during stats collection, but mutants exist — trampoline may not be loading");
+        }
+
         Some(s)
     };
-
-    // Phase 3: Validation
-    eprintln!("Running clean tests...");
-    validate_clean_run(
-        &config.python,
-        &project_dir,
-        &pythonpath,
-        &mutants_dir,
-        &config.tests_dir,
-    )
-    .await?;
-    eprintln!("  done");
-
-    eprintln!("Running forced-fail validation...");
-    validate_fail_run(
-        &config.python,
-        &project_dir,
-        &pythonpath,
-        &mutants_dir,
-        &config.tests_dir,
-    )
-    .await?;
-    eprintln!("  done");
 
     // Phase 4: Mutation testing
     if config.isolate {

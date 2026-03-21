@@ -193,7 +193,7 @@ def test_runtest_teardown_no_hits_leaves_tests_by_function_empty(plugin):
 
 
 # ---------------------------------------------------------------------------
-# pytest_runtest_makereport: duration recorded for 'call' phase only
+# pytest_runtest_makereport: duration accumulates setup + call + teardown
 # ---------------------------------------------------------------------------
 
 
@@ -207,26 +207,16 @@ def test_makereport_records_duration_on_call_phase(plugin):
     assert plugin.duration_by_test[item.nodeid] == pytest.approx(0.42)
 
 
-def test_makereport_ignores_setup_phase(plugin):
-    """Duration must not be recorded for the setup phase."""
+def test_makereport_accumulates_all_phases(plugin):
+    """Duration must accumulate setup + call + teardown."""
     item = MagicMock()
-    item.nodeid = "tests/test_foo.py::test_setup_ignored"
-    call = MagicMock()
-    call.when = "setup"
-    call.duration = 0.01
-    plugin.pytest_runtest_makereport(item, call)
-    assert item.nodeid not in plugin.duration_by_test
-
-
-def test_makereport_ignores_teardown_phase(plugin):
-    """Duration must not be recorded for the teardown phase."""
-    item = MagicMock()
-    item.nodeid = "tests/test_foo.py::test_teardown_ignored"
-    call = MagicMock()
-    call.when = "teardown"
-    call.duration = 0.05
-    plugin.pytest_runtest_makereport(item, call)
-    assert item.nodeid not in plugin.duration_by_test
+    item.nodeid = "tests/test_foo.py::test_full"
+    for phase, dur in [("setup", 0.01), ("call", 0.42), ("teardown", 0.05)]:
+        call = MagicMock()
+        call.when = phase
+        call.duration = dur
+        plugin.pytest_runtest_makereport(item, call)
+    assert plugin.duration_by_test[item.nodeid] == pytest.approx(0.48)
 
 
 # ---------------------------------------------------------------------------
