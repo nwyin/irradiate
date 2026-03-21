@@ -289,6 +289,9 @@ fn collect_node_mutations(
             add_dict_kwarg_mutations(node, source, fn_start, mutations);
         }
         "match_statement" => add_match_case_removal_mutations(node, source, fn_start, mutations),
+        "lambda" => add_lambda_mutation(node, source, fn_start, mutations),
+        "conditional_expression" => add_ternary_mutations(node, source, fn_start, mutations),
+        "raise_statement" => add_raise_deletion(node, source, fn_start, mutations),
         _ => {}
     }
 
@@ -1003,6 +1006,120 @@ fn add_match_case_removal_mutations(
     }
 }
 
+/// Replace the body of a lambda expression with a different value.
+///
+/// `lambda x: body` → `lambda x: None` (when body ≠ None)
+/// `lambda x: None` → `lambda x: 0`
+fn add_lambda_mutation(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let body_text = node_text(source, body);
+    let replacement_body = if body_text.trim() == "None" { "0" } else { "None" };
+
+    let full_text = node_text(source, node);
+    let body_rel_start = body.start_byte() - node.start_byte();
+    let body_rel_end = body.end_byte() - node.start_byte();
+    let replacement = format!(
+        "{}{}{}",
+        &full_text[..body_rel_start],
+        replacement_body,
+        &full_text[body_rel_end..]
+    );
+    record_mutation(
+        full_text,
+        &replacement,
+        "lambda_mutation",
+        node.start_byte() - fn_start,
+        mutations,
+    );
+}
+
+/// Swap the body and alternative of a conditional (ternary) expression.
+///
+/// `a if cond else b` → `b if cond else a`
+///
+/// Also adds condition_negation on the test expression.
+///
+/// Note: in tree-sitter-python 0.23, `conditional_expression` children are positional
+/// (no field names): child[0]=body (true branch), child[1]=condition, child[2]=alternative.
+fn add_ternary_mutations(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // Collect children into a Vec to avoid cursor lifetime issues (see gotcha note).
+    let children: Vec<Node<'_>> = {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).collect()
+    };
+    if children.len() < 3 {
+        return;
+    }
+    let body = children[0];
+    let condition = children[1];
+    let alternative = children[2];
+
+    let body_text = node_text(source, body);
+    let cond_text = node_text(source, condition);
+    let alt_text = node_text(source, alternative);
+
+    // Ternary swap: a if cond else b → b if cond else a
+    if body_text != alt_text {
+        let replacement = format!("{alt_text} if {cond_text} else {body_text}");
+        record_mutation(
+            node_text(source, node),
+            &replacement,
+            "ternary_swap",
+            node.start_byte() - fn_start,
+            mutations,
+        );
+    }
+
+    // Condition negation on the ternary test expression
+    if condition.kind() != "not_operator" {
+        let neg_replacement = format!("not ({cond_text})");
+        record_mutation(
+            cond_text,
+            &neg_replacement,
+            "condition_negation",
+            condition.start_byte() - fn_start,
+            mutations,
+        );
+    }
+}
+
+/// Delete explicit raise statements (replace with `pass`).
+///
+/// `raise ValueError("bad")` → `pass`
+///
+/// Bare `raise` (re-raise inside except) is not deleted.
+fn add_raise_deletion(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // Skip bare raise (re-raise) — it has no named children
+    let mut cursor = node.walk();
+    if node.named_children(&mut cursor).next().is_none() {
+        return;
+    }
+    record_mutation(
+        node_text(source, node),
+        "pass",
+        "statement_deletion",
+        node.start_byte() - fn_start,
+        mutations,
+    );
+}
+
 fn collect_call_arguments<'a>(args_node: Node<'a>, source: &'a str) -> Vec<CallArg<'a>> {
     let mut args = Vec::new();
     let mut cursor = args_node.walk();
@@ -1489,5 +1606,91 @@ mod tests {
             fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
             "foo() should have arg_removal mutations"
         );
+    }
+
+    // --- New operator tests ---
+
+    #[test]
+    fn tree_sitter_lambda_mutation() {
+        let source = "def f():\n    g = lambda x: x + 1\n    return g\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let mutation = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "lambda_mutation")
+            .expect("expected lambda_mutation");
+        assert!(mutation.replacement.contains("None"));
+        let mutated = apply_mutation(&fm.source, mutation);
+        assert!(parse_module(&mutated, None).is_ok(), "lambda mutation must parse: {mutated}");
+    }
+
+    #[test]
+    fn tree_sitter_lambda_none_body_mutates_to_zero() {
+        let source = "def f():\n    g = lambda: None\n    return g\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let mutation = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "lambda_mutation")
+            .expect("expected lambda_mutation");
+        assert!(mutation.replacement.contains("0"));
+    }
+
+    #[test]
+    fn tree_sitter_ternary_swap() {
+        let source = "def f(x):\n    return 'yes' if x else 'no'\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+
+        let swap = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "ternary_swap")
+            .expect("expected ternary_swap");
+        let mutated = apply_mutation(&fm.source, swap);
+        assert!(parse_module(&mutated, None).is_ok(), "ternary swap must parse: {mutated}");
+        assert!(mutated.contains("'no' if") && mutated.contains("else 'yes'"));
+
+        // Also check condition_negation on ternary
+        assert!(fm.mutations.iter().any(|m| m.operator == "condition_negation"));
+    }
+
+    #[test]
+    fn tree_sitter_ternary_swap_skips_identical() {
+        let source = "def f(x):\n    return x if x else x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(
+            !fms[0].mutations.iter().any(|m| m.operator == "ternary_swap"),
+            "ternary swap should be skipped when body == alternative"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_raise_deletion() {
+        let source =
+            "def f(x):\n    if not x:\n        raise ValueError('bad')\n    return x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let mutation = fm
+            .mutations
+            .iter()
+            .find(|m| m.operator == "statement_deletion" && m.original.contains("raise"))
+            .expect("expected raise deletion");
+        assert_eq!(mutation.replacement, "pass");
+        let mutated = apply_mutation(&fm.source, mutation);
+        assert!(parse_module(&mutated, None).is_ok(), "raise deletion must parse: {mutated}");
+    }
+
+    #[test]
+    fn tree_sitter_bare_raise_not_deleted() {
+        let source = "def f():\n    try:\n        pass\n    except:\n        raise\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        // bare raise should NOT produce a statement_deletion targeting the raise
+        let has_raise_deletion = fms
+            .iter()
+            .flat_map(|fm| &fm.mutations)
+            .any(|m| m.operator == "statement_deletion" && m.original.trim() == "raise");
+        assert!(!has_raise_deletion, "bare raise should not be deleted");
     }
 }
