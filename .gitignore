@@ -53,6 +53,10 @@ bench/targets/*/.mutmut-cache
 # Generated docs artifacts
 docs/artifacts/
 
+# Docs build
+.venv-docs/
+site/
+
 # Generated report
 /report/
 
