@@ -8,5 +8,6 @@ pub mod pipeline;
 pub mod progress;
 pub mod protocol;
 pub mod stats;
+pub mod trace;
 pub mod trampoline;
 pub mod tree_sitter_mutation;

@@ -120,7 +120,7 @@ async fn test_worker_pool_dispatches_mutants() {
         },
     ];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete");
 
@@ -156,7 +156,7 @@ async fn test_worker_pool_empty_work() {
         ..Default::default()
     };
 
-    let results = run_worker_pool(&config, vec![], None)
+    let (results, _trace) = run_worker_pool(&config, vec![], None)
         .await
         .expect("Empty work should succeed");
     assert!(results.is_empty());
@@ -190,7 +190,7 @@ async fn test_worker_pool_surviving_mutant() {
         timeout_secs: 300.0,
     }];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete");
     assert_eq!(results.len(), 1);
@@ -263,7 +263,7 @@ async fn test_worker_pool_with_recycling() {
         ..Default::default()
     };
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete with recycling");
 
@@ -314,7 +314,7 @@ async fn test_worker_pool_recycle_disabled() {
         ..Default::default()
     };
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete with recycling disabled");
 
@@ -363,7 +363,7 @@ async fn test_worker_pool_repeated_runs_same_worker_cleanup() {
         },
     ];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete with repeated runs on one worker");
 
@@ -460,7 +460,7 @@ def test_mark_once():
         },
     ];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should cleanly rerun module-scoped fixtures");
 
@@ -561,7 +561,7 @@ async fn test_module_global_restore_between_runs() {
         },
     ];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete");
 
@@ -618,7 +618,7 @@ async fn test_trampoline_intact_after_restore() {
         ..Default::default()
     };
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete");
 
@@ -749,7 +749,7 @@ async fn test_worker_pool_with_session_fixture_project() {
         timeout_secs: 300.0,
     }];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete with session fixture project");
 
@@ -793,7 +793,7 @@ async fn test_worker_pool_explicit_recycle_overrides_auto_tune() {
         timeout_secs: 300.0,
     }];
 
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool should complete with explicit recycle setting");
 
@@ -871,7 +871,7 @@ async fn test_worker_crash_produces_error_not_hang() {
     }];
 
     // Must not hang. If disconnect handling is broken, run_worker_pool never returns.
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool must not hang when the worker process crashes");
 
@@ -938,7 +938,7 @@ async fn test_memory_limit_run_completes() {
     ];
 
     // Must complete without hanging, even if memory recycling respawns workers mid-run.
-    let results = run_worker_pool(&config, work_items, None)
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool must complete even with aggressive memory recycling");
 

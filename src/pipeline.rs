@@ -331,7 +331,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 ..Default::default()
             };
             let progress = crate::progress::ProgressBar::new(total_mutants);
-            run_worker_pool(&pool_config, execution_work, Some(progress)).await?
+            let (results, trace_log) =
+                run_worker_pool(&pool_config, execution_work, Some(progress)).await?;
+            // Write trace file for visualization (e.g. ui.perfetto.dev)
+            let trace_path = project_dir.join(".irradiate").join("trace.json");
+            if let Err(e) = crate::trace::write_trace_file(&trace_path, &trace_log.events) {
+                tracing::warn!("Failed to write trace file: {e}");
+            }
+            results
         };
 
         let cache_keys_by_mutant: HashMap<String, String> = covered_work

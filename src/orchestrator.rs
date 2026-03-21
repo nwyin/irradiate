@@ -11,6 +11,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::harness;
 use crate::protocol::{MutantResult, MutantStatus, OrchestratorMessage, WorkItem, WorkerMessage};
+use crate::trace::TraceLog;
+
+/// Check if a process is still alive using kill(pid, 0).
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
 
 /// Configuration for the worker pool.
 #[derive(Debug, Clone)]
@@ -86,9 +93,9 @@ pub async fn run_worker_pool(
     config: &PoolConfig,
     work_items: Vec<WorkItem>,
     progress: Option<crate::progress::ProgressBar>,
-) -> Result<Vec<MutantResult>> {
+) -> Result<(Vec<MutantResult>, TraceLog)> {
     if work_items.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], TraceLog::new()));
     }
 
     // Extract harness
@@ -120,6 +127,7 @@ pub async fn run_worker_pool(
     }
 
     // Accept connections and dispatch work
+    let mut trace = TraceLog::new();
     let results = dispatch_work(
         listener,
         processes,
@@ -128,13 +136,14 @@ pub async fn run_worker_pool(
         &harness_dir,
         &socket_path,
         progress,
+        &mut trace,
     )
     .await?;
 
     // Clean up socket
     let _ = std::fs::remove_file(&socket_path);
 
-    Ok(results)
+    Ok((results, trace))
 }
 
 fn spawn_worker(
@@ -306,6 +315,7 @@ pub(crate) fn determine_recycle_after(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_work(
     listener: UnixListener,
     mut processes: Vec<Child>,
@@ -314,6 +324,7 @@ async fn dispatch_work(
     harness_dir: &Path,
     socket_path: &Path,
     mut progress: Option<crate::progress::ProgressBar>,
+    trace: &mut TraceLog,
 ) -> Result<Vec<MutantResult>> {
     let total_items = work_items.len();
     let mut results: Vec<MutantResult> = Vec::with_capacity(total_items);
@@ -343,6 +354,15 @@ async fn dispatch_work(
     // Workers flagged for recycling on next result (memory limit exceeded)
     let mut workers_pending_memory_recycle: HashSet<usize> = HashSet::new();
 
+    // Trace: track spawn and dispatch timestamps per worker
+    let mut spawn_times: HashMap<usize, u64> = HashMap::new(); // worker_id -> spawn timestamp (us)
+    let mut dispatch_times: HashMap<usize, (u64, String)> = HashMap::new(); // worker_id -> (timestamp, mutant)
+    // Record spawn times for the initial workers (spawned before dispatch_work)
+    let initial_spawn_us = trace.now_us();
+    for i in 0..processes.len() {
+        spawn_times.insert(i, initial_spawn_us);
+    }
+
     // Effective recycle interval: starts at the user-configured value (or 100 if auto).
     // May be reduced on first Ready message if session fixtures are detected.
     let mut recycle_after = config.worker_recycle_after.unwrap_or(100);
@@ -355,6 +375,11 @@ async fn dispatch_work(
     // Memory check interval (only active when a limit is set)
     let mut memory_check = tokio::time::interval(Duration::from_secs(2));
 
+    // Process health check: detect dead workers faster than the per-mutant
+    // socket read timeout. Polls every 500ms; a dead process triggers an
+    // immediate error result instead of waiting for the full timeout.
+    let mut health_check = tokio::time::interval(Duration::from_millis(500));
+
     // Main dispatch loop — accepts initial worker connections and processes events
     loop {
         // Dispatch work to idle workers
@@ -362,6 +387,7 @@ async fn dispatch_work(
             if let Some(item) = work_queue.pop() {
                 idle_workers.pop();
                 active_mutants.insert(worker_id, item.mutant_name.clone());
+                dispatch_times.insert(worker_id, (trace.now_us(), item.mutant_name.clone()));
                 if let Some(sender) = worker_senders.get(&worker_id) {
                     let msg = OrchestratorMessage::Run {
                         mutant: item.mutant_name,
@@ -479,6 +505,19 @@ async fn dispatch_work(
                                             }
                                         }
 
+                                        // Trace: worker startup span
+                                        if let Some(&spawn_us) = spawn_times.get(&worker_id) {
+                                            let now = trace.now_us();
+                                            trace.complete(
+                                                "worker_startup".to_string(),
+                                                "lifecycle",
+                                                spawn_us,
+                                                now.saturating_sub(spawn_us),
+                                                worker_id,
+                                                Some(serde_json::json!({"pid": pid})),
+                                            );
+                                        }
+
                                         worker_pids.insert(worker_id, pid);
                                         let msg_tx = spawn_worker_task(
                                             worker_id,
@@ -530,6 +569,21 @@ async fn dispatch_work(
                             "Mutant {} -> {:?} ({:.3}s)",
                             result.mutant_name, result.status, result.duration
                         );
+                        // Trace: mutant execution span
+                        if let Some((dispatch_us, _)) = dispatch_times.remove(&worker_id) {
+                            let now = trace.now_us();
+                            trace.complete(
+                                result.mutant_name.clone(),
+                                "mutant",
+                                dispatch_us,
+                                now.saturating_sub(dispatch_us),
+                                worker_id,
+                                Some(serde_json::json!({
+                                    "status": format!("{:?}", result.status),
+                                    "duration_s": result.duration,
+                                })),
+                            );
+                        }
                         active_mutants.remove(&worker_id);
                         if let Some(ref mut pb) = progress {
                             pb.record(result.status);
@@ -561,6 +615,7 @@ async fn dispatch_work(
                                 Ok(child) => {
                                     processes.push(child);
                                     pending_accepts += 1;
+                                    spawn_times.insert(spawn_id, trace.now_us());
                                     info!("Spawned replacement worker {spawn_id}");
                                 }
                                 Err(e) => {
@@ -623,6 +678,7 @@ async fn dispatch_work(
                                     Ok(child) => {
                                         processes.push(child);
                                         pending_accepts += 1;
+                                        spawn_times.insert(spawn_id, trace.now_us());
                                     }
                                     Err(e) => {
                                         error!("Failed to respawn worker: {e}");
@@ -646,6 +702,50 @@ async fn dispatch_work(
                             });
                         }
                         break;
+                    }
+                }
+            }
+
+            // Process health check: detect dead workers immediately instead of
+            // waiting for the per-mutant socket read timeout (which can be 20s+).
+            _ = health_check.tick() => {
+                // Only check workers that have an active mutant assignment
+                let active_pids: Vec<(usize, u32)> = active_mutants
+                    .keys()
+                    .filter_map(|&wid| worker_pids.get(&wid).map(|&pid| (wid, pid)))
+                    .collect();
+                for (worker_id, pid) in active_pids {
+                    if !is_process_alive(pid) {
+                        warn!("Worker {worker_id} (pid {pid}) died — marking active mutant as error");
+                        if let Some(mutant_name) = active_mutants.remove(&worker_id) {
+                            if let Some(ref mut pb) = progress {
+                                pb.record(MutantStatus::Error);
+                            }
+                            results.push(MutantResult {
+                                mutant_name,
+                                exit_code: -1,
+                                duration: 0.0,
+                                status: MutantStatus::Error,
+                            });
+                        }
+                        worker_senders.remove(&worker_id);
+                        worker_pids.remove(&worker_id);
+
+                        // Respawn if there's still work
+                        if !work_queue.is_empty() {
+                            let spawn_id = next_worker_id;
+                            info!("Respawning worker {spawn_id} to replace dead {worker_id}");
+                            match spawn_worker(spawn_id, config, harness_dir, socket_path) {
+                                Ok(child) => {
+                                    processes.push(child);
+                                    pending_accepts += 1;
+                                    spawn_times.insert(spawn_id, trace.now_us());
+                                }
+                                Err(e) => {
+                                    error!("Failed to respawn worker: {e}");
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -681,10 +781,18 @@ async fn dispatch_work(
         let _ = sender.send(OrchestratorMessage::Shutdown).await;
     }
 
-    // Wait for processes to exit
+    // Wait for all processes concurrently with a single shared timeout.
+    // Recycled workers may already have exited; stuck processes are killed on
+    // Child drop (kill_on_drop=true). A single timeout avoids sequential 5s
+    // waits per stuck process.
+    let mut wait_set = tokio::task::JoinSet::new();
     for mut proc in processes {
-        let _ = tokio::time::timeout(Duration::from_secs(5), proc.wait()).await;
+        wait_set.spawn(async move { proc.wait().await });
     }
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while wait_set.join_next().await.is_some() {}
+    })
+    .await;
 
     if let Some(pb) = progress {
         pb.finish();
