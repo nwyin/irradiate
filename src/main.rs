@@ -2,6 +2,16 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+fn parse_fail_under(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
+    if !(0.0..=100.0).contains(&v) {
+        return Err(format!("value must be between 0.0 and 100.0, got {v}"));
+    }
+    Ok(v)
+}
+
 #[derive(Parser)]
 #[command(name = "irradiate", about = "Mutation testing for Python", version)]
 struct Cli {
@@ -61,6 +71,11 @@ enum Commands {
         /// false negatives from warm-session state leakage. No-op when --isolate is set.
         #[arg(long)]
         verify_survivors: bool,
+
+        /// Fail with exit code 1 if mutation score (killed/tested*100) is below this threshold.
+        /// Value must be between 0.0 and 100.0. Only applied when at least one mutant is tested.
+        #[arg(long, value_parser = parse_fail_under)]
+        fail_under: Option<f64>,
     },
 
     /// Display mutation testing results
@@ -112,6 +127,7 @@ async fn main() -> Result<()> {
             max_worker_memory,
             isolate,
             verify_survivors,
+            fail_under,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -140,6 +156,7 @@ async fn main() -> Result<()> {
                 isolate,
                 verify_survivors,
                 do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
+                fail_under,
             })
             .await
         }

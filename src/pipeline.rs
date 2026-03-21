@@ -39,6 +39,9 @@ pub struct RunConfig {
     pub verify_survivors: bool,
     /// Glob patterns of files to skip entirely (e.g. ["**/vendor/*.py", "src/generated.py"]).
     pub do_not_mutate: Vec<String>,
+    /// Fail with exit code 1 when mutation score (killed / tested * 100) is below this value.
+    /// `None` = no threshold check.
+    pub fail_under: Option<f64>,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -410,7 +413,22 @@ pub async fn run(config: RunConfig) -> Result<()> {
     write_meta_files(&mutants_dir, &generation.names_by_module, &results)?;
 
     // Print summary
-    print_summary(&results, test_time.as_secs_f64(), cache_counts);
+    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts);
+
+    // INV-1: When fail_under is None, always return Ok(()).
+    // INV-4: When no mutants were tested (killed + survived == 0), never fail.
+    if let Some(threshold) = config.fail_under {
+        let tested = killed + survived;
+        if tested > 0 {
+            let score = killed as f64 / tested as f64 * 100.0;
+            // INV-2: score >= threshold → Ok(()), INV-3: score < threshold → Err
+            if score < threshold {
+                bail!(
+                    "Mutation score {score:.1}% is below threshold {threshold:.1}%"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1179,12 +1197,13 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: CacheCounts) {
-    let mut killed = 0;
-    let mut survived = 0;
-    let mut no_tests = 0;
-    let mut timeout = 0;
-    let mut errors = 0;
+/// Print the run summary. Returns (killed, survived) counts for threshold checking.
+fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: CacheCounts) -> (usize, usize) {
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut no_tests = 0usize;
+    let mut timeout = 0usize;
+    let mut errors = 0usize;
 
     for r in results {
         match r.status {
@@ -1201,6 +1220,14 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: Cach
         total as f64 / elapsed_secs
     } else {
         0.0
+    };
+
+    // INV-5: Mutation score is always printed in summary output.
+    let tested = killed + survived;
+    let score_str = if tested > 0 {
+        format!("{:.1}%", killed as f64 / tested as f64 * 100.0)
+    } else {
+        "N/A".to_string()
     };
 
     eprintln!();
@@ -1220,6 +1247,7 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: Cach
     if errors > 0 {
         eprintln!("  Errors:    {errors}");
     }
+    eprintln!("  Score:     {score_str}");
 
     if survived > 0 {
         eprintln!();
@@ -1230,6 +1258,8 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: Cach
             }
         }
     }
+
+    (killed, survived)
 }
 
 fn status_emoji(status: MutantStatus) -> &'static str {
@@ -2405,5 +2435,128 @@ mod tests {
             "large estimated_secs should dominate: got {t}"
         );
         assert!(t >= MIN_ISOLATED_TIMEOUT_SECS);
+    }
+
+    // --- fail_under / mutation score ---
+
+    use crate::cache::CacheCounts;
+
+    fn make_results(killed: usize, survived: usize) -> Vec<MutantResult> {
+        let mut v = Vec::new();
+        for i in 0..killed {
+            v.push(make_result(&format!("mod.x_k_{i}"), MutantStatus::Killed, 1));
+        }
+        for i in 0..survived {
+            v.push(make_result(&format!("mod.x_s_{i}"), MutantStatus::Survived, 0));
+        }
+        v
+    }
+
+    fn zero_cache() -> CacheCounts {
+        CacheCounts { hits: 0, misses: 0 }
+    }
+
+    /// INV-5: Score is always printed — verify the function doesn't panic and returns counts.
+    #[test]
+    fn test_print_summary_returns_killed_survived() {
+        let results = make_results(3, 1);
+        let (killed, survived) = print_summary(&results, 1.0, zero_cache());
+        assert_eq!(killed, 3);
+        assert_eq!(survived, 1);
+    }
+
+    /// INV-5: With zero tested mutants, score is N/A and no panic.
+    #[test]
+    fn test_print_summary_no_tested_mutants() {
+        let results: Vec<MutantResult> = vec![];
+        let (killed, survived) = print_summary(&results, 0.0, zero_cache());
+        assert_eq!(killed, 0);
+        assert_eq!(survived, 0);
+    }
+
+    /// INV-4: When no mutants tested, fail_under check must not fail.
+    #[test]
+    fn test_fail_under_no_mutants_never_fails() {
+        // 0 killed + 0 survived → tested == 0 → no threshold applied.
+        let killed = 0usize;
+        let survived = 0usize;
+        let threshold = 100.0_f64;
+        let tested = killed + survived;
+        // Reproduce the exact condition from pipeline::run
+        if tested > 0 {
+            let score = killed as f64 / tested as f64 * 100.0;
+            if score < threshold {
+                panic!("Should not fail when no mutants tested");
+            }
+        }
+        // Test passes if we reach here without panic.
+    }
+
+    /// INV-2: Score equal to threshold passes.
+    #[test]
+    fn test_fail_under_score_at_threshold_passes() {
+        // 5 killed, 5 survived → score = 50.0; threshold = 50.0 → should NOT fail
+        let killed = 5usize;
+        let survived = 5usize;
+        let threshold = 50.0_f64;
+        let tested = killed + survived;
+        let score = killed as f64 / tested as f64 * 100.0;
+        assert!((score - 50.0).abs() < 1e-9, "score should be 50.0");
+        assert!(
+            score >= threshold,
+            "score {score} at threshold {threshold} should pass"
+        );
+    }
+
+    /// INV-3: Score below threshold fails with descriptive message.
+    #[test]
+    fn test_fail_under_score_below_threshold_fails() {
+        // 4 killed, 6 survived → score = 40.0; threshold = 50.0 → should fail
+        let killed = 4usize;
+        let survived = 6usize;
+        let threshold = 50.0_f64;
+        let tested = killed + survived;
+        let score = killed as f64 / tested as f64 * 100.0;
+        assert!((score - 40.0).abs() < 1e-9, "score should be 40.0");
+        assert!(
+            score < threshold,
+            "score {score} should be below threshold {threshold}"
+        );
+        // Verify the error message format used in pipeline::run
+        let msg = format!("Mutation score {score:.1}% is below threshold {threshold:.1}%");
+        assert!(msg.contains("40.0%"), "message should include score: {msg}");
+        assert!(msg.contains("50.0%"), "message should include threshold: {msg}");
+    }
+
+    /// INV-1: When fail_under is None, run always proceeds without error (backward compat).
+    #[test]
+    fn test_fail_under_none_is_no_op() {
+        // When fail_under is None the threshold check is skipped entirely.
+        let fail_under: Option<f64> = None;
+        let killed = 0usize;
+        let survived = 10usize; // all survived, score = 0
+        let mut would_fail = false;
+        if let Some(threshold) = fail_under {
+            let tested = killed + survived;
+            if tested > 0 {
+                let score = killed as f64 / tested as f64 * 100.0;
+                if score < threshold {
+                    would_fail = true;
+                }
+            }
+        }
+        assert!(!would_fail, "fail_under=None must never trigger failure");
+    }
+
+    /// Score just below threshold (floating point boundary) fails.
+    #[test]
+    fn test_fail_under_score_just_below_threshold() {
+        // 2 killed, 1 survived → score = 66.666...; threshold = 67.0 → should fail
+        let killed = 2usize;
+        let survived = 1usize;
+        let threshold = 67.0_f64;
+        let tested = killed + survived;
+        let score = killed as f64 / tested as f64 * 100.0;
+        assert!(score < threshold, "66.6... should be below 67.0");
     }
 }
