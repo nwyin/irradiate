@@ -3,6 +3,12 @@ name = "irradiate"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Fast mutation testing for Python"
+authors = ["nwyin"]
+repository = "https://github.com/nwyin/irradiate"
+homepage = "https://nwyin.github.io/irradiate"
+keywords = ["mutation-testing", "python", "testing"]
+categories = ["development-tools::testing"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
