@@ -994,6 +994,17 @@ fn add_arg_removal_mutations(
         return;
     }
 
+    // A generator expression as a sole argument uses no parens:
+    //   tuple(x for x in items)
+    // tree-sitter inlines these as separate children (call + for_in_clause).
+    // Replacing/removing parts produces invalid syntax like
+    //   tuple(None, for x in items)
+    // so skip arg_removal entirely when any arg is a for_in_clause or if_clause
+    // (indicating a generator expression).
+    if args.iter().any(|a| a.kind == "for_in_clause" || a.kind == "if_clause") {
+        return;
+    }
+
     for (i, arg) in args.iter().enumerate() {
         if arg.text.trim_start().starts_with('*') {
             continue;
@@ -1710,6 +1721,23 @@ mod tests {
         assert!(
             fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
             "foo() should have arg_removal mutations"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_skips_arg_removal_for_generator_expression() {
+        // tuple(expr for x in items) — the genexpr is the sole arg with no parens.
+        // Replacing it with None produces invalid syntax: tuple(None, for x in items)
+        let source = "def f(value):\n    return tuple(helper(x) for x in value)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(!fms.is_empty());
+        // The outer tuple() call must NOT get arg_removal (genexpr),
+        // but the inner helper(x) call CAN get arg_removal (normal call).
+        assert!(
+            !fms[0].mutations.iter().any(|m| {
+                m.operator == "arg_removal" && m.original.starts_with("tuple(")
+            }),
+            "tuple() with generator expression should not have arg_removal mutations"
         );
     }
 
