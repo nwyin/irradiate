@@ -1,14 +1,40 @@
 //! Tree-sitter-backed mutation collector.
 //!
-//! This module is a parallel implementation to the libcst-based `mutation.rs`.
-//! It produces the same `FunctionMutations` / `Mutation` types using byte spans
-//! from tree-sitter directly — no monotonic cursor needed.
+//! Alternative to the libcst collector in `mutation.rs`. Uses tree-sitter for parsing so that
+//! byte spans come directly from the parser — no monotonic cursor hack needed.
+//!
+//! Safety checks (matching the libcst collector):
+//! - Enum subclasses are skipped entirely (EnumMeta treats all class-body names as candidates).
+//! - Functions with `nonlocal` anywhere in their subtree are skipped (scope chain breaks on extract).
+//! - `len` and `isinstance` calls are not arg_removal-mutated (they're trivially killed / noisy).
 
 use crate::mutation::{FunctionMutations, Mutation};
-use std::collections::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
 const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__new__"];
+
+/// Enum base classes whose methods must not be mutated.
+///
+/// Python's `EnumMeta` metaclass processes ALL names in the class body and treats
+/// non-descriptor, non-dunder names as enum member candidates. Trampoline artifacts
+/// (mangled method defs, mutants dicts, `__name__` assignments) placed inside an
+/// Enum class body are misinterpreted as member definitions, causing `TypeError`
+/// at class creation time (e.g. `int.__new__(cls, dict(...))` for IntEnum).
+const ENUM_BASES: &[&str] = &[
+    "Enum",
+    "IntEnum",
+    "StrEnum",
+    "Flag",
+    "IntFlag",
+    "enum.Enum",
+    "enum.IntEnum",
+    "enum.StrEnum",
+    "enum.Flag",
+    "enum.IntFlag",
+];
+
+/// Builtin function calls that are never arg_removal-mutated.
+static NEVER_MUTATE_FUNCTION_CALLS: &[&str] = &["len", "isinstance"];
 
 const BINOP_SWAPS: &[(&str, &str)] = &[
     ("+", "-"),
@@ -24,9 +50,7 @@ const BINOP_SWAPS: &[(&str, &str)] = &[
     ("|", "&"),
     ("^", "&"),
 ];
-
 const BOOLOP_SWAPS: &[(&str, &str)] = &[("and", "or"), ("or", "and")];
-
 const COMPOP_SWAPS: &[(&str, &str)] = &[
     ("<=", "<"),
     (">=", ">"),
@@ -39,7 +63,6 @@ const COMPOP_SWAPS: &[(&str, &str)] = &[
     ("not in", "in"),
     ("in", "not in"),
 ];
-
 const AUGOP_SWAPS: &[(&str, &str)] = &[
     ("+=", "-="),
     ("-=", "+="),
@@ -54,7 +77,6 @@ const AUGOP_SWAPS: &[(&str, &str)] = &[
     ("|=", "&="),
     ("^=", "&="),
 ];
-
 const METHOD_SWAPS: &[(&str, &str)] = &[
     ("lower", "upper"),
     ("upper", "lower"),
@@ -71,14 +93,8 @@ const METHOD_SWAPS: &[(&str, &str)] = &[
     ("partition", "rpartition"),
     ("rpartition", "partition"),
 ];
-
 const CONDITIONAL_METHOD_SWAPS: &[(&str, &str)] = &[("split", "rsplit"), ("rsplit", "split")];
 
-/// Collect all function mutations from a Python source file using the tree-sitter parser.
-///
-/// Parses the source, walks root children for function definitions, class definitions,
-/// and decorated definitions (which are skipped entirely). Returns one `FunctionMutations`
-/// per function that has at least one mutation.
 pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations> {
     let tree = match parse_python(source) {
         Some(tree) => tree,
@@ -101,8 +117,7 @@ pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations
                 collect_class_methods(child, source, &ignored_lines, &mut results);
             }
             "decorated_definition" => {
-                // Skip decorated definitions entirely — decorators can transform functions
-                // in ways incompatible with the trampoline. Matches libcst collector behavior.
+                // Match the libcst collector: skip decorated definitions entirely.
             }
             _ => {}
         }
@@ -124,13 +139,20 @@ fn parse_python(source: &str) -> Option<Tree> {
 fn collect_class_methods(
     class_node: Node<'_>,
     source: &str,
-    ignored_lines: &HashSet<usize>,
+    ignored_lines: &std::collections::HashSet<usize>,
     results: &mut Vec<FunctionMutations>,
 ) {
     let class_name = match class_node.child_by_field_name("name") {
         Some(name) => node_text(source, name).to_string(),
         None => return,
     };
+
+    // Skip Enum subclasses entirely — EnumMeta treats all class-body names as member candidates,
+    // so trampoline artifacts (mangled defs, mutants dicts) cause TypeError at class creation time.
+    if is_enum_subclass(class_node, source) {
+        return;
+    }
+
     let body = match class_node.child_by_field_name("body") {
         Some(body) => body,
         None => return,
@@ -145,15 +167,31 @@ fn collect_class_methods(
                 results.push(fm);
             }
         }
-        // decorated_definition inside a class body is also skipped
     }
+}
+
+/// Returns true if the class_definition node inherits from a known Enum base.
+fn is_enum_subclass(class_node: Node<'_>, source: &str) -> bool {
+    // tree-sitter-python: class_definition has a "superclasses" field which is an argument_list.
+    let superclasses = match class_node.child_by_field_name("superclasses") {
+        Some(sc) => sc,
+        None => return false,
+    };
+    let mut cursor = superclasses.walk();
+    for base in superclasses.named_children(&mut cursor) {
+        let base_text = node_text(source, base).trim();
+        if ENUM_BASES.contains(&base_text) {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_function_mutations(
     function_node: Node<'_>,
     class_name: Option<&str>,
     source: &str,
-    ignored_lines: &HashSet<usize>,
+    ignored_lines: &std::collections::HashSet<usize>,
 ) -> Option<FunctionMutations> {
     let name_node = function_node.child_by_field_name("name")?;
     let name = node_text(source, name_node).to_string();
@@ -162,27 +200,31 @@ fn collect_function_mutations(
     }
 
     let body = function_node.child_by_field_name("body")?;
+
+    // Skip functions whose body contains any `nonlocal` statement at any depth.
+    // The trampoline renames/extracts functions to module scope, breaking nonlocal scope chains —
+    // Python raises SyntaxError at import time when the renamed variant is encountered.
+    if subtree_contains_kind(body, "nonlocal_statement") {
+        return None;
+    }
+
     let fn_start = function_node.start_byte();
     let fn_end = function_node.end_byte();
-    let func_source = source[fn_start..fn_end].to_string();
-
+    let func_source = &source[fn_start..fn_end];
     let params_source = function_node
         .child_by_field_name("parameters")
         .map(|node| node_text(source, node).to_string())
         .unwrap_or_default();
-
     let return_annotation = function_node
         .child_by_field_name("return_type")
         .map(|node| format!(" -> {}", node_text(source, node)))
         .unwrap_or_default();
-
     let is_async = source[fn_start..name_node.start_byte()].contains("async");
     let is_generator =
         subtree_contains_kind(body, "yield") || subtree_contains_kind(body, "yield_from");
 
     let mut mutations = Vec::new();
     collect_default_arg_mutations(function_node, source, fn_start, &mut mutations);
-
     let mut walk = body.walk();
     for child in body.named_children(&mut walk) {
         collect_node_mutations(child, source, fn_start, function_node.id(), &mut mutations);
@@ -197,7 +239,7 @@ fn collect_function_mutations(
     Some(FunctionMutations {
         name,
         class_name: class_name.map(ToOwned::to_owned),
-        source: func_source,
+        source: func_source.to_string(),
         params_source,
         return_annotation,
         is_async,
@@ -206,10 +248,6 @@ fn collect_function_mutations(
     })
 }
 
-/// Main dispatch for mutation collection. Walks the tree recursively.
-///
-/// Returns early if `node` is a nested `function_definition` (different id than
-/// `owner_function_id`) to avoid collecting mutations inside nested functions.
 fn collect_node_mutations(
     node: Node<'_>,
     source: &str,
@@ -235,9 +273,7 @@ fn collect_node_mutations(
             add_expression_statement_mutation(node, source, fn_start, mutations);
         }
         "assignment" => add_assignment_mutations(node, source, fn_start, mutations),
-        "augmented_assignment" => {
-            add_augmented_assignment_mutations(node, source, fn_start, mutations);
-        }
+        "augmented_assignment" => add_augmented_assignment_mutations(node, source, fn_start, mutations),
         "if_statement" | "elif_clause" | "while_statement" => {
             add_condition_negation_statement(node, source, fn_start, mutations);
             add_loop_mutation(node, source, fn_start, mutations);
@@ -262,8 +298,6 @@ fn collect_node_mutations(
     }
 }
 
-// --- Mutation operators ---
-
 fn add_binary_operator_mutation(
     node: Node<'_>,
     source: &str,
@@ -277,7 +311,13 @@ fn add_binary_operator_mutation(
     let Some((_, replacement)) = BINOP_SWAPS.iter().find(|(from, _)| *from == op_text) else {
         return;
     };
-    record_mutation(op_text, replacement, "binop_swap", op_node.start_byte() - fn_start, mutations);
+    record_mutation(
+        op_text,
+        replacement,
+        "binop_swap",
+        op_node.start_byte() - fn_start,
+        mutations,
+    );
 }
 
 fn add_boolean_operator_mutation(
@@ -286,8 +326,7 @@ fn add_boolean_operator_mutation(
     fn_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let Some(op_node) =
-        find_operator_child(node, BOOLOP_SWAPS.iter().map(|(from, _)| *from))
+    let Some(op_node) = find_operator_child(node, BOOLOP_SWAPS.iter().map(|(from, _)| *from))
     else {
         return;
     };
@@ -310,8 +349,7 @@ fn add_comparison_mutation(
     fn_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let Some(op_node) =
-        find_operator_child(node, COMPOP_SWAPS.iter().map(|(from, _)| *from))
+    let Some(op_node) = find_operator_child(node, COMPOP_SWAPS.iter().map(|(from, _)| *from))
     else {
         return;
     };
@@ -516,7 +554,11 @@ fn add_return_statement_mutations(
         return;
     };
     let value_text = node_text(source, value_node);
-    let replacement = if value_text.trim() == "None" { "\"\"" } else { "None" };
+    let replacement = if value_text.trim() == "None" {
+        "\"\""
+    } else {
+        "None"
+    };
     record_mutation(
         value_text,
         replacement,
@@ -547,11 +589,17 @@ fn add_expression_statement_mutation(
         return;
     };
     if value_node.kind() == "string" {
-        return; // skip docstrings
+        return;
     }
 
     let stmt_text = node_text(source, node);
-    record_mutation(stmt_text, "pass", "statement_deletion", node.start_byte() - fn_start, mutations);
+    record_mutation(
+        stmt_text,
+        "pass",
+        "statement_deletion",
+        node.start_byte() - fn_start,
+        mutations,
+    );
 }
 
 fn add_assignment_mutations(
@@ -565,7 +613,11 @@ fn add_assignment_mutations(
     };
     let assignment_text = node_text(source, node);
     let value_text = node_text(source, value_node);
-    let replacement_value = if value_text.trim() == "None" { "\"\"" } else { "None" };
+    let replacement_value = if value_text.trim() == "None" {
+        "\"\""
+    } else {
+        "None"
+    };
     let prefix_len = value_node.start_byte().saturating_sub(node.start_byte());
     if prefix_len <= assignment_text.len() {
         let new_assignment = format!("{}{}", &assignment_text[..prefix_len], replacement_value);
@@ -635,10 +687,10 @@ fn add_condition_negation_statement(
     let Some(condition) = node.child_by_field_name("condition") else {
         return;
     };
+    let condition_text = node_text(source, condition);
     if condition.kind() == "not_operator" {
         return;
     }
-    let condition_text = node_text(source, condition);
     let replacement = format!("not ({condition_text})");
     record_mutation(
         condition_text,
@@ -658,10 +710,10 @@ fn add_condition_negation_assert(
     let Some(condition) = first_named_child(node) else {
         return;
     };
+    let condition_text = node_text(source, condition);
     if condition.kind() == "not_operator" {
         return;
     }
-    let condition_text = node_text(source, condition);
     let replacement = format!("not ({condition_text})");
     record_mutation(
         condition_text,
@@ -764,6 +816,12 @@ fn add_arg_removal_mutations(
     };
 
     let function_text = node_text(source, function_node);
+
+    // Skip builtins where arg_removal mutations are trivially killed and add noise.
+    if NEVER_MUTATE_FUNCTION_CALLS.contains(&function_text) {
+        return;
+    }
+
     let args = collect_call_arguments(args_node, source);
     if args.is_empty() {
         return;
@@ -844,8 +902,9 @@ fn add_method_mutations(
         );
     }
 
-    if let Some((_, replacement)) =
-        CONDITIONAL_METHOD_SWAPS.iter().find(|(from, _)| *from == method_name)
+    if let Some((_, replacement)) = CONDITIONAL_METHOD_SWAPS
+        .iter()
+        .find(|(from, _)| *from == method_name)
     {
         let Some(arguments) = node.child_by_field_name("arguments") else {
             return;
@@ -944,7 +1003,36 @@ fn add_match_case_removal_mutations(
     }
 }
 
-// --- Default argument mutations ---
+fn collect_call_arguments<'a>(args_node: Node<'a>, source: &'a str) -> Vec<CallArg<'a>> {
+    let mut args = Vec::new();
+    let mut cursor = args_node.walk();
+    for child in args_node.named_children(&mut cursor) {
+        let text = node_text(source, child);
+        args.push(CallArg {
+            kind: child.kind(),
+            text,
+        });
+    }
+    args
+}
+
+fn inspect_call_arguments(arguments: Node<'_>, source: &str) -> (usize, bool) {
+    let mut positional_count = 0;
+    let mut has_maxsplit_kwarg = false;
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        match child.kind() {
+            "keyword_argument" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    has_maxsplit_kwarg |= node_text(source, name) == "maxsplit";
+                }
+            }
+            "list_splat" | "dictionary_splat" => {}
+            _ => positional_count += 1,
+        }
+    }
+    (positional_count, has_maxsplit_kwarg)
+}
 
 fn collect_default_arg_mutations(
     function_node: Node<'_>,
@@ -980,17 +1068,18 @@ fn collect_default_arg_mutations(
     }
 }
 
-// --- Helper functions ---
+fn keyword_prefix<'a>(arg: &'a CallArg<'a>) -> Option<&'a str> {
+    if arg.kind != "keyword_argument" {
+        return None;
+    }
+    arg.text.split_once('=').map(|(name, _)| name.trim())
+}
 
-/// Find an anonymous (operator) child node whose text matches one of the given operator strings.
-///
-/// Tree-sitter represents operators as anonymous nodes. We iterate all children (not just named)
-/// and match against the operator text.
 fn find_operator_child<'a>(
     node: Node<'a>,
     kinds: impl IntoIterator<Item = &'a str>,
 ) -> Option<Node<'a>> {
-    let kinds: HashSet<&str> = kinds.into_iter().collect();
+    let kinds: std::collections::HashSet<&str> = kinds.into_iter().collect();
     for i in 0..node.child_count() {
         let child = node.child(i)?;
         if !child.is_named() && kinds.contains(child.kind()) {
@@ -1017,14 +1106,16 @@ fn subtree_contains_kind(node: Node<'_>, expected: &str) -> bool {
         return true;
     }
     let mut cursor = node.walk();
-    let found = node.children(&mut cursor).any(|child| subtree_contains_kind(child, expected));
+    let found = node
+        .children(&mut cursor)
+        .any(|child| subtree_contains_kind(child, expected));
     found
 }
 
 fn filter_ignored_lines(
     source: &str,
     fn_start: usize,
-    ignored_lines: &HashSet<usize>,
+    ignored_lines: &std::collections::HashSet<usize>,
     mutations: &mut Vec<Mutation>,
 ) {
     if ignored_lines.is_empty() {
@@ -1035,7 +1126,7 @@ fn filter_ignored_lines(
     });
 }
 
-fn pragma_no_mutate_lines(source: &str) -> HashSet<usize> {
+fn pragma_no_mutate_lines(source: &str) -> std::collections::HashSet<usize> {
     source
         .lines()
         .enumerate()
@@ -1094,41 +1185,6 @@ fn compute_default_replacement(default_text: &str) -> Option<&'static str> {
             }
         }
     }
-}
-
-fn collect_call_arguments<'a>(args_node: Node<'a>, source: &'a str) -> Vec<CallArg<'a>> {
-    let mut args = Vec::new();
-    let mut cursor = args_node.walk();
-    for child in args_node.named_children(&mut cursor) {
-        let text = node_text(source, child);
-        args.push(CallArg { kind: child.kind(), text });
-    }
-    args
-}
-
-fn inspect_call_arguments(arguments: Node<'_>, source: &str) -> (usize, bool) {
-    let mut positional_count = 0;
-    let mut has_maxsplit_kwarg = false;
-    let mut cursor = arguments.walk();
-    for child in arguments.named_children(&mut cursor) {
-        match child.kind() {
-            "keyword_argument" => {
-                if let Some(name) = child.child_by_field_name("name") {
-                    has_maxsplit_kwarg |= node_text(source, name) == "maxsplit";
-                }
-            }
-            "list_splat" | "dictionary_splat" => {}
-            _ => positional_count += 1,
-        }
-    }
-    (positional_count, has_maxsplit_kwarg)
-}
-
-fn keyword_prefix<'a>(arg: &CallArg<'a>) -> Option<&'a str> {
-    if arg.kind != "keyword_argument" {
-        return None;
-    }
-    arg.text.split_once('=').map(|(name, _)| name.trim())
 }
 
 #[derive(Clone, Copy)]
@@ -1342,5 +1398,96 @@ mod tests {
                 "NEVER_MUTATE_FUNCTIONS: {name} must produce zero FunctionMutations"
             );
         }
+    }
+
+    // --- Enum skipping ---
+
+    #[test]
+    fn tree_sitter_skips_enum_class_methods() {
+        let source = "class Color(IntEnum):\n    RED = 1\n    def label(self):\n        return 'color'\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty(), "Enum subclass methods should produce zero mutations");
+    }
+
+    #[test]
+    fn tree_sitter_skips_qualified_enum_base() {
+        let source = "class Status(enum.StrEnum):\n    ACTIVE = 'active'\n    def display(self):\n        return self.value\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty());
+    }
+
+    #[test]
+    fn tree_sitter_does_not_skip_regular_classes() {
+        let source = "class Foo(Base):\n    def bar(self):\n        return 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(!fms.is_empty(), "Regular class methods should still be mutated");
+    }
+
+    #[test]
+    fn tree_sitter_skips_all_enum_variants() {
+        for base in &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "enum.Enum", "enum.IntEnum", "enum.StrEnum", "enum.Flag", "enum.IntFlag"] {
+            let source = format!("class C({base}):\n    A = 1\n    def f(self):\n        return 1\n");
+            let fms = collect_file_mutations_tree_sitter(&source);
+            assert!(fms.is_empty(), "Expected empty for base {base}, got {:?}", fms.len());
+        }
+    }
+
+    // --- Nonlocal detection ---
+
+    #[test]
+    fn tree_sitter_skips_function_with_nonlocal() {
+        let source = "def outer():\n    x = 0\n    def inner():\n        nonlocal x\n        x += 1\n    return inner\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty(), "Function containing nonlocal should be skipped");
+    }
+
+    #[test]
+    fn tree_sitter_skips_direct_nonlocal() {
+        // nonlocal at function body level (not nested) should also be skipped
+        let source = "def f():\n    nonlocal x\n    return x + 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty());
+    }
+
+    // --- NEVER_MUTATE_FUNCTION_CALLS ---
+
+    #[test]
+    fn tree_sitter_skips_len_arg_removal() {
+        let source = "def f(items):\n    return len(items)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(
+            !fms.is_empty(),
+            "f(items) with return should produce mutations"
+        );
+        assert!(
+            !fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
+            "len() should not have arg_removal mutations"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_skips_isinstance_arg_removal() {
+        let source = "def f(x):\n    return isinstance(x, int)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(
+            !fms.is_empty(),
+            "f(x) with return should produce mutations"
+        );
+        assert!(
+            !fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
+            "isinstance() should not have arg_removal mutations"
+        );
+    }
+
+    #[test]
+    fn tree_sitter_does_mutate_non_filtered_calls() {
+        // A user-defined function call should still get arg_removal mutations.
+        let source = "def f(x, y):\n    return foo(x, y)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(!fms.is_empty());
+        assert!(
+            fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
+            "foo() should have arg_removal mutations"
+        );
     }
 }
