@@ -103,7 +103,7 @@ fn generate_wrapper_function(
     is_generator: bool,
     return_annotation: &str,
 ) -> String {
-    let async_prefix = if is_async { "async " } else { "" };
+    let async_prefix = if is_async && !is_generator { "async " } else { "" };
 
     // Parse parameter names from the params source to build forwarding args.
     // has_self=true strips the implicit first parameter (self or cls) from call_args.
@@ -140,14 +140,12 @@ fn generate_wrapper_function(
     );
 
     // Choose the correct dispatch based on function kind:
-    //   async generator  → async for _item in trampoline(...): yield _item
+    //   async generator  → return trampoline(...)  (plain def, returns async gen object directly)
     //   sync generator   → yield from trampoline(...)
     //   async regular    → return await trampoline(...)
     //   sync regular     → return trampoline(...)
     let body = match (is_async, is_generator) {
-        (true, true) => format!(
-            "    _agen = {trampoline_call}\n    try:\n        async for _item in _agen:\n            yield _item\n    finally:\n        await _agen.aclose()"
-        ),
+        (true, true) => format!("    return {trampoline_call}"),
         (false, true) => format!("    yield from {trampoline_call}"),
         (true, false) => format!("    return await {trampoline_call}"),
         (false, false) => format!("    return {trampoline_call}"),
@@ -705,11 +703,11 @@ mod tests {
         );
     }
 
-    // INV-1: Async generator wrapper must contain try/finally/aclose for proper cleanup.
-    // INV-2: Async generator wrapper must still yield items correctly.
-    // INV-3: Async generator wrapper uses `async for ... yield` instead of `return await`.
+    // INV-1: Async generator wrapper returns trampoline result directly (no nested async gen).
+    // INV-2: Async generator wrapper uses plain `def` (not `async def`).
+    // INV-3: Async generator wrapper has no yield, async for, or aclose.
     #[test]
-    fn test_async_generator_wrapper_uses_try_finally_aclose() {
+    fn test_async_generator_wrapper_returns_directly() {
         let source = "async def agen(n):\n    if n > 0:\n        yield n\n";
         let fms = collect_file_mutations(source);
         assert!(
@@ -717,47 +715,32 @@ mod tests {
             "async generator with compop must produce mutations"
         );
         let output = generate_trampoline(&fms[0], "agen_mod");
-        // INV-1: must assign to _agen and use try/finally/aclose
+        // INV-1: must use plain return (pass through async gen object)
         assert!(
-            output.wrapper_code.contains("_agen = _irradiate_trampoline("),
-            "Async generator wrapper must assign trampoline to _agen, got:\n{}",
+            output.wrapper_code.contains("return _irradiate_trampoline("),
+            "Async generator wrapper must return trampoline result directly, got:\n{}",
+            output.wrapper_code
+        );
+        // INV-2: must be plain def (not async def)
+        assert!(
+            output.wrapper_code.starts_with("def agen("),
+            "Async generator wrapper must be plain def (not async def), got:\n{}",
+            output.wrapper_code
+        );
+        // INV-3: must NOT contain yield, async for, or aclose
+        assert!(
+            !output.wrapper_code.contains("yield"),
+            "Async generator wrapper must NOT contain yield, got:\n{}",
             output.wrapper_code
         );
         assert!(
-            output.wrapper_code.contains("try:"),
-            "Async generator wrapper must have 'try:', got:\n{}",
+            !output.wrapper_code.contains("async for"),
+            "Async generator wrapper must NOT contain 'async for', got:\n{}",
             output.wrapper_code
         );
         assert!(
-            output.wrapper_code.contains("finally:"),
-            "Async generator wrapper must have 'finally:', got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            output.wrapper_code.contains("await _agen.aclose()"),
-            "Async generator wrapper must call 'await _agen.aclose()', got:\n{}",
-            output.wrapper_code
-        );
-        // INV-2: must still yield items
-        assert!(
-            output.wrapper_code.contains("async for _item in _agen:"),
-            "Async generator wrapper must use 'async for _item in _agen:', got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            output.wrapper_code.contains("yield _item"),
-            "Async generator wrapper must yield _item, got:\n{}",
-            output.wrapper_code
-        );
-        // INV-3: must be async def, must not use return
-        assert!(
-            !output.wrapper_code.contains("return "),
-            "Async generator wrapper must NOT use 'return', got:\n{}",
-            output.wrapper_code
-        );
-        assert!(
-            output.wrapper_code.starts_with("async def "),
-            "Async generator wrapper must be an async def, got:\n{}",
+            !output.wrapper_code.contains("aclose"),
+            "Async generator wrapper must NOT contain 'aclose', got:\n{}",
             output.wrapper_code
         );
     }
