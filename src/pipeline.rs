@@ -433,13 +433,76 @@ pub async fn run(config: RunConfig) -> Result<()> {
     Ok(())
 }
 
+/// Entry in the JSON results `mutants` array.
+#[derive(Serialize)]
+struct JsonMutantEntry {
+    name: String,
+    status: MutantStatus,
+}
+
+/// Top-level JSON output for `irradiate results --json`.
+#[derive(Serialize)]
+struct JsonResults {
+    mutation_score_pct: f64,
+    total: usize,
+    killed: usize,
+    survived: usize,
+    no_tests: usize,
+    timeout: usize,
+    errors: usize,
+    mutants: Vec<JsonMutantEntry>,
+}
+
+/// Build a `JsonResults` from raw (name, exit_code) pairs.
+///
+/// Pure function — no I/O. Extracted for testability.
+/// When `show_all` is false, `mutants` contains only survived entries.
+fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResults {
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut no_tests = 0usize;
+    let mut timeout = 0usize;
+    let mut errors = 0usize;
+    let mut mutants = Vec::new();
+
+    for (name, exit_code) in all_results {
+        let status = MutantStatus::from_exit_code(*exit_code, false);
+        match status {
+            MutantStatus::Killed => killed += 1,
+            MutantStatus::Survived => survived += 1,
+            MutantStatus::NoTests => no_tests += 1,
+            MutantStatus::Timeout => timeout += 1,
+            _ => errors += 1,
+        }
+        if show_all || status == MutantStatus::Survived {
+            mutants.push(JsonMutantEntry { name: name.clone(), status });
+        }
+    }
+
+    let total = all_results.len();
+    let denominator = (killed + survived) as f64;
+    let mutation_score_pct = if denominator > 0.0 {
+        ((killed as f64 / denominator * 100.0) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    JsonResults { mutation_score_pct, total, killed, survived, no_tests, timeout, errors, mutants }
+}
+
 /// Display results from previous run.
-pub fn results(show_all: bool) -> Result<()> {
+pub fn results(show_all: bool, json_output: bool) -> Result<()> {
     let mutants_dir = std::env::current_dir()?.join("mutants");
     let all_results = load_all_meta(&mutants_dir)?;
 
-    if all_results.is_empty() {
+    if all_results.is_empty() && !json_output {
         eprintln!("No results found. Run `irradiate run` first.");
+        return Ok(());
+    }
+
+    if json_output {
+        let json_out = build_json_results(&all_results, show_all);
+        println!("{}", serde_json::to_string_pretty(&json_out)?);
         return Ok(());
     }
 
@@ -2558,5 +2621,124 @@ mod tests {
         let tested = killed + survived;
         let score = killed as f64 / tested as f64 * 100.0;
         assert!(score < threshold, "66.6... should be below 67.0");
+    }
+
+    // --- build_json_results ---
+
+    fn raw(name: &str, exit_code: i32) -> (String, i32) {
+        (name.to_string(), exit_code)
+    }
+
+    /// INV-1: JSON output is valid JSON; INV-5: total == sum of all status counts.
+    #[test]
+    fn test_json_results_valid_json_and_inv5_total() {
+        let results = vec![
+            raw("mod.x_a__irradiate_1", 1),  // killed
+            raw("mod.x_b__irradiate_1", 0),  // survived
+            raw("mod.x_c__irradiate_1", 33), // no_tests
+            raw("mod.x_d__irradiate_1", 2),  // error
+        ];
+        let json_out = build_json_results(&results, true);
+        // INV-1: serializes to valid JSON
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["total"], 4);
+        assert_eq!(parsed["killed"], 1);
+        assert_eq!(parsed["survived"], 1);
+        assert_eq!(parsed["no_tests"], 1);
+        assert_eq!(parsed["errors"], 1);
+
+        // INV-5: total == killed + survived + no_tests + timeout + errors
+        let sum = parsed["killed"].as_u64().unwrap()
+            + parsed["survived"].as_u64().unwrap()
+            + parsed["no_tests"].as_u64().unwrap()
+            + parsed["timeout"].as_u64().unwrap()
+            + parsed["errors"].as_u64().unwrap();
+        assert_eq!(sum, parsed["total"].as_u64().unwrap());
+    }
+
+    /// INV-2: mutation_score_pct = killed / (killed + survived) * 100, rounded to 1 decimal.
+    #[test]
+    fn test_json_results_mutation_score_pct() {
+        // 3 killed out of 4 (3 killed + 1 survived) = 75.0%
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 1), // killed
+            raw("c", 1), // killed
+            raw("d", 0), // survived
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutation_score_pct, 75.0);
+    }
+
+    /// INV-2: score rounds to 1 decimal correctly.
+    #[test]
+    fn test_json_results_mutation_score_rounding() {
+        // 2 killed / 3 total relevant = 66.666...% → rounds to 66.7
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 1), // killed
+            raw("c", 0), // survived
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutation_score_pct, 66.7);
+    }
+
+    /// Failure mode: no results → JSON with total: 0 and empty mutants array (not an error).
+    #[test]
+    fn test_json_results_empty_input() {
+        let json_out = build_json_results(&[], true);
+        assert_eq!(json_out.total, 0);
+        assert_eq!(json_out.killed, 0);
+        assert_eq!(json_out.survived, 0);
+        assert_eq!(json_out.mutants.len(), 0);
+        assert_eq!(json_out.mutation_score_pct, 0.0);
+        // Must still serialize without panic
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["total"], 0);
+    }
+
+    /// When show_all=false, mutants array contains only survived entries.
+    #[test]
+    fn test_json_results_show_all_false_only_survived() {
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 0), // survived
+            raw("c", 0), // survived
+        ];
+        let json_out = build_json_results(&results, false);
+        assert_eq!(json_out.mutants.len(), 2);
+        for m in &json_out.mutants {
+            assert_eq!(m.status, MutantStatus::Survived);
+        }
+    }
+
+    /// When show_all=true, mutants array includes all statuses.
+    #[test]
+    fn test_json_results_show_all_true_includes_all() {
+        let results = vec![
+            raw("a", 1),  // killed
+            raw("b", 0),  // survived
+            raw("c", 33), // no_tests
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutants.len(), 3);
+    }
+
+    /// INV-4: All status strings in JSON are lowercase snake_case.
+    #[test]
+    fn test_json_results_status_serialization_snake_case() {
+        let results = vec![
+            raw("a", 0),  // survived
+            raw("b", 1),  // killed
+            raw("c", 33), // no_tests
+        ];
+        let json_out = build_json_results(&results, true);
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        assert!(serialized.contains("\"survived\""));
+        assert!(serialized.contains("\"killed\""));
+        assert!(serialized.contains("\"no_tests\""));
     }
 }

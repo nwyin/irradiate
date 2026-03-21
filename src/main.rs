@@ -83,6 +83,10 @@ enum Commands {
         /// Show all mutants, not just survived
         #[arg(long)]
         all: bool,
+
+        /// Output machine-readable JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show diff for a specific mutant
@@ -160,7 +164,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Commands::Results { all } => irradiate::pipeline::results(all),
+        Commands::Results { all, json } => irradiate::pipeline::results(all, json),
         Commands::Show { mutant_name } => irradiate::pipeline::show(&mutant_name),
         Commands::Cache { command } => match command {
             CacheCommands::Clean => {
