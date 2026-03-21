@@ -213,15 +213,25 @@ fn collect_function_mutations(
     let func_source = &source[fn_start..fn_end];
     let params_source = function_node
         .child_by_field_name("parameters")
-        .map(|node| node_text(source, node).to_string())
+        .map(|node| {
+            let text = node_text(source, node);
+            // tree-sitter `parameters` node includes outer `(` and `)`, but the trampoline
+            // generator wraps params in its own parens in `def name({params}):`. Strip them.
+            if text.starts_with('(') && text.ends_with(')') {
+                text[1..text.len() - 1].to_string()
+            } else {
+                text.to_string()
+            }
+        })
         .unwrap_or_default();
     let return_annotation = function_node
         .child_by_field_name("return_type")
         .map(|node| format!(" -> {}", node_text(source, node)))
         .unwrap_or_default();
     let is_async = source[fn_start..name_node.start_byte()].contains("async");
-    let is_generator =
-        subtree_contains_kind(body, "yield") || subtree_contains_kind(body, "yield_from");
+    // is_generator must NOT cross nested function_definition boundaries: only the function's own
+    // scope level matters. Use body_contains_yield_at_scope instead of subtree_contains_kind.
+    let is_generator = body_contains_yield_at_scope(body);
 
     let mut mutations = Vec::new();
     collect_default_arg_mutations(function_node, source, fn_start, &mut mutations);
@@ -289,9 +299,12 @@ fn collect_node_mutations(
             add_dict_kwarg_mutations(node, source, fn_start, mutations);
         }
         "match_statement" => add_match_case_removal_mutations(node, source, fn_start, mutations),
+        "raise_statement" => add_raise_statement_mutation(node, source, fn_start, mutations),
         "lambda" => add_lambda_mutation(node, source, fn_start, mutations),
-        "conditional_expression" => add_ternary_mutations(node, source, fn_start, mutations),
-        "raise_statement" => add_raise_deletion(node, source, fn_start, mutations),
+        "conditional_expression" => {
+            add_ternary_swap_mutation(node, source, fn_start, mutations);
+            add_condition_negation_ternary(node, source, fn_start, mutations);
+        }
         _ => {}
     }
 
@@ -591,18 +604,39 @@ fn add_expression_statement_mutation(
     let Some(value_node) = first_named_child(node) else {
         return;
     };
-    if value_node.kind() == "string" {
-        return;
-    }
-
     let stmt_text = node_text(source, node);
-    record_mutation(
-        stmt_text,
-        "pass",
-        "statement_deletion",
-        node.start_byte() - fn_start,
-        mutations,
-    );
+    match value_node.kind() {
+        // Docstrings: string-literal expression statements are never deleted.
+        "string" => {}
+        // Augmented assignment (`x += 1`) has its own handler via `add_augmented_assignment_mutations`.
+        // tree-sitter-python wraps it in expression_statement — skip here so we don't add
+        // a spurious statement_deletion for augmented assignments.
+        "augmented_assignment" => {}
+        // Regular assignment (`x = expr`) — statement_deletion is handled here (at expression_statement
+        // level) so we get the full statement text including all chained targets (e.g. `a = b = c`).
+        // The add_assignment_mutations handler only adds the value-replacement mutation.
+        "assignment" => {
+            if !stmt_text.trim_start().starts_with("self.") {
+                record_mutation(
+                    stmt_text,
+                    "pass",
+                    "statement_deletion",
+                    node.start_byte() - fn_start,
+                    mutations,
+                );
+            }
+        }
+        // All other expression statements (calls, etc.): delete to `pass`.
+        _ => {
+            record_mutation(
+                stmt_text,
+                "pass",
+                "statement_deletion",
+                node.start_byte() - fn_start,
+                mutations,
+            );
+        }
+    }
 }
 
 fn add_assignment_mutations(
@@ -614,13 +648,18 @@ fn add_assignment_mutations(
     let Some(value_node) = last_named_child(node) else {
         return;
     };
+
+    // Chained assignments like `a = b = c` appear in tree-sitter as nested `assignment` nodes:
+    // outer has right=assignment(b, c). Skip the outer; recursion will reach the inner assignment
+    // `b = c` and produce the correct `b = None` mutation, which applied to the full source
+    // yields `a = b = None` — matching the libcst collector's single-target-replacement behavior.
+    if value_node.kind() == "assignment" {
+        return;
+    }
+
     let assignment_text = node_text(source, node);
     let value_text = node_text(source, value_node);
-    let replacement_value = if value_text.trim() == "None" {
-        "\"\""
-    } else {
-        "None"
-    };
+    let replacement_value = if value_text.trim() == "None" { "\"\"" } else { "None" };
     let prefix_len = value_node.start_byte().saturating_sub(node.start_byte());
     if prefix_len <= assignment_text.len() {
         let new_assignment = format!("{}{}", &assignment_text[..prefix_len], replacement_value);
@@ -632,16 +671,9 @@ fn add_assignment_mutations(
             mutations,
         );
     }
-
-    if !assignment_text.trim_start().starts_with("self.") {
-        record_mutation(
-            assignment_text,
-            "pass",
-            "statement_deletion",
-            node.start_byte() - fn_start,
-            mutations,
-        );
-    }
+    // Note: statement_deletion is handled by add_expression_statement_mutation at the
+    // expression_statement level, so the full statement text (including all chained targets)
+    // is used for deletion. We do NOT add statement_deletion here.
 }
 
 fn add_augmented_assignment_mutations(
@@ -793,16 +825,148 @@ fn add_exception_type_mutation(
     let Some(value) = node.child_by_field_name("value") else {
         return;
     };
-    let text = node_text(source, value);
+    // `except ValueError as e:` → tree-sitter wraps the type in `as_pattern`:
+    //   value: (as_pattern (identifier "ValueError") alias: ...)
+    // We should only mutate the exception type, not the full `as_pattern` text.
+    let type_node = if value.kind() == "as_pattern" {
+        let children: Vec<Node<'_>> = {
+            let mut c = value.walk();
+            value.named_children(&mut c).collect()
+        };
+        match children.into_iter().next() {
+            Some(n) => n,
+            None => return,
+        }
+    } else {
+        value
+    };
+    let text = node_text(source, type_node);
     if text.trim() != "Exception" {
         record_mutation(
             text,
             "Exception",
             "exception_type",
-            value.start_byte() - fn_start,
+            type_node.start_byte() - fn_start,
             mutations,
         );
     }
+}
+
+/// Delete an explicit `raise Exc(...)` statement to `pass`.
+/// Bare `raise` (re-raise in except) has no named children — skip those.
+fn add_raise_statement_mutation(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    if node.named_child_count() == 0 {
+        return; // bare `raise` — re-raise, don't delete
+    }
+    let stmt_text = node_text(source, node);
+    record_mutation(stmt_text, "pass", "statement_deletion", node.start_byte() - fn_start, mutations);
+}
+
+/// Lambda mutation: replace `lambda params: body` with `lambda params: None` (or `: 0` if body is None).
+///
+/// Strategy: find the first `:` in the lambda text (params can't contain `:` except in annotations,
+/// but lambda params don't have type annotations in Python syntax), then replace the body text after it.
+fn add_lambda_mutation(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let Some(body_node) = node.child_by_field_name("body") else {
+        return;
+    };
+    let lambda_text = node_text(source, node);
+    let body_text = node_text(source, body_node);
+    let replacement_body = if body_text.trim() == "None" { "0" } else { "None" };
+    // Find `:` separator: first `:` in the lambda text is always the colon before the body.
+    let colon_pos = match lambda_text.find(':') {
+        Some(p) => p,
+        None => return,
+    };
+    let after_colon = &lambda_text[colon_pos + 1..];
+    let ws_len = after_colon.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+    let body_start = colon_pos + 1 + ws_len;
+    let body_end = body_start + body_text.len();
+    if body_end > lambda_text.len() {
+        return; // safety guard
+    }
+    let replacement = format!(
+        "{}{}{}",
+        &lambda_text[..body_start],
+        replacement_body,
+        &lambda_text[body_end..]
+    );
+    record_mutation(lambda_text, &replacement, "lambda_mutation", node.start_byte() - fn_start, mutations);
+}
+
+/// Ternary swap: `body if condition else alternative` → `alternative if condition else body`.
+/// Skip if body and alternative are identical (equivalent mutant).
+///
+/// Per hive notes: tree-sitter-python conditional_expression uses positional named children:
+///   children[0] = body, children[1] = condition, children[2] = alternative
+fn add_ternary_swap_mutation(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let children: Vec<Node<'_>> = {
+        let mut c = node.walk();
+        node.named_children(&mut c).collect()
+    };
+    if children.len() < 3 {
+        return;
+    }
+    let body_text = node_text(source, children[0]);
+    let alternative_text = node_text(source, children[2]);
+    if body_text == alternative_text {
+        return; // equivalent mutant
+    }
+    let full_text = node_text(source, node);
+    // Reconstruct swapped ternary: alternative if condition else body.
+    // Find the positions of `if` and `else` keywords in the original text.
+    let body_end = children[0].end_byte() - node.start_byte();
+    let condition_start = children[1].start_byte() - node.start_byte();
+    let condition_end = children[1].end_byte() - node.start_byte();
+    let alt_start = children[2].start_byte() - node.start_byte();
+    // Between body end and condition start there are whitespace + `if`; preserve it.
+    let between_body_and_cond = &full_text[body_end..condition_start];
+    // Between condition end and alt start there are whitespace + `else`; preserve it.
+    let between_cond_and_alt = &full_text[condition_end..alt_start];
+    let replacement = format!(
+        "{}{}{}{}{}",
+        alternative_text, between_body_and_cond, node_text(source, children[1]),
+        between_cond_and_alt, body_text
+    );
+    record_mutation(full_text, &replacement, "ternary_swap", node.start_byte() - fn_start, mutations);
+}
+
+/// Condition negation for ternary expression: `body if cond else alt` → `body if not (cond) else alt`.
+fn add_condition_negation_ternary(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let children: Vec<Node<'_>> = {
+        let mut c = node.walk();
+        node.named_children(&mut c).collect()
+    };
+    if children.len() < 3 {
+        return;
+    }
+    let condition = children[1];
+    if condition.kind() == "not_operator" {
+        return; // already negated
+    }
+    let condition_text = node_text(source, condition);
+    let replacement = format!("not ({condition_text})");
+    record_mutation(condition_text, &replacement, "condition_negation", condition.start_byte() - fn_start, mutations);
 }
 
 fn add_arg_removal_mutations(
@@ -1006,120 +1170,6 @@ fn add_match_case_removal_mutations(
     }
 }
 
-/// Replace the body of a lambda expression with a different value.
-///
-/// `lambda x: body` → `lambda x: None` (when body ≠ None)
-/// `lambda x: None` → `lambda x: 0`
-fn add_lambda_mutation(
-    node: Node<'_>,
-    source: &str,
-    fn_start: usize,
-    mutations: &mut Vec<Mutation>,
-) {
-    let Some(body) = node.child_by_field_name("body") else {
-        return;
-    };
-    let body_text = node_text(source, body);
-    let replacement_body = if body_text.trim() == "None" { "0" } else { "None" };
-
-    let full_text = node_text(source, node);
-    let body_rel_start = body.start_byte() - node.start_byte();
-    let body_rel_end = body.end_byte() - node.start_byte();
-    let replacement = format!(
-        "{}{}{}",
-        &full_text[..body_rel_start],
-        replacement_body,
-        &full_text[body_rel_end..]
-    );
-    record_mutation(
-        full_text,
-        &replacement,
-        "lambda_mutation",
-        node.start_byte() - fn_start,
-        mutations,
-    );
-}
-
-/// Swap the body and alternative of a conditional (ternary) expression.
-///
-/// `a if cond else b` → `b if cond else a`
-///
-/// Also adds condition_negation on the test expression.
-///
-/// Note: in tree-sitter-python 0.23, `conditional_expression` children are positional
-/// (no field names): child[0]=body (true branch), child[1]=condition, child[2]=alternative.
-fn add_ternary_mutations(
-    node: Node<'_>,
-    source: &str,
-    fn_start: usize,
-    mutations: &mut Vec<Mutation>,
-) {
-    // Collect children into a Vec to avoid cursor lifetime issues (see gotcha note).
-    let children: Vec<Node<'_>> = {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).collect()
-    };
-    if children.len() < 3 {
-        return;
-    }
-    let body = children[0];
-    let condition = children[1];
-    let alternative = children[2];
-
-    let body_text = node_text(source, body);
-    let cond_text = node_text(source, condition);
-    let alt_text = node_text(source, alternative);
-
-    // Ternary swap: a if cond else b → b if cond else a
-    if body_text != alt_text {
-        let replacement = format!("{alt_text} if {cond_text} else {body_text}");
-        record_mutation(
-            node_text(source, node),
-            &replacement,
-            "ternary_swap",
-            node.start_byte() - fn_start,
-            mutations,
-        );
-    }
-
-    // Condition negation on the ternary test expression
-    if condition.kind() != "not_operator" {
-        let neg_replacement = format!("not ({cond_text})");
-        record_mutation(
-            cond_text,
-            &neg_replacement,
-            "condition_negation",
-            condition.start_byte() - fn_start,
-            mutations,
-        );
-    }
-}
-
-/// Delete explicit raise statements (replace with `pass`).
-///
-/// `raise ValueError("bad")` → `pass`
-///
-/// Bare `raise` (re-raise inside except) is not deleted.
-fn add_raise_deletion(
-    node: Node<'_>,
-    source: &str,
-    fn_start: usize,
-    mutations: &mut Vec<Mutation>,
-) {
-    // Skip bare raise (re-raise) — it has no named children
-    let mut cursor = node.walk();
-    if node.named_children(&mut cursor).next().is_none() {
-        return;
-    }
-    record_mutation(
-        node_text(source, node),
-        "pass",
-        "statement_deletion",
-        node.start_byte() - fn_start,
-        mutations,
-    );
-}
-
 fn collect_call_arguments<'a>(args_node: Node<'a>, source: &'a str) -> Vec<CallArg<'a>> {
     let mut args = Vec::new();
     let mut cursor = args_node.walk();
@@ -1169,10 +1219,10 @@ fn collect_default_arg_mutations(
                 };
                 let value_text = node_text(source, value);
                 if let Some(replacement) = compute_default_replacement(value_text) {
-                    if replacement != value_text {
+                    if replacement.as_str() != value_text {
                         record_mutation(
                             value_text,
-                            replacement,
+                            &replacement,
                             "default_arg",
                             value.start_byte() - fn_start,
                             mutations,
@@ -1227,6 +1277,26 @@ fn subtree_contains_kind(node: Node<'_>, expected: &str) -> bool {
         .children(&mut cursor)
         .any(|child| subtree_contains_kind(child, expected));
     found
+}
+
+/// Check if `node` (a function body block) contains a `yield` or `yield_from` at its own scope,
+/// NOT crossing into nested function_definition or lambda boundaries.
+///
+/// This matches the libcst collector's behavior: a function is a generator only if IT yields,
+/// not if a nested function inside it yields.
+fn body_contains_yield_at_scope(node: Node<'_>) -> bool {
+    if node.kind() == "yield" || node.kind() == "yield_from" {
+        return true;
+    }
+    // Don't recurse into nested function definitions or lambdas — they have their own scope.
+    if node.kind() == "function_definition" || node.kind() == "lambda" {
+        return false;
+    }
+    let children: Vec<Node<'_>> = {
+        let mut cursor = node.walk();
+        node.children(&mut cursor).collect()
+    };
+    children.into_iter().any(body_contains_yield_at_scope)
 }
 
 fn filter_ignored_lines(
@@ -1286,22 +1356,57 @@ fn record_mutation(
     });
 }
 
-fn compute_default_replacement(default_text: &str) -> Option<&'static str> {
-    match default_text.trim() {
-        "True" => Some("False"),
-        "False" => Some("True"),
-        "None" => Some("\"\""),
-        "0" => Some("1"),
-        "1" => Some("0"),
-        "\"\"" | "''" => Some("None"),
-        _ => {
-            if default_text.starts_with('"') || default_text.starts_with('\'') {
-                Some("\"\"")
-            } else {
-                Some("None")
+fn compute_default_replacement(default_text: &str) -> Option<String> {
+    let trimmed = default_text.trim();
+
+    if trimmed == "None" {
+        return Some("\"\"".to_string());
+    }
+    if trimmed == "True" {
+        return Some("False".to_string());
+    }
+    if trimmed == "False" {
+        return Some("True".to_string());
+    }
+
+    // Integer: try parsing without underscores (Python allows 1_000 etc.)
+    if let Ok(n) = trimmed.replace('_', "").parse::<i64>() {
+        let r = (n + 1).to_string();
+        if r.as_str() != trimmed {
+            return Some(r);
+        }
+    }
+
+    // Float: only try parsing if it looks like a float (contains `.` or `e`/`E`).
+    if trimmed.contains('.') || trimmed.to_lowercase().contains('e') {
+        if let Ok(n) = trimmed.parse::<f64>() {
+            let r = format!("{}", n + 1.0);
+            if r != trimmed {
+                return Some(r);
             }
         }
     }
+
+    // String literal: detect quoted form (with optional prefix like r, b, f).
+    if let Some(prefix_end) = trimmed.find(['"', '\'']) {
+        let quote_char = trimmed.as_bytes()[prefix_end] as char;
+        let rest = &trimmed[prefix_end..];
+        let triple = if quote_char == '"' { "\"\"\"" } else { "'''" };
+        if !rest.starts_with(triple) && trimmed.ends_with(quote_char) && trimmed.len() >= 2 {
+            let prefix = &trimmed[..prefix_end];
+            let inner = &trimmed[prefix_end + 1..trimmed.len() - 1];
+            if !inner.contains(quote_char) {
+                if inner.is_empty() {
+                    return Some(format!("{prefix}{quote_char}XX{quote_char}"));
+                } else {
+                    return Some(format!("{prefix}{quote_char}XX{inner}XX{quote_char}"));
+                }
+            }
+        }
+    }
+
+    // Fallback: replace with None.
+    Some("None".to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -1608,89 +1713,4 @@ mod tests {
         );
     }
 
-    // --- New operator tests ---
-
-    #[test]
-    fn tree_sitter_lambda_mutation() {
-        let source = "def f():\n    g = lambda x: x + 1\n    return g\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        let fm = &fms[0];
-        let mutation = fm
-            .mutations
-            .iter()
-            .find(|m| m.operator == "lambda_mutation")
-            .expect("expected lambda_mutation");
-        assert!(mutation.replacement.contains("None"));
-        let mutated = apply_mutation(&fm.source, mutation);
-        assert!(parse_module(&mutated, None).is_ok(), "lambda mutation must parse: {mutated}");
-    }
-
-    #[test]
-    fn tree_sitter_lambda_none_body_mutates_to_zero() {
-        let source = "def f():\n    g = lambda: None\n    return g\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        let mutation = fms[0]
-            .mutations
-            .iter()
-            .find(|m| m.operator == "lambda_mutation")
-            .expect("expected lambda_mutation");
-        assert!(mutation.replacement.contains("0"));
-    }
-
-    #[test]
-    fn tree_sitter_ternary_swap() {
-        let source = "def f(x):\n    return 'yes' if x else 'no'\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        let fm = &fms[0];
-
-        let swap = fm
-            .mutations
-            .iter()
-            .find(|m| m.operator == "ternary_swap")
-            .expect("expected ternary_swap");
-        let mutated = apply_mutation(&fm.source, swap);
-        assert!(parse_module(&mutated, None).is_ok(), "ternary swap must parse: {mutated}");
-        assert!(mutated.contains("'no' if") && mutated.contains("else 'yes'"));
-
-        // Also check condition_negation on ternary
-        assert!(fm.mutations.iter().any(|m| m.operator == "condition_negation"));
-    }
-
-    #[test]
-    fn tree_sitter_ternary_swap_skips_identical() {
-        let source = "def f(x):\n    return x if x else x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        assert!(
-            !fms[0].mutations.iter().any(|m| m.operator == "ternary_swap"),
-            "ternary swap should be skipped when body == alternative"
-        );
-    }
-
-    #[test]
-    fn tree_sitter_raise_deletion() {
-        let source =
-            "def f(x):\n    if not x:\n        raise ValueError('bad')\n    return x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        let fm = &fms[0];
-        let mutation = fm
-            .mutations
-            .iter()
-            .find(|m| m.operator == "statement_deletion" && m.original.contains("raise"))
-            .expect("expected raise deletion");
-        assert_eq!(mutation.replacement, "pass");
-        let mutated = apply_mutation(&fm.source, mutation);
-        assert!(parse_module(&mutated, None).is_ok(), "raise deletion must parse: {mutated}");
-    }
-
-    #[test]
-    fn tree_sitter_bare_raise_not_deleted() {
-        let source = "def f():\n    try:\n        pass\n    except:\n        raise\n";
-        let fms = collect_file_mutations_tree_sitter(source);
-        // bare raise should NOT produce a statement_deletion targeting the raise
-        let has_raise_deletion = fms
-            .iter()
-            .flat_map(|fm| &fm.mutations)
-            .any(|m| m.operator == "statement_deletion" && m.original.trim() == "raise");
-        assert!(!has_raise_deletion, "bare raise should not be deleted");
-    }
 }

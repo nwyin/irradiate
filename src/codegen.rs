@@ -337,8 +337,14 @@ mod tests {
             result.descriptors[0].mutant_name, result.mutant_names[0],
             "Descriptor keys must align with generated mutant names"
         );
-        assert_eq!(result.descriptors[0].operator, "binop_swap");
-        assert_eq!(result.descriptors[0].function_source, source);
+        // tree-sitter collects return_statement mutations before recursing into binary_operator,
+        // so the first descriptor may be return_value or statement_deletion rather than binop_swap.
+        // Assert that a binop_swap descriptor exists somewhere (not necessarily first).
+        let binop_desc = result.descriptors.iter().find(|d| d.operator == "binop_swap");
+        assert!(binop_desc.is_some(), "Must have at least one binop_swap descriptor");
+        // tree-sitter's function_definition node may not include the trailing newline that
+        // libcst codegen adds. Strip trailing whitespace before comparing.
+        assert_eq!(binop_desc.unwrap().function_source.trim_end(), source.trim_end());
     }
 
     #[test]
