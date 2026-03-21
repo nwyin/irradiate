@@ -75,7 +75,7 @@ nav:
     - The Trampoline: internals/trampoline.md
     - Mutation Operators: internals/mutation-operators.md
     - Import Hook: internals/import-hook.md
-    - Known Issues: internals/known-issues.md
+
   - Reference:
     - CLI: reference/cli.md
   - Blog: blog/index.md
