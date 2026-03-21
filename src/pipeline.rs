@@ -601,16 +601,15 @@ pub fn show(mutant_name: &str) -> Result<()> {
 
 // --- Internal helpers ---
 
-/// Default timeout (seconds) when no per-test baseline is available.
-const DEFAULT_SUBPROCESS_TIMEOUT_SECS: f64 = 30.0;
+/// Minimum estimated duration (seconds) used as a floor before applying the multiplier.
+/// Prevents near-zero estimated durations from producing sub-second timeouts.
+/// Even trivially fast tests need a few seconds for pytest overhead.
+const MIN_ESTIMATED_SECS: f64 = 2.0;
 
-/// Minimum absolute timeout for an isolated subprocess (seconds).
-///
-/// Each isolated run spawns a fresh `python -m pytest` process. Even for trivially
-/// fast tests the subprocess startup + pytest collection overhead is ~1-3 seconds.
-/// If the estimated test duration is sub-second we must not let the multiplied timeout
-/// drop below this floor, or every mutant will time out before pytest even collects.
-const MIN_ISOLATED_TIMEOUT_SECS: f64 = 10.0;
+/// Absolute minimum timeout (seconds) regardless of multiplier or estimate.
+/// Protects against edge cases where multiplier * estimate is still too small
+/// for subprocess startup + pytest collection.
+const MIN_TIMEOUT_SECS: f64 = 10.0;
 
 /// Timeout (seconds) for validation subprocess calls (validate_clean_run, validate_fail_run,
 /// discover_tests). If pytest hangs during validation, the pipeline would block indefinitely
@@ -639,7 +638,7 @@ pub async fn run_isolated(
         let start = Instant::now();
 
         // Per-item timeout: multiply estimated test duration by the multiplier, then
-        // apply MIN_ISOLATED_TIMEOUT_SECS as an absolute floor.
+        // apply MIN_TIMEOUT_SECS as an absolute floor and MIN_ESTIMATED_SECS
         //
         // The floor is essential: each isolated run spawns a fresh subprocess and pytest
         // must start, import, collect, and then run — even for microsecond-fast tests
@@ -1193,9 +1192,12 @@ fn apply_verification_corrections(
 }
 
 fn compute_timeout(multiplier: f64, estimated_secs: f64) -> f64 {
-    (multiplier * estimated_secs)
-        .max(multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS)
-        .max(MIN_ISOLATED_TIMEOUT_SECS)
+    // Floor the estimate at MIN_ESTIMATED_SECS so near-zero durations still get
+    // a reasonable timeout, then apply the multiplier, then enforce an absolute minimum.
+    //
+    // Old formula: max(mult * est, mult * 30, 10) → 300s floor at default multiplier.
+    // New formula: max(mult * max(est, 2), 10) → 20s floor at default multiplier.
+    (multiplier * estimated_secs.max(MIN_ESTIMATED_SECS)).max(MIN_TIMEOUT_SECS)
 }
 
 fn write_meta_files(
@@ -1512,21 +1514,21 @@ mod tests {
 
     #[test]
     fn test_per_mutant_timeout_formula_zero_duration() {
-        // INV: timeout >= MIN_ISOLATED_TIMEOUT_SECS always.
-        // INV: timeout >= multiplier * DEFAULT_SUBPROCESS_TIMEOUT_SECS when estimated=0.
-        // multiplier(10) * DEFAULT(30) = 300, which dominates
+        // INV: timeout >= MIN_TIMEOUT_SECS always.
+        // INV: timeout >= multiplier * MIN_ESTIMATED_SECS when estimated=0.
+        // multiplier(10) * MIN_ESTIMATED(2) = 20
         let timeout = compute_timeout(10.0, 0.0);
         assert!(
-            (timeout - 300.0).abs() < 1e-9,
-            "expected 300.0, got {timeout}"
+            (timeout - 20.0).abs() < 1e-9,
+            "expected 20.0, got {timeout}"
         );
-        assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
+        assert!(timeout >= MIN_TIMEOUT_SECS);
     }
 
     #[test]
     fn test_per_mutant_timeout_formula_large_suite() {
-        // When estimated duration exceeds the default, multiplier×estimated wins.
-        // multiplier(10) * estimated(60) = 600 > multiplier * DEFAULT (300)
+        // When estimated duration exceeds the floor, multiplier×estimated wins.
+        // multiplier(10) * estimated(60) = 600
         let timeout = compute_timeout(10.0, 60.0);
         assert!(
             (timeout - 600.0).abs() < 1e-9,
@@ -1536,14 +1538,13 @@ mod tests {
 
     #[test]
     fn test_per_mutant_timeout_formula_min_floor() {
-        // With multiplier=1 and tiny suite, DEFAULT dominates over tiny estimated.
-        // multiplier(1) * DEFAULT(30) = 30 >> 0.001; 30 >= MIN(10)
+        // With multiplier=1 and tiny suite, MIN_ESTIMATED dominates.
+        // multiplier(1) * max(0.001, MIN_ESTIMATED(2)) = 2; 2 < MIN(10) → 10
         let timeout = compute_timeout(1.0, 0.001);
         assert!(
-            (timeout - 30.0).abs() < 1e-9,
-            "expected 30.0, got {timeout}"
+            (timeout - MIN_TIMEOUT_SECS).abs() < 1e-9,
+            "expected {MIN_TIMEOUT_SECS}, got {timeout}"
         );
-        assert!(timeout >= MIN_ISOLATED_TIMEOUT_SECS);
     }
 
     #[test]
@@ -1562,8 +1563,8 @@ mod tests {
         for &(multiplier, estimated_secs) in cases {
             let timeout = compute_timeout(multiplier, estimated_secs);
             assert!(
-                timeout >= MIN_ISOLATED_TIMEOUT_SECS,
-                "timeout {timeout} < MIN ({MIN_ISOLATED_TIMEOUT_SECS}) for multiplier={multiplier} estimated={estimated_secs}"
+                timeout >= MIN_TIMEOUT_SECS,
+                "timeout {timeout} < MIN ({MIN_TIMEOUT_SECS}) for multiplier={multiplier} estimated={estimated_secs}"
             );
         }
     }
@@ -2517,13 +2518,13 @@ mod tests {
         );
     }
 
-    /// compute_timeout: very small multiplier still produces at least MIN_ISOLATED_TIMEOUT_SECS.
+    /// compute_timeout: very small multiplier still produces at least MIN_TIMEOUT_SECS.
     #[test]
     fn test_compute_timeout_very_small_multiplier() {
         // multiplier=0.001, estimated=0.0 → max(0.001*0, 0.001*30, 10) = max(0, 0.03, 10) = 10
         let t = compute_timeout(0.001, 0.0);
         assert!(
-            (t - MIN_ISOLATED_TIMEOUT_SECS).abs() < 1e-9,
+            (t - MIN_TIMEOUT_SECS).abs() < 1e-9,
             "very small multiplier should fall back to MIN floor: got {t}"
         );
     }
@@ -2537,7 +2538,7 @@ mod tests {
             (t - 5000.0).abs() < 1e-9,
             "large estimated_secs should dominate: got {t}"
         );
-        assert!(t >= MIN_ISOLATED_TIMEOUT_SECS);
+        assert!(t >= MIN_TIMEOUT_SECS);
     }
 
     // --- fail_under / mutation score ---
