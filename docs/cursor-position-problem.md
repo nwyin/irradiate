@@ -162,14 +162,45 @@ let text = &source[start..end];
 
 **Cons**: tree-sitter produces an AST, not a CST — it may not preserve all whitespace details in its node structure (though the byte ranges into the original source give us the exact text anyway). Would require rewriting the mutation walker to use tree-sitter's node types instead of libcst's. The tree-sitter grammar for Python may not expose all the structural detail we rely on (e.g., individual `lpar`/`rpar`, whitespace fields on operators).
 
-### Option C: Two-pass approach — tree-sitter for positions, libcst for structure
+### Option C: Use Astral/Ruff's Python parser and AST
+
+Astral's parser stack (the Rust crates behind Ruff, not `uv` directly) parses Python into a typed AST where nodes carry `TextRange` source spans, and the parse result also includes a token stream with ranges. `TextSize` is defined as a UTF-8 byte offset, so these ranges map directly to our current `start: usize` / `end: usize` mutation model.
+
+```rust
+use ruff_python_parser::parse_module;
+use ruff_text_size::Ranged;
+
+let parsed = parse_module(source)?;
+let expr = /* walk AST */;
+let start = expr.start().to_usize();
+let end = expr.end().to_usize();
+let text = &source[start..end];
+```
+
+This would eliminate the expression-level cursor search entirely. For token-level mutations (`and` -> `or`, `+` -> `-`), we would still need to locate the operator token within the containing expression span, but the parser exposes a `Tokens` collection with per-token ranges, so that search can be constrained to the exact node span rather than the whole function body.
+
+**Pros**: exact byte ranges on AST nodes. Token ranges are also available, which helps for operator swaps and punctuation-sensitive mutations. The typed Python AST is richer and more semantically convenient than tree-sitter's generic syntax nodes. Some punctuation-sensitive helpers already exist in the AST layer (e.g., call argument ranges and paren helpers), which may make operators like `arg_removal` easier to port.
+
+**Cons**: these crates are effectively internal Ruff implementation crates, not a stable published library API (`version = "0.0.0"`, `publish = false`). Depending on them directly by git revision would be brittle. In practice, the cleaner adoption path would likely be to vendor or fork the parser into irradiate and maintain it ourselves. That is operationally reasonable, but it changes the ownership model: we would need to track new Python syntax, decide our supported Python-version matrix explicitly, and periodically sync upstream parser fixes when they matter to us. It's also still an AST, not a full CST — we'd rely on source slices and token ranges for exact text preservation rather than reconstructing formatting from nodes.
+
+The licensing side is not the blocker here: Astral's projects are permissively licensed, so maintaining a fork is feasible. The real question is product and release discipline, not legal permission.
+
+From a packaging perspective, vendoring/forking is actually more attractive than depending on unpublished internal crates. If irradiate eventually ships as a PyPI package with Python bindings and maybe also as a reusable Rust crate, a self-contained parser dependency story matters:
+
+- **PyPI**: users care that `pip install irradiate` works; they do not care whether the parser originated in Ruff, tree-sitter, or a local fork. A vendored parser is fine here.
+- **crates.io / embeddable Rust library**: depending on unpublished internal crates by `git` or `path` is awkward for a library we want other Rust projects to consume. A vendored parser inside the irradiate workspace is much easier to ship and support.
+- **Python bindings**: if we expose irradiate through PyO3/maturin later, the parser choice is largely internal. What matters is that the Rust core remains self-contained and has a stable API boundary.
+
+In other words: if we choose the Ruff parser, we should treat it less like "take an external dependency" and more like "adopt and own a parser subsystem".
+
+### Option D: Two-pass approach — tree-sitter for positions, libcst for structure
 
 Use tree-sitter to get byte ranges for all expressions and statements. Use libcst to get structural information (operator types, child relationships). Merge the two by matching nodes.
 
 **Pros**: best of both worlds — accurate positions + rich structural types.
 **Cons**: complexity of maintaining two parsers and correlating their outputs. Fragile if the grammars disagree on boundaries.
 
-### Option D: Direct regex/text-pattern mutation (no CST)
+### Option E: Direct regex/text-pattern mutation (no CST)
 
 Some mutation testing tools (e.g., mutant in Ruby, stryker for JS) use regex patterns and text transformations rather than full parsing. For example: find `and` keyword tokens, replace with `or`. Use a tokenizer to avoid matching inside strings/comments.
 
@@ -178,6 +209,20 @@ Some mutation testing tools (e.g., mutant in Ruby, stryker for JS) use regex pat
 
 ### Recommendation
 
-**Option B (tree-sitter) is the most promising long-term path.** It eliminates the root cause rather than patching symptoms. The migration could be incremental: add tree-sitter as a parallel parser, migrate one operator at a time, remove libcst when complete. The byte-range-on-every-node property makes position computation trivial and eliminates an entire class of bugs.
+**Option B (tree-sitter) and Option C (Astral/Ruff parser) are the most credible long-term paths.** Both eliminate the root cause by giving us exact source ranges on parsed nodes instead of forcing text search over `libcst` codegen output.
 
-The main risk is whether tree-sitter-python's grammar exposes enough structural detail for operators like `arg_removal` and `match_case_removal`. Worth prototyping with those two operators first to validate feasibility before committing to a full migration.
+If we optimize for ecosystem stability and embeddability, tree-sitter is the safer bet. If we optimize for Python-specific structure plus exact byte spans, Ruff's parser may be the better technical fit, but only if we are willing to vendor/fork it and own that decision as part of irradiate's release process.
+
+That tradeoff is especially important if the long-term goal is "install like mutmut": a PyPI package, optional Python bindings, and possibly a reusable Rust crate. Tree-sitter keeps the dependency story simpler. Ruff's parser can still fit that goal, but the sustainable version of that plan is to absorb it into irradiate rather than depending on Astral's unpublished internal crates as if they were a stable library.
+
+Worth prototyping with `arg_removal` and `match_case_removal` first in either stack. Those operators exercise the hardest combination of requirements: exact spans, punctuation awareness, and enough structural information to rebuild valid source without falling back to brittle whole-function search.
+
+### Decision
+
+**Choose tree-sitter.**
+
+Ruff's parser is attractive on technical grounds: typed Python AST, exact byte spans, and token ranges. If irradiate were an internal tool with no packaging constraints, it would be a strong contender. But irradiate is intended to be a public tool that should eventually be easy to install from PyPI, may grow Python bindings, and may also want to expose a reusable Rust core. In that context, tree-sitter is the better fit.
+
+The reason is not that Ruff's parser lacks capability; it is that tree-sitter is designed to be embedded as a stable parser dependency, while Ruff's parser crates are internal implementation crates. Choosing Ruff would effectively mean adopting and maintaining a parser subsystem inside irradiate. That is feasible, but it is not free, and it widens the scope of the project in a way that is orthogonal to mutation testing itself.
+
+tree-sitter gives us the key property we actually need — exact byte ranges on syntax nodes — without forcing us into parser ownership. It has a mature Rust API, broad ecosystem adoption, and a cleaner dependency story for binary distribution, PyPI packaging, and any future crate consumers. For irradiate as a product, that makes it the better long-term choice.
