@@ -10,36 +10,35 @@
 #
 # Environment overrides:
 #   BENCH_RUNS=N    number of timed runs (default: 3)
+#   MUTMUT_VERSION  expected mutmut version in bench/.venv (default: 3.5.0)
 #
-# ── APPLES-TO-ORANGES NOTE ──────────────────────────────────────────────────
-# This script compares irradiate against mutmut 2.5.1. These tools use
-# fundamentally different mutation architectures:
+# ── COMPARISON NOTE ─────────────────────────────────────────────────────────
+# This script compares irradiate against the mutmut version installed in
+# bench/.venv (default pin: 3.5.0). These tools use fundamentally different
+# execution models and operator sets:
 #
 #   irradiate   — trampoline-based: all mutant variants compiled into one file,
 #                 switching via a global variable (no per-mutant disk I/O).
 #                 Parsing via libcst (Rust-native, pyo3).
 #
-#   mutmut 2.x  — disk-based: writes mutated source to disk, runs pytest,
-#                 restores original after each mutant. Each mutant involves
-#                 file I/O. Parsing via parso (pure Python AST).
+#   mutmut      — separate implementation with its own worker pool and
+#                 mutant representation. Mutant counts and scheduling behavior
+#                 differ from irradiate.
 #
 # What this means for the numbers:
-#   • irradiate's trampoline eliminates per-mutant disk I/O — a structural
-#     advantage, not just an optimization.
 #   • Operator coverage differs; mutant counts will NOT match between tools.
 #     This is expected and not a bug.
 #   • ms/mutant is the fairest comparison metric (normalizes for count differences).
-#   • We pin mutmut to 2.5.1 — the last stable release. mutmut 3.x crashes on
-#     macOS (set_start_method #466, setproctitle #446).
-#   • mutmut 2.x does NOT use the trampoline architecture mutmut 3.x introduced.
-#     This comparison is disk-based vs trampoline, not old-mutmut vs new-mutmut.
+#   • mutmut defaults to using all CPU cores when --max-children is omitted.
+#     The benchmark forces --max-children 1 for the mutmut single-child row.
 #
 # See bench/README.md for full methodology documentation.
-# ────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$ROOT/bench"
+MUTMUT_VERSION="${MUTMUT_VERSION:-3.5.0}"
 
 # ── Argument parsing ───────────────────────────────────────────────────────
 TARGET="${1:-}"
@@ -213,10 +212,8 @@ else
     echo
 fi
 
-# ── Run mutmut (N children) ───────────────────────────────────────────────
-# mutmut 2.5.1 pinned — see header comment for apples-to-oranges context.
-# mutmut 2.5.1 is sequential (no --max-children) and takes 60+ minutes on
-# CI. Skip on CI by default; set BENCH_MUTMUT=1 to force.
+# ── Run mutmut (1 child) ──────────────────────────────────────────────────
+# Skip on CI by default; set BENCH_MUTMUT=1 to force.
 MUTMUT_PYTHON="$BENCH_DIR/.venv/bin/python"
 MUTMUT_PATH="$BENCH_DIR/.venv/bin:$PATH"
 BENCH_MUTMUT="${BENCH_MUTMUT:-}"
@@ -227,14 +224,14 @@ elif [ ! -x "$MUTMUT_PYTHON" ]; then
     echo "  Run: bash bench/setup.sh" >&2
 else
     CONFIG="mutmut_1c"
-    echo "--- $CONFIG ---"
-    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run )
+    echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION)"
+    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children 1 )
 
     for i in $(seq 1 "$RUNS"); do
         (
             cd "$PROJECT_DIR"
             PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
-                "$MUTMUT_PYTHON" -m mutmut run
+                "$MUTMUT_PYTHON" -m mutmut run --max-children 1
         )
     done
     echo

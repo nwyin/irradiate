@@ -4,6 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MUTMUT_VERSION="${MUTMUT_VERSION:-3.5.0}"
 cd "$ROOT"
 
 echo "=== irradiate benchmark setup ==="
@@ -52,15 +53,14 @@ uv pip install --python .venv/bin/python -e .
 cd "$ROOT"
 echo
 
-# ── 5. mutmut 2.5.1 venv (benchmark comparison) ──────────────────────────
-# We pin to 2.5.1 — the last stable release before the broken 3.x rewrite.
-# mutmut 3.0–3.5 all crash on macOS (set_start_method #466, setproctitle #446).
+# ── 5. mutmut venv (benchmark comparison) ────────────────────────────────
+# Default to the current benchmark pin; override with MUTMUT_VERSION if needed.
 # This venv also gets the synth package installed so mutmut can run its tests.
-echo "[5/7] Setting up bench/.venv (mutmut==2.5.1 for benchmark comparison)..."
+echo "[5/7] Setting up bench/.venv (mutmut==$MUTMUT_VERSION for benchmark comparison)..."
 if [ ! -d bench/.venv ]; then
     uv venv bench/.venv --python python3.12 --seed
 fi
-uv pip install --python bench/.venv/bin/python 'mutmut==2.5.1' pytest hatchling
+uv pip install --python bench/.venv/bin/python "mutmut==$MUTMUT_VERSION" pytest hatchling
 uv pip install --python bench/.venv/bin/python -e bench/targets/synth
 echo
 

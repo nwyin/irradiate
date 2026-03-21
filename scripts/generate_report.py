@@ -319,7 +319,8 @@ def _benchmarks_html(bench_dir: Path) -> str:
     </table>
   </div>
   <p class="bench-note">
-    Note: mutmut 2.5.1 is strictly serial &mdash; it runs one mutant at a time with no parallel execution.
+    Note: the benchmark pins mutmut to the version configured in <code>bench/setup.sh</code>.
+    The <code>mutmut (1c)</code> row is forced to a single child via <code>--max-children 1</code>.
     irradiate pool mode runs multiple pre-warmed pytest workers in parallel;
     irradiate isolate mode spawns a fresh process per mutant (most comparable to mutmut).
     Mutant counts differ between tools due to operator coverage gaps.

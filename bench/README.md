@@ -2,52 +2,38 @@
 
 Scripts to benchmark irradiate on shared Python test targets.
 
-## Architecture comparison (apples-to-oranges)
+## Comparison methodology
 
-This benchmark compares irradiate against **mutmut 2.5.1**. The two tools use
-fundamentally different mutation architectures — the comparison is informative,
-not a direct apples-to-apples speed contest.
+This benchmark compares irradiate against **mutmut 3.5.0** by default. The two
+tools use different execution models and operator sets, so the comparison is
+informative rather than perfectly apples-to-apples.
 
 ### How each tool works
 
-**mutmut 2.x — disk-based mutation**
-- Rewrites mutated source to disk, runs pytest against the modified file,
-  then restores the original. Each mutant incurs file I/O.
-- Parses Python with parso (pure Python AST library).
-- Parallelism via `--max-children N` (multiple pytest subprocesses, each testing
-  one mutant at a time).
+**mutmut 3.5.0**
+- Runs via the mutmut CLI installed in `bench/.venv`.
+- Defaults to using all CPU cores if `--max-children` is omitted.
+- The benchmark currently forces `--max-children 1` so the reported mutmut row
+  is explicitly single-child.
 
-**irradiate — trampoline-based mutation**
+**irradiate**
 - Compiles all function variants (original + all mutants) into a single file at
-  start-up. Mutant switching is a global variable assignment — zero disk I/O per
-  mutant.
+ start-up. Mutant switching is a global variable assignment — zero disk I/O per
+ mutant.
 - Parses Python with libcst (Rust-native, via pyo3).
 - Parallelism via a persistent worker pool (workers stay alive across mutants,
   paying startup cost once per worker rather than once per mutant).
 
 ### What this means for the benchmark numbers
 
-- **Disk I/O**: irradiate's trampoline eliminates per-mutant file writes — a
-  structural advantage, not just an optimization.
 - **Parsing speed**: libcst (Rust-native) vs parso (pure Python) differs in
   baseline parsing cost, though this is a one-time cost per file.
 - **Mutant counts differ**: operator coverage is not identical between tools.
   Counts will NOT match. This is expected.
 - **ms/mutant is the fairest metric**: it normalises for different mutant counts
   and lets you compare efficiency per unit of work.
-- **mutmut 2.x ≠ mutmut 3.x**: mutmut 2.x is disk-based. mutmut 3.x introduced
-  the trampoline architecture — but 3.x crashes on macOS (see below). This
-  comparison is disk-based vs trampoline, not old-mutmut vs new-mutmut.
-
-### Why mutmut 2.5.1 (not 3.x)
-
-mutmut 3.0–3.5 all crash on macOS:
-- Issue #466: `set_start_method` crash at startup
-- Issue #446: `setproctitle` segfaults in forked workers
-
-2.5.1 is the last stable release before the broken 3.x rewrite. The CLI
-interface (`mutmut run --max-children N`) and output format are unchanged,
-so existing result parsing works without modification.
+- **Child count matters**: mutmut defaults to all cores, but the benchmark uses
+  `--max-children 1` for a stable single-child baseline.
 
 ## Setup
 
@@ -62,7 +48,7 @@ This will:
 2. Create `tests/fixtures/simple_project/.venv`
 3. Create `vendor/mutmut/e2e_projects/my_lib/.venv`
 4. Create `bench/targets/synth/.venv`
-5. Create `bench/.venv` with mutmut==2.5.1 + pytest (for benchmark comparison)
+5. Create `bench/.venv` with mutmut==3.5.0 + pytest (for benchmark comparison)
 
 ## Running benchmarks
 
@@ -97,8 +83,7 @@ Results are written to `bench/results/<timestamp>/<target>/`:
 | `irradiate pool (Nw)` | irradiate | Pool mode, all CPU cores |
 | `irradiate pool (1w)` | irradiate | Pool mode, single worker |
 | `irradiate isolate` | irradiate | Isolated subprocess per mutant |
-| `mutmut (Nc)` | mutmut 2.5.1 | All CPU cores (`--max-children N`) |
-| `mutmut (1c)` | mutmut 2.5.1 | Single child process (`--max-children 1`) |
+| `mutmut (1c)` | mutmut 3.5.0 | Single child process (`--max-children 1`) |
 
 ## Measurement methodology
 
