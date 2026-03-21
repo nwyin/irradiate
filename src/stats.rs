@@ -38,6 +38,29 @@ impl TestStats {
             .unwrap_or_default()
     }
 
+    /// Get the test IDs that cover a given function, sorted by ascending duration
+    /// (shortest first). Tests with unknown duration sort last.
+    pub fn tests_for_function_by_duration(&self, func_key: &str) -> Vec<String> {
+        let mut tests = self.tests_for_function(func_key);
+        tests.sort_by(|a, b| {
+            let da = self.duration_by_test.get(a).copied().unwrap_or(f64::MAX);
+            let db = self.duration_by_test.get(b).copied().unwrap_or(f64::MAX);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        tests
+    }
+
+    /// Return all known test IDs sorted by ascending duration.
+    pub fn all_tests_by_duration(&self) -> Vec<String> {
+        let mut tests: Vec<String> = self.duration_by_test.keys().cloned().collect();
+        tests.sort_by(|a, b| {
+            let da = self.duration_by_test.get(a).copied().unwrap_or(f64::MAX);
+            let db = self.duration_by_test.get(b).copied().unwrap_or(f64::MAX);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        tests
+    }
+
     /// Estimate the total duration for running a set of tests.
     pub fn estimated_duration(&self, test_ids: &[String]) -> f64 {
         test_ids
@@ -153,6 +176,60 @@ mod tests {
 
         let duration = stats.estimated_duration(&["test_a".to_string(), "test_b".to_string()]);
         assert!((duration - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tests_for_function_by_duration() {
+        let stats = TestStats {
+            tests_by_function: HashMap::from([(
+                "mod.x_foo".to_string(),
+                vec![
+                    "test_slow".to_string(),
+                    "test_fast".to_string(),
+                    "test_mid".to_string(),
+                ],
+            )]),
+            duration_by_test: HashMap::from([
+                ("test_slow".to_string(), 1.0),
+                ("test_fast".to_string(), 0.01),
+                ("test_mid".to_string(), 0.1),
+            ]),
+            ..Default::default()
+        };
+
+        let sorted = stats.tests_for_function_by_duration("mod.x_foo");
+        assert_eq!(sorted, vec!["test_fast", "test_mid", "test_slow"]);
+    }
+
+    #[test]
+    fn test_tests_for_function_by_duration_unknown_last() {
+        let stats = TestStats {
+            tests_by_function: HashMap::from([(
+                "mod.x_foo".to_string(),
+                vec!["test_known".to_string(), "test_unknown".to_string()],
+            )]),
+            duration_by_test: HashMap::from([("test_known".to_string(), 0.5)]),
+            ..Default::default()
+        };
+
+        let sorted = stats.tests_for_function_by_duration("mod.x_foo");
+        assert_eq!(sorted, vec!["test_known", "test_unknown"]);
+    }
+
+    #[test]
+    fn test_all_tests_by_duration() {
+        let stats = TestStats {
+            tests_by_function: HashMap::new(),
+            duration_by_test: HashMap::from([
+                ("test_slow".to_string(), 1.0),
+                ("test_fast".to_string(), 0.01),
+                ("test_mid".to_string(), 0.1),
+            ]),
+            ..Default::default()
+        };
+
+        let sorted = stats.all_tests_by_duration();
+        assert_eq!(sorted, vec!["test_fast", "test_mid", "test_slow"]);
     }
 
     #[test]

@@ -158,7 +158,8 @@ def make_item(nodeid):
     return item
 
 
-def test_prepare_items_sorts_by_collection_order():
+def test_prepare_items_preserves_received_order():
+    """_prepare_items must preserve the order of test_ids from the orchestrator."""
     plugin = make_plugin()
     plugin.items = {
         "tests/test_mod.py::test_b": make_item("tests/test_mod.py::test_b"),
@@ -169,11 +170,12 @@ def test_prepare_items_sorts_by_collection_order():
         "tests/test_mod.py::test_b": 1,
     }
 
+    # Pass test_b before test_a — order should be preserved (not re-sorted)
     items = plugin._prepare_items(["tests/test_mod.py::test_b", "tests/test_mod.py::test_a"])
 
     assert [item.nodeid for item in items] == [
-        "tests/test_mod.py::test_a",
         "tests/test_mod.py::test_b",
+        "tests/test_mod.py::test_a",
     ]
 
 
@@ -214,3 +216,67 @@ def test_reset_run_state_clears_plugin_fields():
     assert plugin.current_run_nodeids == set()
     assert plugin.current_item_nodeid is None
     assert plugin.current_run_reports == []
+
+
+# ---------------------------------------------------------------------------
+# _run_items_via_hooks: nextitem passing
+# ---------------------------------------------------------------------------
+
+
+def test_run_items_via_hooks_passes_real_nextitem():
+    """_run_items_via_hooks must pass real nextitem for all but the last item."""
+    plugin = make_plugin()
+    plugin.current_run_mutant = "mod.x_func__irradiate_1"
+
+    item_a = make_item("tests/test_mod.py::test_a")
+    item_b = make_item("tests/test_mod.py::test_b")
+    item_c = make_item("tests/test_mod.py::test_c")
+
+    protocol_calls = []
+
+    def fake_protocol(item, nextitem):
+        protocol_calls.append((item.nodeid, nextitem.nodeid if nextitem else None))
+        return True
+
+    config_mock = MagicMock()
+    config_mock.hook.pytest_runtest_protocol.side_effect = fake_protocol
+    item_a.config = config_mock
+    item_b.config = config_mock
+    item_c.config = config_mock
+
+    result = plugin._run_items_via_hooks([item_a, item_b, item_c])
+
+    assert result == 0
+    assert len(protocol_calls) == 3
+    assert protocol_calls[0] == ("tests/test_mod.py::test_a", "tests/test_mod.py::test_b")
+    assert protocol_calls[1] == ("tests/test_mod.py::test_b", "tests/test_mod.py::test_c")
+    assert protocol_calls[2] == ("tests/test_mod.py::test_c", None)
+
+
+def test_run_items_via_hooks_early_exit_nextitem():
+    """On early exit, the failed item should have had nextitem set to the real next item."""
+    plugin = make_plugin()
+    plugin.current_run_mutant = "mod.x_func__irradiate_1"
+
+    item_a = make_item("tests/test_mod.py::test_a")
+    item_b = make_item("tests/test_mod.py::test_b")
+
+    protocol_calls = []
+
+    def fake_protocol_fail_on_a(item, nextitem):
+        protocol_calls.append((item.nodeid, nextitem.nodeid if nextitem else None))
+        if item.nodeid == "tests/test_mod.py::test_a":
+            report = MagicMock(nodeid="tests/test_mod.py::test_a", failed=True)
+            plugin.current_run_reports.append(report)
+        return True
+
+    config_mock = MagicMock()
+    config_mock.hook.pytest_runtest_protocol.side_effect = fake_protocol_fail_on_a
+    item_a.config = config_mock
+    item_b.config = config_mock
+
+    result = plugin._run_items_via_hooks([item_a, item_b])
+
+    assert result == 1
+    assert len(protocol_calls) == 1
+    assert protocol_calls[0] == ("tests/test_mod.py::test_a", "tests/test_mod.py::test_b")

@@ -151,20 +151,21 @@ class MutationWorkerPlugin:
         self.current_run_reports = []
 
     def _prepare_items(self, test_ids):
-        items = [self.items[tid] for tid in test_ids if tid in self.items]
-        items.sort(key=lambda item: self.item_order.get(item.nodeid, sys.maxsize))
-        return items
+        # Preserve order from orchestrator (sorted by duration for fail-fast)
+        return [self.items[tid] for tid in test_ids if tid in self.items]
 
     def _run_items_via_hooks(self, items):
         self.current_run_nodeids = {item.nodeid for item in items}
 
-        for item in items:
+        for i, item in enumerate(items):
             self.current_item_nodeid = item.nodeid
             start_idx = len(self.current_run_reports)
 
-            # Safety-first phase: treat each item as a teardown boundary. This
-            # avoids relying on private setup state when a mutant is killed.
-            item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
+            # Pass the real next item so pytest only tears down fixtures that
+            # the next item doesn't share (session, module, class scopes).
+            # Last item gets None → full teardown before next mutant.
+            nextitem = items[i + 1] if i + 1 < len(items) else None
+            item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
 
             item_reports = self.current_run_reports[start_idx:]
             if reports_indicate_failure(item_reports):

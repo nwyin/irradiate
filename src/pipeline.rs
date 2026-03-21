@@ -200,13 +200,13 @@ pub async fn run(config: RunConfig) -> Result<()> {
                     .rsplit_once("__irradiate_")
                     .map(|(prefix, _)| prefix)
                     .unwrap_or(mutant_name);
-                let tests = stats.tests_for_function(func_key);
+                let tests = stats.tests_for_function_by_duration(func_key);
                 if tests.is_empty() && config.covered_only {
                     return None; // skip uncovered
                 }
                 if tests.is_empty() {
-                    // No coverage info — run all tests
-                    stats.duration_by_test.keys().cloned().collect()
+                    // No coverage info — run all tests (shortest first for fail-fast)
+                    stats.all_tests_by_duration()
                 } else {
                     tests
                 }
