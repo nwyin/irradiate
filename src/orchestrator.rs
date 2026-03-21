@@ -85,6 +85,7 @@ enum WorkerEvent {
 pub async fn run_worker_pool(
     config: &PoolConfig,
     work_items: Vec<WorkItem>,
+    progress: Option<crate::progress::ProgressBar>,
 ) -> Result<Vec<MutantResult>> {
     if work_items.is_empty() {
         return Ok(vec![]);
@@ -126,6 +127,7 @@ pub async fn run_worker_pool(
         config,
         &harness_dir,
         &socket_path,
+        progress,
     )
     .await?;
 
@@ -311,6 +313,7 @@ async fn dispatch_work(
     config: &PoolConfig,
     harness_dir: &Path,
     socket_path: &Path,
+    mut progress: Option<crate::progress::ProgressBar>,
 ) -> Result<Vec<MutantResult>> {
     let total_items = work_items.len();
     let mut results: Vec<MutantResult> = Vec::with_capacity(total_items);
@@ -369,7 +372,9 @@ async fn dispatch_work(
                         warn!("Worker {worker_id} channel closed while dispatching");
                         // Put the work item back
                         if let Some(mutant_name) = active_mutants.remove(&worker_id) {
-                            // We lost this work item — record as error
+                            if let Some(ref mut pb) = progress {
+                                pb.record(MutantStatus::Error);
+                            }
                             results.push(MutantResult {
                                 mutant_name,
                                 exit_code: -1,
@@ -407,6 +412,9 @@ async fn dispatch_work(
                 work_queue.len()
             );
             for item in work_queue.drain(..).rev() {
+                if let Some(ref mut pb) = progress {
+                    pb.record(MutantStatus::Error);
+                }
                 results.push(MutantResult {
                     mutant_name: item.mutant_name,
                     exit_code: -1,
@@ -523,6 +531,9 @@ async fn dispatch_work(
                             result.mutant_name, result.status, result.duration
                         );
                         active_mutants.remove(&worker_id);
+                        if let Some(ref mut pb) = progress {
+                            pb.record(result.status);
+                        }
                         results.push(result);
 
                         let count = worker_recycle_counts.entry(worker_id).or_insert(0);
@@ -569,6 +580,9 @@ async fn dispatch_work(
                     }) => {
                         error!("Worker {worker_id} error: {message}");
                         if let Some(mutant_name) = mutant.or_else(|| active_mutants.remove(&worker_id)) {
+                            if let Some(ref mut pb) = progress {
+                                pb.record(MutantStatus::Error);
+                            }
                             results.push(MutantResult {
                                 mutant_name,
                                 exit_code: -1,
@@ -589,6 +603,9 @@ async fn dispatch_work(
                             warn!("Worker {worker_id} disconnected unexpectedly");
                             // Record any active mutant as error
                             if let Some(mutant_name) = active_mutants.remove(&worker_id) {
+                                if let Some(ref mut pb) = progress {
+                                    pb.record(MutantStatus::Error);
+                                }
                                 results.push(MutantResult {
                                     mutant_name,
                                     exit_code: -1,
@@ -618,6 +635,9 @@ async fn dispatch_work(
                         // All event_tx clones dropped — all worker tasks finished
                         warn!("All worker tasks finished");
                         for (_, mutant_name) in active_mutants.drain() {
+                            if let Some(ref mut pb) = progress {
+                                pb.record(MutantStatus::Error);
+                            }
                             results.push(MutantResult {
                                 mutant_name,
                                 exit_code: -1,
@@ -664,6 +684,10 @@ async fn dispatch_work(
     // Wait for processes to exit
     for mut proc in processes {
         let _ = tokio::time::timeout(Duration::from_secs(5), proc.wait()).await;
+    }
+
+    if let Some(pb) = progress {
+        pb.finish();
     }
 
     Ok(results)

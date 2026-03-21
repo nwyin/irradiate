@@ -307,7 +307,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 max_worker_memory_mb: config.max_worker_memory_mb,
                 ..Default::default()
             };
-            run_worker_pool(&pool_config, execution_work).await?
+            let progress = crate::progress::ProgressBar::new(total_mutants);
+            run_worker_pool(&pool_config, execution_work, Some(progress)).await?
         };
 
         let cache_keys_by_mutant: HashMap<String, String> = covered_work
