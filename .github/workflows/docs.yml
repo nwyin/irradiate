@@ -1,4 +1,4 @@
-name: Report
+name: Docs & Report
 
 on:
   push:
@@ -46,12 +46,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # --- Docs ---
+      - name: Install docs dependencies
+        run: uv pip install --system -r requirements-docs.txt
+
+      - name: Build docs
+        run: mkdocs build --strict || mkdocs build  # --strict may fail until all pages exist
+
+      # --- Report ---
       - name: Set up fixture venv
         run: cd tests/fixtures/simple_project && uv venv --python 3.12 --clear && uv pip install pytest
-
-      # Tests are already covered by the CI workflow — skip here to avoid the
-      # release-build timing sensitivity that causes flaky failures.
-      # The fixture venv is still needed for bench/vendor steps below.
 
       # Benchmarks are slow — only run on schedule and workflow_dispatch, not on every push.
       # The report still generates with placeholder data when bench results are absent.
@@ -64,20 +68,19 @@ jobs:
         run: bash bench/compare.sh synth --runs 1
 
       # Vendor tests: run irradiate on real open-source Python libraries.
-      # bench/setup.sh (run above) already bootstraps corpora and sets up their venvs.
       # Skipped on push to keep CI fast; report shows placeholders when file is absent.
       - name: Run vendor tests
         if: github.event_name != 'push'
         run: bash scripts/run_vendor_tests.sh -o vendor_results.json
 
-      # Generate the report (gracefully handles missing benchmark and vendor data)
+      # Generate the report into site/report/ so it's a subpath of the docs site
       - name: Generate report
-        run: uv run --python 3.12 scripts/generate_report.py -o report/index.html --vendor-results vendor_results.json
+        run: uv run --python 3.12 scripts/generate_report.py -o site/report/index.html --vendor-results vendor_results.json
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: report
+          path: site
 
   deploy:
     needs: build
