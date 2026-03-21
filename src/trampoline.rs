@@ -64,10 +64,10 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
 
     // Trampoline wrapper with original name and signature.
     // Since all decorated functions are skipped, only two cases remain:
-    //   - Regular instance method: pass self; look up via type(self). for MRO-correct access.
+    //   - Regular instance method: pass self; look up via _type(self). for MRO-correct access.
     //   - Top-level function: bare names are in module scope, no implicit first arg.
     let (self_arg, has_self, lookup_prefix) = if fm.class_name.is_some() {
-        ("self", true, "type(self).".to_string())
+        ("self", true, "_type(self).".to_string())
     } else {
         ("None", false, String::new())
     };
@@ -131,7 +131,8 @@ fn generate_wrapper_function(
     };
 
     // lookup_prefix controls how mangled names are resolved:
-    //   instance method  → "type(self)." (class attribute via MRO)
+    //   instance method  → "_type(self)." (class attribute via MRO; uses module-level
+    //                       _type=type alias to avoid shadowing by parameter names like `type`)
     //   classmethod      → "cls."        (cls IS the class)
     //   staticmethod     → "ClassName."  (no implicit arg; use class name directly)
     //   top-level fn     → ""            (module globals are directly accessible)
@@ -156,16 +157,28 @@ fn generate_wrapper_function(
 
 /// Strip inline comments from a params source string (line by line).
 /// This handles `# type: ignore[override]` and similar annotations.
+/// Must be string-aware: `fill_char: str = "#"` is NOT a comment.
 fn strip_inline_comments(s: &str) -> String {
     s.lines()
         .map(|line| {
-            // Strip everything after the first '#' on each line.
-            // Per task spec, we don't need to handle '#' inside string literals.
-            if let Some(pos) = line.find('#') {
-                &line[..pos]
-            } else {
-                line
+            // Find the first `#` that is NOT inside a string literal.
+            let mut in_single = false;
+            let mut in_double = false;
+            let mut escape = false;
+            for (i, ch) in line.char_indices() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escape = true,
+                    '\'' if !in_double => in_single = !in_single,
+                    '"' if !in_single => in_double = !in_double,
+                    '#' if !in_single && !in_double => return &line[..i],
+                    _ => {}
+                }
             }
+            line
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -329,6 +342,7 @@ fn rename_function(source: &str, old_name: &str, new_name: &str) -> String {
 /// Generate the trampoline implementation that gets prepended to mutated files.
 pub fn trampoline_impl() -> &'static str {
     r#"import irradiate_harness as _ih
+_type = type
 
 
 def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None, args=None):
@@ -611,7 +625,7 @@ mod tests {
         );
     }
 
-    // INV-1: Class method wrapper must use `type(self).` prefix for mangled name lookups.
+    // INV-1: Class method wrapper must use `_type(self).` prefix for mangled name lookups.
     // Without this, Python raises NameError because class body names are NOT in scope
     // for methods — they are class attributes, not locals or globals.
     #[test]
@@ -625,8 +639,8 @@ mod tests {
             .expect("should find class method");
         let output = generate_trampoline(class_fm, "point_module");
         assert!(
-            output.wrapper_code.contains("type(self)."),
-            "Class method wrapper must use type(self). prefix for mangled lookups; got:\n{}",
+            output.wrapper_code.contains("_type(self)."),
+            "Class method wrapper must use _type(self). prefix for mangled lookups; got:\n{}",
             output.wrapper_code
         );
         // Should NOT use bare mangled name (would NameError at runtime)
@@ -641,7 +655,7 @@ mod tests {
 
     // INV-2: Inheritance works — type(self) uses MRO so Child inheriting from Point
     // uses Child's class dict first (which inherits Point's mangled attrs).
-    // This is verified by checking `type(self).` is used rather than `Point.` (hardcoded).
+    // This is verified by checking `_type(self).` is used rather than `Point.` (hardcoded).
     #[test]
     fn test_class_method_wrapper_not_hardcoded_class_name() {
         let source = "class MyClass:\n    def method(self, v):\n        return v + 1\n";
@@ -651,20 +665,20 @@ mod tests {
             .find(|fm| fm.class_name.is_some())
             .expect("should find class method");
         let output = generate_trampoline(class_fm, "mod");
-        // type(self). is used — not the literal class name
+        // _type(self). is used — not the literal class name
         assert!(
-            output.wrapper_code.contains("type(self)."),
-            "Class method wrapper must use type(self). not hardcoded class name; got:\n{}",
+            output.wrapper_code.contains("_type(self)."),
+            "Class method wrapper must use _type(self). not hardcoded class name; got:\n{}",
             output.wrapper_code
         );
         assert!(
             !output.wrapper_code.contains("MyClass.x"),
-            "Class method wrapper must use type(self). not 'MyClass.x'; got:\n{}",
+            "Class method wrapper must use _type(self). not 'MyClass.x'; got:\n{}",
             output.wrapper_code
         );
     }
 
-    // INV-3: Top-level function wrapper still uses bare names (no type(self). prefix).
+    // INV-3: Top-level function wrapper still uses bare names (no _type(self). prefix).
     #[test]
     fn test_top_level_wrapper_no_type_self_prefix() {
         let source = "def add(a, b):\n    return a + b\n";
@@ -672,8 +686,8 @@ mod tests {
         assert!(!fms.is_empty());
         let output = generate_trampoline(&fms[0], "my_lib");
         assert!(
-            !output.wrapper_code.contains("type(self)."),
-            "Top-level wrapper must NOT use type(self). prefix; got:\n{}",
+            !output.wrapper_code.contains("_type(self)."),
+            "Top-level wrapper must NOT use _type(self). prefix; got:\n{}",
             output.wrapper_code
         );
     }
@@ -839,7 +853,7 @@ mod tests {
         assert!(!fms.is_empty(), "plain method must produce mutations");
     }
 
-    // INV-3: Instance method without decorator uses type(self). prefix (regression check).
+    // INV-3: Instance method without decorator uses _type(self). prefix (regression check).
     #[test]
     fn test_instance_method_still_uses_type_self_prefix() {
         let source = "class Foo:\n    def method(self, v):\n        return v + 1\n";
@@ -847,8 +861,8 @@ mod tests {
         let fm = fms.iter().find(|f| f.name == "method").expect("should find method");
         let output = generate_trampoline(fm, "foo_module");
         assert!(
-            output.wrapper_code.contains("type(self)."),
-            "instance method must still use type(self). prefix; got:\n{}",
+            output.wrapper_code.contains("_type(self)."),
+            "instance method must still use _type(self). prefix; got:\n{}",
             output.wrapper_code
         );
         assert!(

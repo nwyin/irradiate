@@ -77,13 +77,26 @@ pub fn collect_stats(
         .output()
         .context("Failed to run pytest for stats collection")?;
 
-    if !output.status.success() {
+    // Pytest exit codes:
+    //   0 = all tests passed
+    //   1 = tests collected and ran, but some failed
+    //   2 = interrupted
+    //   3 = internal error
+    //   4 = usage error
+    //   5 = no tests collected
+    // Exit code 1 is expected for projects with pre-existing test failures.
+    // The stats plugin writes its output in pytest_sessionfinish which runs
+    // regardless of test outcome, so we only need tests to be collected/run.
+    let exit_code = output.status.code().unwrap_or(-1);
+    if exit_code > 1 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         anyhow::bail!(
-            "Stats collection failed (exit code {:?}):\nstdout: {stdout}\nstderr: {stderr}",
-            output.status.code()
+            "Stats collection failed (exit code {exit_code}):\nstdout: {stdout}\nstderr: {stderr}",
         );
+    }
+    if exit_code == 1 {
+        info!("Stats collection completed with some test failures (exit code 1) — this is OK");
     }
 
     info!(

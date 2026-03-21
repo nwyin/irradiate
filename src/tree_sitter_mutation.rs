@@ -1185,6 +1185,13 @@ fn collect_call_arguments<'a>(args_node: Node<'a>, source: &'a str) -> Vec<CallA
     let mut args = Vec::new();
     let mut cursor = args_node.walk();
     for child in args_node.named_children(&mut cursor) {
+        // tree-sitter marks comments as "extra" nodes; they can appear anywhere
+        // inside an argument list (e.g. `foo(  # type: ignore\n  x, y)`).
+        // Treating them as arguments produces invalid mutations like
+        // `foo(# type: ignore, None, y)` where the comment swallows the closing paren.
+        if child.is_extra() {
+            continue;
+        }
         let text = node_text(source, child);
         args.push(CallArg {
             kind: child.kind(),
@@ -1739,6 +1746,25 @@ mod tests {
             }),
             "tuple() with generator expression should not have arg_removal mutations"
         );
+    }
+
+    #[test]
+    fn tree_sitter_arg_removal_ignores_inline_comments() {
+        // Comments inside argument lists (e.g. `# type: ignore`) are tree-sitter
+        // "extra" nodes. If collected as arguments, arg_removal produces invalid
+        // code like `foo(# type: ignore, None, y)` where the `#` swallows the `)`.
+        let source = "def f(ctx, val):\n    return bar(  # type: ignore\n        ctx, val\n    )\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(!fms.is_empty());
+        for m in &fms[0].mutations {
+            if m.operator == "arg_removal" {
+                assert!(
+                    !m.replacement.contains('#'),
+                    "arg_removal must not include comments in replacement: {}",
+                    m.replacement
+                );
+            }
+        }
     }
 
 }

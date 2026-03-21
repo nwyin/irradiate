@@ -993,12 +993,25 @@ async fn validate_clean_run(
         }
     };
 
-    if !status.success() {
+    // Pytest exit codes:
+    //   0 = all tests passed
+    //   1 = tests collected and ran, but some failed (pre-existing failures)
+    //   2+ = interrupted / internal error / usage error / no tests collected
+    // Exit code 1 is expected for projects with pre-existing test failures.
+    // The clean test validates that trampolining doesn't completely break
+    // the project — pre-existing failures are OK.
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code > 1 {
         let stdout_bytes = stdout_task.await.unwrap_or_default();
         let stderr_bytes = stderr_task.await.unwrap_or_default();
         let stdout = String::from_utf8_lossy(&stdout_bytes);
         let stderr = String::from_utf8_lossy(&stderr_bytes);
         bail!("Clean test run failed:\n{stdout}\n{stderr}");
+    }
+    if exit_code == 1 {
+        let stdout_bytes = stdout_task.await.unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        eprintln!("Warning: some tests failed during clean test run (pre-existing failures)\n{stdout}");
     }
 
     Ok(())
@@ -2261,7 +2274,9 @@ mod tests {
 
     /// validate_clean_run returns Err when any test fails.
     #[tokio::test]
-    async fn test_validate_clean_run_fails_for_failing_tests() {
+    async fn test_validate_clean_run_tolerates_failing_tests() {
+        // Exit code 1 (tests ran but some failed) is tolerated — projects may have
+        // pre-existing failures that are unrelated to trampolining.
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
         std::fs::write(
@@ -2272,14 +2287,36 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        // paths_to_mutate parent doesn't matter for this test — no imports needed
+        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let tmp_mutants = tempfile::tempdir().unwrap();
+
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
+        assert!(
+            result.is_ok(),
+            "Pre-existing test failures (exit code 1) should be tolerated: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_clean_run_rejects_collection_errors() {
+        // Exit code 2+ (import errors, no tests collected, etc.) should still fail.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("tests")).unwrap();
+        std::fs::write(
+            project.path().join("tests/test_broken.py"),
+            "import nonexistent_module_xyz\ndef test_something():\n    pass\n",
+        )
+        .unwrap();
+
+        let python = subprocess_fixture_python();
+        let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
         assert!(
             result.is_err(),
-            "Project with failing tests should return Err from validate_clean_run"
+            "Collection errors (exit code 2+) should cause validate_clean_run to return Err"
         );
     }
 
@@ -2387,12 +2424,14 @@ mod tests {
     /// failures are actionable. Pytest output (e.g. 'assert False') must appear in
     /// the returned Err.
     #[tokio::test]
-    async fn test_validate_clean_run_includes_output_on_failure() {
+    async fn test_validate_clean_run_error_includes_output() {
+        // When the clean test fails with exit code 2+ (e.g., import error),
+        // the error message should include pytest output for debugging.
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join("tests")).unwrap();
         std::fs::write(
             project.path().join("tests/test_bad.py"),
-            "def test_always_fails():\n    assert False\n",
+            "import nonexistent_module_xyz_abc\ndef test_something():\n    pass\n",
         )
         .unwrap();
 
@@ -2402,11 +2441,11 @@ mod tests {
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
-        assert!(result.is_err(), "Failing test should cause validate_clean_run to return Err");
+        assert!(result.is_err(), "Collection error should cause validate_clean_run to return Err");
 
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
-            err_msg.contains("assert False") || err_msg.contains("AssertionError") || err_msg.contains("FAILED"),
+            err_msg.contains("nonexistent_module_xyz_abc") || err_msg.contains("ModuleNotFoundError") || err_msg.contains("ERROR"),
             "Error message should contain pytest output: {err_msg}"
         );
     }

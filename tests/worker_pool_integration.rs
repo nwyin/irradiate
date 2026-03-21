@@ -1009,6 +1009,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         isolate: true,
         verify_survivors: false,
         do_not_mutate: vec![],
+        fail_under: None,
     }
 }
 
