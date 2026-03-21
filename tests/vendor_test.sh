@@ -69,13 +69,12 @@ log "markupsafe tests: OK"
 # Clean any prior irradiate run
 rm -rf "$MDIR/mutants" "$MDIR/.irradiate"
 
-# Run irradiate in --isolate mode
+# Run irradiate (trampoline mode — default)
 log "Running irradiate on markupsafe..."
 MARKUPSAFE_OUTPUT=$( cd "$MDIR" && run_with_timeout 600 "$BINARY" run \
     --paths-to-mutate src/markupsafe \
     --tests-dir tests \
     --python .venv/bin/python3 \
-    --isolate \
     --timeout-multiplier 10 2>&1 )
 echo "$MARKUPSAFE_OUTPUT"
 
@@ -140,7 +139,6 @@ run_click() {
         --paths-to-mutate src/click \
         --tests-dir tests \
         --python .venv/bin/python3 \
-        --isolate \
         --timeout-multiplier 10 2>&1 )
     echo "$CLICK_OUTPUT"
 
@@ -197,7 +195,6 @@ run_httpx() {
         --paths-to-mutate httpx \
         --tests-dir tests \
         --python .venv/bin/python3 \
-        --isolate \
         --timeout-multiplier 10 2>&1 )
     echo "$HTTPX_OUTPUT"
 
