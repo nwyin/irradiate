@@ -207,4 +207,136 @@ echo "  Harness self-mutation: OK (no panic)"
 rm -rf "$ROOT_DIR/mutants" "$ROOT_DIR/.irradiate"
 
 echo ""
+echo "=== E2E: --diff incremental mode ==="
+
+INCR_TMPDIR="$(mktemp -d /tmp/irradiate_incr_XXXXXX)"
+cleanup_incr() { rm -rf "$INCR_TMPDIR"; }
+trap cleanup_incr EXIT
+
+# Create project structure
+mkdir -p "$INCR_TMPDIR/src/math_ops" "$INCR_TMPDIR/tests"
+
+cat > "$INCR_TMPDIR/src/math_ops/__init__.py" << 'PYEOF'
+def add(a, b):
+    return a + b
+
+
+def multiply(a, b):
+    return a * b
+PYEOF
+
+cat > "$INCR_TMPDIR/tests/test_math.py" << 'PYEOF'
+from math_ops import add, multiply
+
+
+def test_add():
+    assert add(2, 3) == 5
+    assert add(0, 0) == 0
+
+
+def test_multiply():
+    assert multiply(2, 3) == 6
+    assert multiply(0, 5) == 0
+PYEOF
+
+cat > "$INCR_TMPDIR/pyproject.toml" << 'PYEOF'
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "math_ops"
+version = "0.1.0"
+PYEOF
+
+# Set up Python venv
+(cd "$INCR_TMPDIR" && uv venv --python 3.12 -q && uv pip install pytest -q)
+
+# Initialize git repo and make initial commit
+git -C "$INCR_TMPDIR" init -q
+git -C "$INCR_TMPDIR" config user.email "test@example.com"
+git -C "$INCR_TMPDIR" config user.name "Test"
+git -C "$INCR_TMPDIR" add .
+git -C "$INCR_TMPDIR" commit -qm "initial"
+INITIAL_BRANCH=$(git -C "$INCR_TMPDIR" rev-parse --abbrev-ref HEAD)
+
+# Run full mutation test for comparison baseline (on initial commit)
+FULL_OUTPUT=$( cd "$INCR_TMPDIR" && \
+    "$BINARY" run \
+    --paths-to-mutate src \
+    --tests-dir tests \
+    --python .venv/bin/python3 2>&1 )
+echo "$FULL_OUTPUT"
+FULL_RESULTS=$( cd "$INCR_TMPDIR" && "$BINARY" results --all 2>&1 )
+FULL_TOTAL=$(echo "$FULL_RESULTS" | grep -cE "🎉|🙁" || true)
+echo "  Full run (initial) total mutants: $FULL_TOTAL"
+
+if [ "$FULL_TOTAL" -lt 1 ]; then
+    echo "FAIL: Full run produced no mutants"
+    exit 1
+fi
+
+# Create branch, modify add() to have more operators (keeps tests passing)
+git -C "$INCR_TMPDIR" checkout -qb feature
+cat > "$INCR_TMPDIR/src/math_ops/__init__.py" << 'PYEOF'
+def add(a, b):
+    result = a + b
+    check = result > 0
+    return result
+
+
+def multiply(a, b):
+    return a * b
+PYEOF
+git -C "$INCR_TMPDIR" commit -qam "modify add"
+
+# Run incremental mutation test (--diff <initial_branch>)
+rm -rf "$INCR_TMPDIR/mutants" "$INCR_TMPDIR/.irradiate"
+INCR_OUTPUT=$( cd "$INCR_TMPDIR" && \
+    "$BINARY" run \
+    --paths-to-mutate src \
+    --tests-dir tests \
+    --python .venv/bin/python3 \
+    --diff "$INITIAL_BRANCH" 2>&1 )
+echo "$INCR_OUTPUT"
+INCR_RESULTS=$( cd "$INCR_TMPDIR" && "$BINARY" results --all 2>&1 )
+INCR_TOTAL=$(echo "$INCR_RESULTS" | grep -cE "🎉|🙁" || true)
+echo "  Incremental run total mutants: $INCR_TOTAL"
+
+# Also run a full mutation test on the modified branch for comparison
+rm -rf "$INCR_TMPDIR/mutants" "$INCR_TMPDIR/.irradiate"
+MODIFIED_FULL_OUTPUT=$( cd "$INCR_TMPDIR" && \
+    "$BINARY" run \
+    --paths-to-mutate src \
+    --tests-dir tests \
+    --python .venv/bin/python3 2>&1 )
+MODIFIED_FULL_RESULTS=$( cd "$INCR_TMPDIR" && "$BINARY" results --all 2>&1 )
+MODIFIED_FULL_TOTAL=$(echo "$MODIFIED_FULL_RESULTS" | grep -cE "🎉|🙁" || true)
+echo "  Full run (modified branch) total mutants: $MODIFIED_FULL_TOTAL"
+
+# INV-1: Incremental run produces fewer mutants than full run on same branch
+if [ "$INCR_TOTAL" -ge "$MODIFIED_FULL_TOTAL" ]; then
+    echo "FAIL: INV-1: Incremental run ($INCR_TOTAL mutants) should be less than full run ($MODIFIED_FULL_TOTAL mutants)"
+    exit 1
+fi
+echo "  INV-1: incremental < full: OK ($INCR_TOTAL < $MODIFIED_FULL_TOTAL)"
+
+# INV-2: No multiply() mutants in incremental run (multiply was not changed)
+if echo "$INCR_RESULTS" | grep -q "multiply"; then
+    echo "FAIL: INV-2: Incremental run produced mutants for multiply() which was not changed"
+    exit 1
+fi
+echo "  INV-2: no multiply() mutants in incremental run: OK"
+
+# INV-2 (cont): add() mutants must be present in incremental run
+if ! echo "$INCR_RESULTS" | grep -q "add"; then
+    echo "FAIL: INV-2: Incremental run produced no mutants for add() which was changed"
+    exit 1
+fi
+echo "  INV-2: add() mutants present in incremental run: OK"
+
+trap - EXIT
+rm -rf "$INCR_TMPDIR"
+
+echo ""
 echo "=== E2E tests: PASS ==="
