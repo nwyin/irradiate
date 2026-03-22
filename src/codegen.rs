@@ -256,6 +256,7 @@ pub fn mutate_file(
                     replacement: mutation.replacement.clone(),
                     source_file: module_name.to_string(),
                     fn_byte_offset: fm.byte_offset,
+                    fn_start_line: fm.start_line,
                 })
                 .collect::<Vec<_>>()
         })

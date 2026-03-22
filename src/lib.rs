@@ -8,6 +8,7 @@ pub mod orchestrator;
 pub mod pipeline;
 pub mod progress;
 pub mod protocol;
+pub mod report;
 pub mod stats;
 pub mod trace;
 pub mod trampoline;

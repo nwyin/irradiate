@@ -469,6 +469,10 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Print summary
     let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts);
 
+    // Emit GitHub Actions annotations (no-op outside GitHub Actions).
+    let all_descriptors: Vec<_> = generation.descriptors_by_name.values().cloned().collect();
+    crate::report::emit_github_annotations(&results, &all_descriptors, killed, survived);
+
     // INV-1: When fail_under is None, always return Ok(()).
     // INV-4: When no mutants were tested (killed + survived == 0), never fail.
     if let Some(threshold) = config.fail_under {
@@ -914,7 +918,13 @@ fn generate_mutants(
 
             let file_diff_arg = per_file_diff.as_ref().map(|(f, p)| (*f, p.as_path()));
 
-            if let Some(mutated) = mutate_file(&source, &module_name, file_diff_arg) {
+            if let Some(mut mutated) = mutate_file(&source, &module_name, file_diff_arg) {
+                // Patch descriptors with source_file (rel_path relative to strip_base).
+                let source_file_str = rel_path.to_string_lossy().replace('\\', "/");
+                for desc in &mut mutated.descriptors {
+                    desc.source_file = source_file_str.clone();
+                }
+
                 // Write mutated file
                 let dest = mutants_dir.join(rel_path);
                 if let Some(parent) = dest.parent() {

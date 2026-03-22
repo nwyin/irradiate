@@ -24,6 +24,8 @@ pub struct MutantCacheDescriptor {
     /// Byte offset of the function definition start within the source file.
     /// `fn_byte_offset + start` gives the absolute byte position of the mutation in the file.
     pub fn_byte_offset: usize,
+    /// 1-indexed start line of the function in the source file. 0 if unknown.
+    pub fn_start_line: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -301,6 +303,7 @@ mod tests {
             replacement: "-".to_string(),
             source_file: "src/pkg/foo.py".to_string(),
             fn_byte_offset: 0,
+            fn_start_line: 1,
         }
     }
 
