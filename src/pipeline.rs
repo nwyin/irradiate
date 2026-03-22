@@ -48,6 +48,11 @@ pub struct RunConfig {
     /// Use fork-per-mutant execution (default true). Each test run forks the worker,
     /// giving full process isolation. Disable with --no-fork for legacy in-process mode.
     pub fork: bool,
+    /// Report format to generate after the run (e.g. "json" for Stryker-schema JSON).
+    /// `None` = no report generated.
+    pub report: Option<String>,
+    /// Output path for the report. Defaults to `irradiate-report.<format>`.
+    pub report_output: Option<std::path::PathBuf>,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -466,6 +471,26 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Write .meta files
     write_meta_files(&mutants_dir, &generation.names_by_module, &results)?;
 
+    // Optional: generate Stryker-format report
+    if let Some(ref fmt) = config.report {
+        let output_path = config
+            .report_output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("irradiate-report.{fmt}")));
+        let all_descriptors: Vec<MutantCacheDescriptor> =
+            generation.descriptors_by_name.values().cloned().collect();
+        let report = crate::report::build_stryker_report(
+            &results,
+            &all_descriptors,
+            test_stats.as_ref(),
+            &project_dir,
+            &config.paths_to_mutate,
+        );
+        let json_str = serde_json::to_string_pretty(&report)?;
+        std::fs::write(&output_path, json_str)?;
+        eprintln!("Report written to {}", output_path.display());
+    }
+
     // Print summary
     let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts);
 
@@ -549,11 +574,17 @@ fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResu
 }
 
 /// Display results from previous run.
-pub fn results(show_all: bool, json_output: bool) -> Result<()> {
-    let mutants_dir = std::env::current_dir()?.join("mutants");
+pub fn results(
+    show_all: bool,
+    json_output: bool,
+    report: Option<String>,
+    report_output: Option<PathBuf>,
+) -> Result<()> {
+    let project_dir = std::env::current_dir()?;
+    let mutants_dir = project_dir.join("mutants");
     let all_results = load_all_meta(&mutants_dir)?;
 
-    if all_results.is_empty() && !json_output {
+    if all_results.is_empty() && !json_output && report.is_none() {
         eprintln!("No results found. Run `irradiate run` first.");
         return Ok(());
     }
@@ -561,6 +592,36 @@ pub fn results(show_all: bool, json_output: bool) -> Result<()> {
     if json_output {
         let json_out = build_json_results(&all_results, show_all);
         println!("{}", serde_json::to_string_pretty(&json_out)?);
+        return Ok(());
+    }
+
+    // Generate Stryker-format report from meta files (no descriptor/location info).
+    if let Some(ref fmt) = report {
+        let output_path = report_output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("irradiate-report.{fmt}")));
+        let file_config = crate::config::load_config(&project_dir)?;
+        let paths_to_mutate =
+            PathBuf::from(file_config.paths_to_mutate.unwrap_or_else(|| "src".to_string()));
+        // Load stats for coveredBy if available
+        let stats_path = project_dir.join(".irradiate").join("stats.json");
+        let stats = if stats_path.exists() {
+            crate::stats::TestStats::load(&stats_path).ok()
+        } else {
+            None
+        };
+        // Build MutantResult list from meta files
+        let mutant_results = load_all_meta_as_results(&mutants_dir)?;
+        let report_val = crate::report::build_stryker_report(
+            &mutant_results,
+            &[], // no descriptors available from meta files alone
+            stats.as_ref(),
+            &project_dir,
+            &paths_to_mutate,
+        );
+        let json_str = serde_json::to_string_pretty(&report_val)?;
+        std::fs::write(&output_path, json_str)?;
+        eprintln!("Report written to {}", output_path.display());
         return Ok(());
     }
 
@@ -1340,6 +1401,36 @@ fn load_all_meta(mutants_dir: &Path) -> Result<Vec<(String, i32)>> {
     }
 
     all.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(all)
+}
+
+/// Load all results from .meta files, including durations, as `MutantResult` values.
+/// Used by `results --report` which needs the full result struct.
+fn load_all_meta_as_results(mutants_dir: &Path) -> Result<Vec<MutantResult>> {
+    let mut all = Vec::new();
+    if !mutants_dir.exists() {
+        return Ok(all);
+    }
+
+    for entry in walkdir(mutants_dir)? {
+        if entry.extension().is_some_and(|e| e == "meta") {
+            let content = std::fs::read_to_string(&entry)?;
+            if let Ok(meta) = serde_json::from_str::<FileMeta>(&content) {
+                for (name, exit_code) in &meta.exit_code_by_key {
+                    let duration = meta.durations_by_key.get(name).copied().unwrap_or(0.0);
+                    let status = MutantStatus::from_exit_code(*exit_code, false);
+                    all.push(MutantResult {
+                        mutant_name: name.clone(),
+                        exit_code: *exit_code,
+                        duration,
+                        status,
+                    });
+                }
+            }
+        }
+    }
+
+    all.sort_by(|a, b| a.mutant_name.cmp(&b.mutant_name));
     Ok(all)
 }
 

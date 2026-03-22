@@ -1,18 +1,27 @@
-//! GitHub Actions output: inline annotations and step summary.
+//! Mutation testing reports: GitHub Actions output and Stryker JSON schema v2.
 //!
-//! Both features are auto-detected via environment variables and activate
-//! automatically in GitHub Actions without any user configuration.
+//! ## GitHub Actions (auto-detected)
+//! Both features activate automatically via environment variables.
 //!
 //! - **Tier 1** (`GITHUB_ACTIONS=true`): Emit `::warning` annotation lines for
 //!   survived mutants. GitHub Actions renders these as yellow warning badges
 //!   on the PR "Files changed" tab.
 //! - **Tier 2** (`GITHUB_STEP_SUMMARY` set): Append a Markdown summary table
 //!   to the step summary file.
+//!
+//! ## Stryker mutation-testing-report-schema v2 (`--report json`)
+//! The Stryker schema is the de-facto standard interchange format for mutation
+//! testing reports, consumed by the Stryker Dashboard and various HTML renderers.
+//!
+//! Schema reference: <https://github.com/stryker-mutator/mutation-testing-elements>
 
 use crate::cache::MutantCacheDescriptor;
 use crate::protocol::{MutantResult, MutantStatus};
+use crate::stats::TestStats;
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
+use std::path::Path;
 
 /// Maximum number of `::warning` annotations emitted per step.
 /// GitHub Actions truncates annotation lists beyond this point.
@@ -208,13 +217,210 @@ pub fn build_step_summary(
     Ok(md)
 }
 
+/// Map an irradiate `MutantStatus` to its Stryker schema status string.
+fn stryker_status(status: MutantStatus) -> &'static str {
+    match status {
+        MutantStatus::Killed => "Killed",
+        MutantStatus::Survived => "Survived",
+        MutantStatus::NoTests => "NoCoverage",
+        MutantStatus::Timeout => "Timeout",
+        MutantStatus::TypeCheck | MutantStatus::Error => "RuntimeError",
+    }
+}
+
+/// Build a Stryker mutation-testing-report-schema v2 JSON value from irradiate results.
+///
+/// # Arguments
+/// - `results` — one `MutantResult` per tested mutant
+/// - `descriptors` — rich descriptors with operator, byte spans, and source file.
+///   May be empty (e.g. when called from `irradiate results --report`); in that
+///   case mutants are included with minimal location info.
+/// - `stats` — optional stats from the coverage run; used to populate `coveredBy`
+/// - `project_root` — absolute path to the project root (written into the report)
+/// - `paths_to_mutate` — used to locate source files when `descriptor.source_file`
+///   is not set
+pub fn build_stryker_report(
+    results: &[MutantResult],
+    descriptors: &[MutantCacheDescriptor],
+    stats: Option<&TestStats>,
+    project_root: &Path,
+    paths_to_mutate: &Path,
+) -> serde_json::Value {
+    // Index: mutant_name → descriptor
+    let desc_by_name: HashMap<&str, &MutantCacheDescriptor> =
+        descriptors.iter().map(|d| (d.mutant_name.as_str(), d)).collect();
+
+    // Group mutant entries by relative source file path.
+    // The file key is slash-separated and relative to project_root.
+    let mut file_mutants: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    for result in results {
+        let name = result.mutant_name.as_str();
+        let desc = desc_by_name.get(name).copied();
+
+        // --- Status and timing ---
+        let status_str = stryker_status(result.status);
+        let duration_ms = (result.duration * 1000.0).round() as u64;
+
+        // --- coveredBy (function-level coverage from stats run) ---
+        let covered_by: Vec<serde_json::Value> = if let Some(s) = stats {
+            let func_key = name
+                .rsplit_once("__irradiate_")
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(name);
+            s.tests_for_function(func_key)
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // --- Location ---
+        let location = if let Some(d) = desc {
+            let (rel_start_line, start_col) =
+                crate::codegen::byte_offset_to_location(&d.function_source, d.start);
+            let (rel_end_line, end_col) =
+                crate::codegen::byte_offset_to_location(&d.function_source, d.end);
+            // fn_start_line is 1-indexed; rel_*_line are also 1-indexed relative to function start.
+            let abs_start_line = d.fn_start_line + rel_start_line - 1;
+            let abs_end_line = d.fn_start_line + rel_end_line - 1;
+            serde_json::json!({
+                "start": { "line": abs_start_line, "column": start_col },
+                "end":   { "line": abs_end_line,   "column": end_col }
+            })
+        } else {
+            // Minimal placeholder when no descriptor is available
+            serde_json::json!({
+                "start": { "line": 1, "column": 1 },
+                "end":   { "line": 1, "column": 1 }
+            })
+        };
+
+        // --- Mutator name, replacement, description ---
+        let (mutator_name, replacement, description) = if let Some(d) = desc {
+            (
+                d.operator.clone(),
+                d.replacement.clone(),
+                format!("replaced `{}` with `{}`", d.original, d.replacement),
+            )
+        } else {
+            (
+                "unknown".to_string(),
+                String::new(),
+                "unknown mutation".to_string(),
+            )
+        };
+
+        // --- Source file key (relative to project_root, slash-separated) ---
+        // source_file is already a relative slash-separated path set by the pipeline.
+        let file_key = if let Some(d) = desc {
+            if d.source_file.is_empty() {
+                // source_file was not set; derive from module name
+                derive_file_key_from_name(name, project_root, paths_to_mutate)
+            } else {
+                d.source_file.clone()
+            }
+        } else {
+            derive_file_key_from_name(name, project_root, paths_to_mutate)
+        };
+
+        // --- Build mutant object ---
+        let mut mutant_obj = serde_json::json!({
+            "id": name,
+            "mutatorName": mutator_name,
+            "replacement": replacement,
+            "description": description,
+            "location": location,
+            "status": status_str,
+            "duration": duration_ms,
+        });
+        if !covered_by.is_empty() {
+            mutant_obj["coveredBy"] = serde_json::Value::Array(covered_by);
+        }
+
+        file_mutants.entry(file_key).or_default().push(mutant_obj);
+    }
+
+    // Build the `files` object: file_key → { language, source, mutants }
+    let mut files_obj = serde_json::Map::new();
+    for (file_key, mutants) in file_mutants {
+        let source_path = project_root.join(&file_key);
+        let source = std::fs::read_to_string(&source_path).unwrap_or_default();
+        files_obj.insert(
+            file_key,
+            serde_json::json!({
+                "language": "python",
+                "source": source,
+                "mutants": mutants,
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "schemaVersion": "2",
+        "thresholds": { "high": 80, "low": 60 },
+        "projectRoot": project_root.display().to_string(),
+        "files": serde_json::Value::Object(files_obj),
+        "framework": {
+            "name": "irradiate",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+/// Derive a slash-separated file key from the mutant name (best-effort, no descriptor).
+///
+/// Mutant name format: `module.x_func__irradiate_N`
+/// Module "simple_lib" → check for `paths_to_mutate/simple_lib/__init__.py`
+/// or `paths_to_mutate/simple_lib.py`.
+fn derive_file_key_from_name(name: &str, project_root: &Path, paths_to_mutate: &Path) -> String {
+    let module = name.split('.').next().unwrap_or(name);
+    let module_path = module.replace('.', "/");
+
+    // Resolve paths_to_mutate relative to project_root if needed.
+    let base = if paths_to_mutate.is_absolute() {
+        paths_to_mutate.to_path_buf()
+    } else {
+        project_root.join(paths_to_mutate)
+    };
+
+    // Prefer package (__init__.py) over module file (.py)
+    let init_candidate = base.join(&module_path).join("__init__.py");
+    let mod_candidate = base.join(format!("{module_path}.py"));
+
+    let abs_path = if init_candidate.exists() {
+        init_candidate
+    } else if mod_candidate.exists() {
+        mod_candidate
+    } else {
+        // Fall back to .py path even if it doesn't exist
+        mod_candidate
+    };
+
+    abs_path
+        .strip_prefix(project_root)
+        .unwrap_or(&abs_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::MutantStatus;
 
-    fn make_descriptor(mutant_name: &str, source_file: &str, operator: &str, orig: &str, repl: &str, fn_start_line: usize, offset: usize) -> MutantCacheDescriptor {
-        // function_source has the orig token at `offset`
+    /// Build a MutantCacheDescriptor for GitHub Actions tests.
+    /// function_source is synthesised from `orig` so that `offset` points at it.
+    fn make_descriptor(
+        mutant_name: &str,
+        source_file: &str,
+        operator: &str,
+        orig: &str,
+        repl: &str,
+        fn_start_line: usize,
+        offset: usize,
+    ) -> MutantCacheDescriptor {
         let function_source = format!("def foo():\n    return {orig}\n");
         MutantCacheDescriptor {
             mutant_name: mutant_name.to_string(),
@@ -230,14 +436,51 @@ mod tests {
         }
     }
 
-    fn make_result(name: &str, status: MutantStatus) -> MutantResult {
+    /// Build a MutantCacheDescriptor for Stryker report tests (full control over source).
+    fn make_full_descriptor(
+        mutant_name: &str,
+        function_source: &str,
+        operator: &str,
+        start: usize,
+        end: usize,
+        original: &str,
+        replacement: &str,
+        fn_start_line: usize,
+        source_file: &str,
+    ) -> MutantCacheDescriptor {
+        MutantCacheDescriptor {
+            mutant_name: mutant_name.to_string(),
+            function_source: function_source.to_string(),
+            operator: operator.to_string(),
+            start,
+            end,
+            original: original.to_string(),
+            replacement: replacement.to_string(),
+            fn_start_line,
+            fn_byte_offset: 0,
+            source_file: source_file.to_string(),
+        }
+    }
+
+    fn make_result(name: &str, status: MutantStatus, duration: f64) -> MutantResult {
         MutantResult {
             mutant_name: name.to_string(),
-            exit_code: if status == MutantStatus::Survived { 0 } else { 1 },
-            duration: 0.1,
+            exit_code: match status {
+                MutantStatus::Killed => 1,
+                MutantStatus::Survived => 0,
+                MutantStatus::NoTests => 33,
+                MutantStatus::Timeout => -1,
+                MutantStatus::TypeCheck => 37,
+                MutantStatus::Error => 2,
+            },
+            duration,
             status,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // GitHub Actions tests
+    // -------------------------------------------------------------------------
 
     /// INV-1: No annotations emitted when GITHUB_ACTIONS is not set.
     /// (Tested indirectly — we verify the function is a no-op by checking it
@@ -246,7 +489,7 @@ mod tests {
     fn test_no_annotations_outside_github_actions() {
         // GITHUB_ACTIONS is not "true" in normal test env.
         // This test simply ensures the function doesn't panic or crash.
-        let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Survived)];
+        let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Survived, 0.1)];
         let desc = make_descriptor("mod.x_foo__irradiate_1", "src/mod.py", "binop_swap", "+", "-", 1, 19);
         // Should be a complete no-op (doesn't write anything)
         emit_github_annotations(&results, &[desc], 5, 1);
@@ -259,7 +502,7 @@ mod tests {
     fn test_annotation_cap_at_ten() {
         // Build 15 survived results, verify only 10 would be annotated.
         let survived: Vec<MutantResult> = (1..=15)
-            .map(|i| make_result(&format!("mod.x_foo__irradiate_{i}"), MutantStatus::Survived))
+            .map(|i| make_result(&format!("mod.x_foo__irradiate_{i}"), MutantStatus::Survived, 0.1))
             .collect();
 
         let to_annotate = survived.len().min(MAX_ANNOTATIONS);
@@ -270,8 +513,8 @@ mod tests {
     #[test]
     fn test_step_summary_valid_markdown() {
         let results = vec![
-            make_result("mod.x_add__irradiate_1", MutantStatus::Survived),
-            make_result("mod.x_sub__irradiate_1", MutantStatus::Killed),
+            make_result("mod.x_add__irradiate_1", MutantStatus::Survived, 0.1),
+            make_result("mod.x_sub__irradiate_1", MutantStatus::Killed, 0.1),
         ];
         let descs = vec![
             make_descriptor("mod.x_add__irradiate_1", "src/mod.py", "binop_swap", "+", "-", 2, 19),
@@ -289,7 +532,7 @@ mod tests {
     /// INV-3: Summary still written when no mutants survived.
     #[test]
     fn test_step_summary_no_survivors() {
-        let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Killed)];
+        let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Killed, 0.1)];
         let md = build_step_summary(&results, &[], 1, 0).unwrap();
 
         assert!(md.contains("## Mutation Testing Results"), "heading present");
@@ -338,8 +581,8 @@ mod tests {
     #[test]
     fn test_step_summary_score() {
         let results = vec![
-            make_result("mod.x_a__irradiate_1", MutantStatus::Survived),
-            make_result("mod.x_b__irradiate_1", MutantStatus::Killed),
+            make_result("mod.x_a__irradiate_1", MutantStatus::Survived, 0.1),
+            make_result("mod.x_b__irradiate_1", MutantStatus::Killed, 0.1),
         ];
         let md = build_step_summary(&results, &[], 1, 1).unwrap();
         assert!(md.contains("50.0%"), "50% score shown");
@@ -349,12 +592,182 @@ mod tests {
     #[test]
     fn test_step_summary_counts_no_tests_and_timeout() {
         let results = vec![
-            make_result("mod.x_a__irradiate_1", MutantStatus::NoTests),
-            make_result("mod.x_b__irradiate_1", MutantStatus::Timeout),
-            make_result("mod.x_c__irradiate_1", MutantStatus::Killed),
+            make_result("mod.x_a__irradiate_1", MutantStatus::NoTests, 0.1),
+            make_result("mod.x_b__irradiate_1", MutantStatus::Timeout, 0.1),
+            make_result("mod.x_c__irradiate_1", MutantStatus::Killed, 0.1),
         ];
         let md = build_step_summary(&results, &[], 1, 0).unwrap();
         assert!(md.contains("| No coverage | 1 |"));
         assert!(md.contains("| Timeout | 1 |"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Stryker JSON report tests
+    // -------------------------------------------------------------------------
+
+    /// INV-1: Report always contains schemaVersion "2".
+    #[test]
+    fn test_schema_version_present() {
+        let results = vec![make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1)];
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        assert_eq!(report["schemaVersion"], "2");
+    }
+
+    /// INV-2: All 5 status mappings are correct.
+    #[test]
+    fn test_status_mapping() {
+        assert_eq!(stryker_status(MutantStatus::Killed), "Killed");
+        assert_eq!(stryker_status(MutantStatus::Survived), "Survived");
+        assert_eq!(stryker_status(MutantStatus::NoTests), "NoCoverage");
+        assert_eq!(stryker_status(MutantStatus::Timeout), "Timeout");
+        assert_eq!(stryker_status(MutantStatus::Error), "RuntimeError");
+        assert_eq!(stryker_status(MutantStatus::TypeCheck), "RuntimeError");
+    }
+
+    /// INV-3: Location line/column values are 1-indexed.
+    #[test]
+    fn test_location_is_1indexed() {
+        // "def add(a, b):\n    return a + b\n"
+        // The '+' at 'a + b' on line 2 column 14 (1-indexed).
+        let source = "def add(a, b):\n    return a + b\n";
+        // byte offset of '+': "def add(a, b):\n    return a " = 15+11 = 26 bytes
+        let (line, col) = crate::codegen::byte_offset_to_location(source, 26);
+        assert_eq!(line, 2, "line should be 1-indexed (line 2 = second line)");
+        assert_eq!(col, 12, "column should be 1-indexed");
+    }
+
+    /// INV-4: Every mutant in results appears in the report.
+    #[test]
+    fn test_every_result_in_report() {
+        let results = vec![
+            make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1),
+            make_result("mod.x_g__irradiate_1", MutantStatus::Survived, 0.2),
+        ];
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+
+        // Collect all mutant ids from the report
+        let mut found_ids: Vec<String> = Vec::new();
+        if let Some(files) = report["files"].as_object() {
+            for file_val in files.values() {
+                if let Some(mutants) = file_val["mutants"].as_array() {
+                    for m in mutants {
+                        if let Some(id) = m["id"].as_str() {
+                            found_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        found_ids.sort();
+        assert!(
+            found_ids.contains(&"mod.x_f__irradiate_1".to_string()),
+            "killed mutant must be in report"
+        );
+        assert!(
+            found_ids.contains(&"mod.x_g__irradiate_1".to_string()),
+            "survived mutant must be in report"
+        );
+    }
+
+    /// Report with descriptors: correct status, operator, and description.
+    #[test]
+    fn test_report_with_descriptors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_file = tmp.path().join("core.py");
+        std::fs::write(&src_file, "def add(a, b):\n    return a + b\n").unwrap();
+
+        let results = vec![make_result("core.x_add__irradiate_1", MutantStatus::Killed, 0.05)];
+        let rel_src = src_file
+            .strip_prefix(tmp.path())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let descriptors = vec![make_full_descriptor(
+            "core.x_add__irradiate_1",
+            "def add(a, b):\n    return a + b\n",
+            "binop_swap",
+            26, // offset of '+'
+            27,
+            "+",
+            "-",
+            1,
+            &rel_src,
+        )];
+
+        let report =
+            build_stryker_report(&results, &descriptors, None, tmp.path(), Path::new("src"));
+
+        // schemaVersion
+        assert_eq!(report["schemaVersion"], "2");
+
+        // Find the mutant in files
+        let files = report["files"].as_object().unwrap();
+        let file_entry = files.values().next().unwrap();
+        let mutants = file_entry["mutants"].as_array().unwrap();
+        assert_eq!(mutants.len(), 1);
+        let m = &mutants[0];
+        assert_eq!(m["id"], "core.x_add__irradiate_1");
+        assert_eq!(m["status"], "Killed");
+        assert_eq!(m["mutatorName"], "binop_swap");
+        assert_eq!(m["replacement"], "-");
+        assert!(m["description"].as_str().unwrap().contains('+'));
+
+        // INV-3: location is 1-indexed
+        let start_line = m["location"]["start"]["line"].as_u64().unwrap();
+        assert!(start_line >= 1, "line must be >= 1 (1-indexed)");
+        let start_col = m["location"]["start"]["column"].as_u64().unwrap();
+        assert!(start_col >= 1, "column must be >= 1 (1-indexed)");
+    }
+
+    /// Report includes framework name and version.
+    #[test]
+    fn test_framework_field() {
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        assert_eq!(report["framework"]["name"], "irradiate");
+        assert!(
+            report["framework"]["version"].as_str().is_some(),
+            "version field must be present"
+        );
+    }
+
+    /// Mutant in results but not in descriptors → included with minimal info (failure mode).
+    #[test]
+    fn test_result_without_descriptor_included() {
+        let results = vec![make_result("unknown.x_h__irradiate_1", MutantStatus::Survived, 0.0)];
+        let report =
+            build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        let files = report["files"].as_object().unwrap();
+        let all_mutants: Vec<_> = files.values().flat_map(|f| f["mutants"].as_array().unwrap().iter()).collect();
+        assert_eq!(all_mutants.len(), 1);
+        assert_eq!(all_mutants[0]["id"], "unknown.x_h__irradiate_1");
+        assert_eq!(all_mutants[0]["status"], "Survived");
+    }
+
+    /// coveredBy is populated from stats when provided.
+    #[test]
+    fn test_covered_by_from_stats() {
+        use std::collections::HashMap;
+        let mut tests_by_function = HashMap::new();
+        tests_by_function.insert(
+            "mod.x_foo".to_string(),
+            vec!["tests/test_mod.py::test_it".to_string()],
+        );
+        let stats = TestStats {
+            tests_by_function,
+            ..Default::default()
+        };
+
+        let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Killed, 0.1)];
+        let report =
+            build_stryker_report(&results, &[], Some(&stats), Path::new("/p"), Path::new("src"));
+
+        let files = report["files"].as_object().unwrap();
+        let mutants: Vec<_> = files
+            .values()
+            .flat_map(|f| f["mutants"].as_array().unwrap().iter())
+            .collect();
+        let covered_by = mutants[0]["coveredBy"].as_array().unwrap();
+        assert_eq!(covered_by.len(), 1);
+        assert_eq!(covered_by[0], "tests/test_mod.py::test_it");
     }
 }

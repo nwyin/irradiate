@@ -87,6 +87,14 @@ enum Commands {
         /// Requires a git repository.
         #[arg(long)]
         diff: Option<String>,
+
+        /// Generate a report in the specified format (json = Stryker schema v2)
+        #[arg(long)]
+        report: Option<String>,
+
+        /// Output path for the generated report (default: irradiate-report.<format>)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
     },
 
     /// Display mutation testing results
@@ -98,6 +106,14 @@ enum Commands {
         /// Output machine-readable JSON instead of text
         #[arg(long)]
         json: bool,
+
+        /// Generate a report in the specified format (json = Stryker schema v2)
+        #[arg(long)]
+        report: Option<String>,
+
+        /// Output path for the generated report (default: irradiate-report.<format>)
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
     },
 
     /// Show diff for a specific mutant
@@ -145,6 +161,8 @@ async fn main() -> Result<()> {
             verify_survivors,
             fail_under,
             diff,
+            report,
+            output,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -176,10 +194,14 @@ async fn main() -> Result<()> {
                 fail_under,
                 diff_ref: diff,
                 fork: !no_fork,
+                report,
+                report_output: output,
             })
             .await
         }
-        Commands::Results { all, json } => irradiate::pipeline::results(all, json),
+        Commands::Results { all, json, report, output } => {
+            irradiate::pipeline::results(all, json, report, output)
+        }
         Commands::Show { mutant_name } => irradiate::pipeline::show(&mutant_name),
         Commands::Cache { command } => match command {
             CacheCommands::Clean => {

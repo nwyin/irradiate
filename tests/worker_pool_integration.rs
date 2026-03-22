@@ -1016,6 +1016,8 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         fail_under: None,
         diff_ref: None,
         fork: true,
+        report: None,
+        report_output: None,
     }
 }
 
