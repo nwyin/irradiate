@@ -48,9 +48,6 @@ pub struct PoolConfig {
     pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
-    /// Use fork-per-mutant execution (default true). Each test run forks the worker,
-    /// giving full process isolation. Set to false to use legacy in-process mode.
-    pub fork: bool,
 }
 
 impl Default for PoolConfig {
@@ -66,7 +63,6 @@ impl Default for PoolConfig {
             pythonpath: String::new(),
             worker_recycle_after: None,
             max_worker_memory_mb: 0,
-            fork: true,
         }
     }
 }
@@ -164,7 +160,6 @@ fn spawn_worker(
         .env("IRRADIATE_MUTANTS_DIR", &config.mutants_dir)
         .env("IRRADIATE_TESTS_DIR", &config.tests_dir)
         .env("PYTHONPATH", &config.pythonpath)
-        .env("IRRADIATE_NO_FORK", if config.fork { "0" } else { "1" })
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

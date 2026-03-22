@@ -339,38 +339,4 @@ trap - EXIT
 rm -rf "$INCR_TMPDIR"
 
 echo ""
-echo "=== E2E: --no-fork legacy path ==="
-
-# Capture reference killed/survived counts from the default fork-mode run
-rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
-FORK_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
-FORK_RESULTS=$( cd "$FIXTURE" && "$BINARY" results --all 2>&1 )
-FORK_KILLED=$(echo "$FORK_RESULTS" | grep -c "🎉" || true)
-FORK_SURVIVED=$(echo "$FORK_RESULTS" | grep -c "🙁" || true)
-echo "  Fork mode (default): Killed=$FORK_KILLED, Survived=$FORK_SURVIVED"
-
-# Run with --no-fork and compare
-rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
-NOFORK_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 --no-fork 2>&1 )
-echo "$NOFORK_OUTPUT"
-NOFORK_RESULTS=$( cd "$FIXTURE" && "$BINARY" results --all 2>&1 )
-NOFORK_KILLED=$(echo "$NOFORK_RESULTS" | grep -c "🎉" || true)
-NOFORK_SURVIVED=$(echo "$NOFORK_RESULTS" | grep -c "🙁" || true)
-echo "  No-fork mode: Killed=$NOFORK_KILLED, Survived=$NOFORK_SURVIVED"
-
-# INV-1: --no-fork must produce identical killed/survived counts as fork mode
-if [ "$NOFORK_KILLED" -ne "$FORK_KILLED" ]; then
-    echo "FAIL: --no-fork killed count ($NOFORK_KILLED) differs from fork mode ($FORK_KILLED)"
-    exit 1
-fi
-if [ "$NOFORK_SURVIVED" -ne "$FORK_SURVIVED" ]; then
-    echo "FAIL: --no-fork survived count ($NOFORK_SURVIVED) differs from fork mode ($FORK_SURVIVED)"
-    exit 1
-fi
-echo "  --no-fork matches fork mode results: OK"
-
-# Clean up
-rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
-
-echo ""
 echo "=== E2E tests: PASS ==="

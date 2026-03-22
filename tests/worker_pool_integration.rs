@@ -574,10 +574,10 @@ async fn test_module_global_restore_between_runs() {
     );
 }
 
-/// INV-2: Trampolined function dispatch still works after module restore.
+/// INV-2: Trampolined function dispatch still works across multiple fork-mode runs on the same worker.
 ///
-/// After restore, the trampoline dict and variant functions must be intact.
-/// We run a real mutant (not nonexistent) and verify it is still killed by the test.
+/// In fork mode each child gets a fresh COW copy; the parent's trampoline dict is intact
+/// across runs. We run the same mutant twice and verify it is killed both times.
 #[tokio::test]
 async fn test_trampoline_intact_after_restore() {
     let fixture = fixture_dir();
@@ -631,7 +631,7 @@ async fn test_trampoline_intact_after_restore() {
     assert_eq!(
         results[1].status,
         MutantStatus::Killed,
-        "INV-2: trampoline must still dispatch mutant correctly after module restore"
+        "INV-2: trampoline must still dispatch mutant correctly on second fork"
     );
 }
 
@@ -801,11 +801,11 @@ async fn test_worker_pool_explicit_recycle_overrides_auto_tune() {
     assert_eq!(results[0].status, MutantStatus::Killed);
 }
 
-/// INV-3: A worker process that calls os._exit() mid-test produces Error status, not a hang.
+/// INV-3: A child process that calls os._exit() in fork mode produces a result (not a hang).
 ///
-/// This exercises the unexpected-disconnect path in dispatch_work:
-/// worker_pids.remove + recycled_worker_ids check + active_mutants.remove → Error result.
-/// If the stuck-detection or disconnect handling is removed/mutated, this test hangs or panics.
+/// In fork mode, os._exit() in the child only kills the child; the parent survives and
+/// reports exit code 1 → MutantStatus::Killed. The key invariant is no hang: run_worker_pool
+/// must return even when a test abruptly exits the child process.
 #[tokio::test]
 async fn test_worker_crash_produces_error_not_hang() {
     let crash_project = project_root().join("tests/fixtures/crash_worker_project");
@@ -860,10 +860,6 @@ async fn test_worker_crash_produces_error_not_hang() {
         timeout_multiplier: 10.0,
         pythonpath,
         worker_recycle_after: Some(0), // no count recycling — only crash path matters
-        // Use no-fork mode: os._exit() in a test kills the whole worker process,
-        // causing a socket disconnect that the orchestrator maps to Error.
-        // In fork mode, os._exit() only kills the child, which maps to Killed.
-        fork: false,
         ..Default::default()
     };
 
@@ -879,11 +875,12 @@ async fn test_worker_crash_produces_error_not_hang() {
         .await
         .expect("Worker pool must not hang when the worker process crashes");
 
-    assert_eq!(results.len(), 1, "Crashed worker must still produce exactly one result");
+    assert_eq!(results.len(), 1, "Forked child crash must still produce exactly one result (no hang)");
+    // In fork mode, os._exit(1) only kills the child; the parent receives exit code 1 → Killed.
     assert_eq!(
         results[0].status,
-        MutantStatus::Error,
-        "os._exit() in the worker must produce Error status, got {:?}",
+        MutantStatus::Killed,
+        "os._exit(1) in the child must produce Killed status in fork mode, got {:?}",
         results[0].status
     );
 }
@@ -1015,7 +1012,6 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         do_not_mutate: vec![],
         fail_under: None,
         diff_ref: None,
-        fork: true,
         report: None,
         report_output: None,
     }

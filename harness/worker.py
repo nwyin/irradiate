@@ -58,9 +58,7 @@ class MutationWorkerPlugin:
         self.current_item_nodeid = None
         self.current_run_reports = []
         self._source_module_names = []  # modules loaded via MutantFinder
-        self._module_snapshots = {}  # mod_name -> shallow copy of vars(mod)
         self.session_fixture_names = []  # populated by pytest_collection_finish
-        self._fork_mode = False  # set in pytest_runtestloop based on env var
 
     def _detect_session_fixtures(self, session):
         """Check if any collected tests use session-scoped fixtures.
@@ -117,38 +115,6 @@ class MutationWorkerPlugin:
             name for name in source_names if name in sys.modules and name != "irradiate_harness" and not name.startswith("irradiate_harness.")
         ]
 
-    def _snapshot_source_modules(self):
-        """Shallow-copy source module state before the first mutant run.
-
-        This snapshot is taken once, before any test runs. Between mutant
-        runs, _restore_source_modules() resets each module back to this state,
-        preventing globals mutated by one test from leaking into the next run.
-        """
-        self._module_snapshots = {}
-        for mod_name in self._source_module_names:
-            mod = sys.modules.get(mod_name)
-            if mod is not None:
-                # Shallow copy: stores references, not deep copies.
-                # Handles scalar globals, class defs, function refs correctly.
-                # Mutable containers modified in-place (list.append, dict[k]=v)
-                # are NOT isolated — recycling handles that case.
-                self._module_snapshots[mod_name] = dict(vars(mod))
-
-    def _restore_source_modules(self):
-        """Restore source module state to the pre-run snapshot.
-
-        Called in the finally block after each mutant run to reset module-level
-        globals that tests may have modified. The shallow snapshot captures the
-        module dict at collection time, so trampolined functions are preserved.
-        irradiate_harness.active_mutant is NOT affected (separate module).
-        """
-        for mod_name, snapshot in self._module_snapshots.items():
-            mod = sys.modules.get(mod_name)
-            if mod is not None:
-                current = vars(mod)
-                current.clear()
-                current.update(snapshot)
-
     def _reset_run_state(self):
         self.current_run_mutant = None
         self.current_run_nodeids = set()
@@ -186,54 +152,6 @@ class MutationWorkerPlugin:
         if report.nodeid != self.current_item_nodeid:
             return
         self.current_run_reports.append(report)
-
-    def _run_in_process(self, mutant_name, items_to_run, start):  # pragma: no mutate
-        """Run tests in the current process (legacy mode, --no-fork)."""
-        import irradiate_harness
-
-        try:
-            self._reset_run_state()
-            self.current_run_mutant = mutant_name
-            irradiate_harness.active_mutant = mutant_name
-            run_exit_code = self._run_items_via_hooks(items_to_run)
-
-            duration = time.monotonic() - start
-            send_message(
-                self.sock,
-                {
-                    "type": "result",
-                    "mutant": mutant_name,
-                    "exit_code": run_exit_code,
-                    "duration": duration,
-                },
-            )
-        except SystemExit as exc:
-            duration = time.monotonic() - start
-            exit_code = int(exc.code) if isinstance(exc.code, int) else 1
-            send_message(
-                self.sock,
-                {
-                    "type": "result",
-                    "mutant": mutant_name,
-                    "exit_code": exit_code,
-                    "duration": duration,
-                },
-            )
-        except BaseException:
-            duration = time.monotonic() - start
-            send_message(
-                self.sock,
-                {
-                    "type": "error",
-                    "mutant": mutant_name,
-                    "message": traceback.format_exc(),
-                    "duration": duration,
-                },
-            )
-        finally:
-            self._reset_run_state()
-            self._restore_source_modules()
-            irradiate_harness.active_mutant = None
 
     def _run_forked(self, mutant_name, items_to_run, start, timeout_secs=None):  # pragma: no mutate
         """Fork a child to run tests. Parent waits and reports result."""
@@ -327,21 +245,14 @@ class MutationWorkerPlugin:
             },
         )
 
-        # Choose execution model based on IRRADIATE_NO_FORK env var.
-        # Fork mode (default): freeze GC to prevent COW faults, then fork per mutant.
-        # No-fork mode (--no-fork): snapshot module state and restore between runs.
-        self._fork_mode = os.environ.get("IRRADIATE_NO_FORK") != "1"
-        if self._fork_mode:
-            gc.freeze()  # prevent COW faults from GC refcount updates in children
-            thread_count = threading.active_count()
-            if thread_count > 1:
-                print(
-                    f"[irradiate] WARNING: {thread_count} threads active at fork time; "
-                    "fork-unsafe plugins may cause hangs",
-                    file=sys.stderr,
-                )
-        else:
-            self._snapshot_source_modules()
+        gc.freeze()  # prevent COW faults from GC refcount updates in children
+        thread_count = threading.active_count()
+        if thread_count > 1:
+            print(
+                f"[irradiate] WARNING: {thread_count} threads active at fork time; "
+                "fork-unsafe plugins may cause hangs",
+                file=sys.stderr,
+            )
 
         while True:
             msg, self.buf = recv_message(self.sock, self.buf)
@@ -375,10 +286,7 @@ class MutationWorkerPlugin:
                     )
                     continue
 
-                if self._fork_mode:
-                    self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
-                else:
-                    self._run_in_process(mutant_name, items_to_run, start)
+                self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
 
         return True  # Signal to pytest that we handled the run loop
 

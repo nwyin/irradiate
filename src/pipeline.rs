@@ -45,9 +45,6 @@ pub struct RunConfig {
     /// Only mutate functions changed since this git ref (e.g., "main", "HEAD~3").
     /// `None` = mutate everything (default full-run behaviour).
     pub diff_ref: Option<String>,
-    /// Use fork-per-mutant execution (default true). Each test run forks the worker,
-    /// giving full process isolation. Disable with --no-fork for legacy in-process mode.
-    pub fork: bool,
     /// Report format to generate after the run (e.g. "json" for Stryker-schema JSON).
     /// `None` = no report generated.
     pub report: Option<String>,
@@ -355,7 +352,6 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 pythonpath: pythonpath.clone(),
                 worker_recycle_after: config.worker_recycle_after,
                 max_worker_memory_mb: config.max_worker_memory_mb,
-                fork: config.fork,
                 ..Default::default()
             };
             let progress = crate::progress::ProgressBar::new(total_mutants);
