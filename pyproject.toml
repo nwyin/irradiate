@@ -1,2 +1,31 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "irradiate"
+description = "Fast mutation testing for Python"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["mutation-testing", "testing", "pytest"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://nwyin.github.io/irradiate"
+Repository = "https://github.com/nwyin/irradiate"
+
+[tool.maturin]
+bindings = "bin"
+strip = true
+
 [tool.ruff]
 line-length = 144
