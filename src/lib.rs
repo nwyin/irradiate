@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod codegen;
 pub mod config;
+pub mod git_diff;
 pub mod harness;
 pub mod mutation;
 pub mod orchestrator;
