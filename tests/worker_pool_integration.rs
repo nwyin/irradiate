@@ -860,6 +860,10 @@ async fn test_worker_crash_produces_error_not_hang() {
         timeout_multiplier: 10.0,
         pythonpath,
         worker_recycle_after: Some(0), // no count recycling — only crash path matters
+        // Use no-fork mode: os._exit() in a test kills the whole worker process,
+        // causing a socket disconnect that the orchestrator maps to Error.
+        // In fork mode, os._exit() only kills the child, which maps to Killed.
+        fork: false,
         ..Default::default()
     };
 
@@ -1011,6 +1015,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         do_not_mutate: vec![],
         fail_under: None,
         diff_ref: None,
+        fork: true,
     }
 }
 

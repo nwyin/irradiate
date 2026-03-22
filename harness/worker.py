@@ -7,10 +7,14 @@ plugins are fully initialized when the worker executes selected items via
 pytest's hook machinery.
 """
 
+import gc
 import json
 import os
+import resource
+import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 
@@ -56,6 +60,7 @@ class MutationWorkerPlugin:
         self._source_module_names = []  # modules loaded via MutantFinder
         self._module_snapshots = {}  # mod_name -> shallow copy of vars(mod)
         self.session_fixture_names = []  # populated by pytest_collection_finish
+        self._fork_mode = False  # set in pytest_runtestloop based on env var
 
     def _detect_session_fixtures(self, session):
         """Check if any collected tests use session-scoped fixtures.
@@ -182,6 +187,124 @@ class MutationWorkerPlugin:
             return
         self.current_run_reports.append(report)
 
+    def _run_in_process(self, mutant_name, items_to_run, start):  # pragma: no mutate
+        """Run tests in the current process (legacy mode, --no-fork)."""
+        import irradiate_harness
+
+        try:
+            self._reset_run_state()
+            self.current_run_mutant = mutant_name
+            irradiate_harness.active_mutant = mutant_name
+            run_exit_code = self._run_items_via_hooks(items_to_run)
+
+            duration = time.monotonic() - start
+            send_message(
+                self.sock,
+                {
+                    "type": "result",
+                    "mutant": mutant_name,
+                    "exit_code": run_exit_code,
+                    "duration": duration,
+                },
+            )
+        except SystemExit as exc:
+            duration = time.monotonic() - start
+            exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            send_message(
+                self.sock,
+                {
+                    "type": "result",
+                    "mutant": mutant_name,
+                    "exit_code": exit_code,
+                    "duration": duration,
+                },
+            )
+        except BaseException:
+            duration = time.monotonic() - start
+            send_message(
+                self.sock,
+                {
+                    "type": "error",
+                    "mutant": mutant_name,
+                    "message": traceback.format_exc(),
+                    "duration": duration,
+                },
+            )
+        finally:
+            self._reset_run_state()
+            self._restore_source_modules()
+            irradiate_harness.active_mutant = None
+
+    def _run_forked(self, mutant_name, items_to_run, start, timeout_secs=None):  # pragma: no mutate
+        """Fork a child to run tests. Parent waits and reports result."""
+        import irradiate_harness
+
+        pid = os.fork()
+
+        if pid == 0:
+            # === CHILD PROCESS ===
+            try:
+                # Close parent socket fd — child communicates only via exit code
+                self.sock.close()
+
+                # Reset signal handlers to defaults
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+                # Set CPU time limit as orphan safety net
+                if timeout_secs is not None:
+                    try:
+                        limit = int(timeout_secs) + 5
+                        resource.setrlimit(resource.RLIMIT_CPU, (limit, limit + 1))
+                    except (ValueError, resource.error):
+                        pass
+
+                self._reset_run_state()
+                self.current_run_mutant = mutant_name
+                irradiate_harness.active_mutant = mutant_name
+                exit_code = self._run_items_via_hooks(items_to_run)
+            except SystemExit as exc:
+                exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            except BaseException:
+                traceback.print_exc()
+                exit_code = 99
+            finally:
+                os._exit(exit_code)
+        else:
+            # === PARENT PROCESS ===
+            try:
+                _, wait_status = os.waitpid(pid, 0)
+            except ChildProcessError:
+                wait_status = 0
+
+            duration = time.monotonic() - start
+
+            if os.WIFEXITED(wait_status):
+                exit_code = os.WEXITSTATUS(wait_status)
+                send_message(self.sock, {
+                    "type": "result", "mutant": mutant_name,
+                    "exit_code": exit_code, "duration": duration,
+                })
+            elif os.WIFSIGNALED(wait_status):
+                sig = os.WTERMSIG(wait_status)
+                if sig in (signal.SIGKILL, signal.SIGXCPU):
+                    send_message(self.sock, {
+                        "type": "result", "mutant": mutant_name,
+                        "exit_code": -sig, "duration": duration,
+                    })
+                else:
+                    send_message(self.sock, {
+                        "type": "error", "mutant": mutant_name,
+                        "message": f"child killed by signal {sig}",
+                        "duration": duration,
+                    })
+            else:
+                send_message(self.sock, {
+                    "type": "error", "mutant": mutant_name,
+                    "message": "unknown child wait status",
+                    "duration": duration,
+                })
+
     def pytest_runtestloop(self, session) -> bool:
         """
         Intercept pytest's run loop to drive mutation testing via IPC.
@@ -189,8 +312,6 @@ class MutationWorkerPlugin:
         Runs after collection and before pytest_sessionfinish, so the session
         is fully alive and all plugins are ready for test execution.
         """
-        import irradiate_harness
-
         if not self.items:
             print("WARNING: No tests collected", file=sys.stderr)
 
@@ -206,9 +327,21 @@ class MutationWorkerPlugin:
             },
         )
 
-        # Snapshot module state AFTER collection (tests have imported source modules)
-        # but BEFORE the first mutant run. Restored between runs to prevent leakage.
-        self._snapshot_source_modules()
+        # Choose execution model based on IRRADIATE_NO_FORK env var.
+        # Fork mode (default): freeze GC to prevent COW faults, then fork per mutant.
+        # No-fork mode (--no-fork): snapshot module state and restore between runs.
+        self._fork_mode = os.environ.get("IRRADIATE_NO_FORK") != "1"
+        if self._fork_mode:
+            gc.freeze()  # prevent COW faults from GC refcount updates in children
+            thread_count = threading.active_count()
+            if thread_count > 1:
+                print(
+                    f"[irradiate] WARNING: {thread_count} threads active at fork time; "
+                    "fork-unsafe plugins may cause hangs",
+                    file=sys.stderr,
+                )
+        else:
+            self._snapshot_source_modules()
 
         while True:
             msg, self.buf = recv_message(self.sock, self.buf)
@@ -228,63 +361,24 @@ class MutationWorkerPlugin:
 
                 start = time.monotonic()
 
-                try:
-                    items_to_run = self._prepare_items(test_ids)
+                items_to_run = self._prepare_items(test_ids)
 
-                    if not items_to_run:
-                        send_message(
-                            self.sock,
-                            {
-                                "type": "result",
-                                "mutant": mutant_name,
-                                "exit_code": 33,
-                                "duration": 0.0,
-                            },
-                        )
-                        continue
-
-                    self._reset_run_state()
-                    self.current_run_mutant = mutant_name
-                    irradiate_harness.active_mutant = mutant_name
-                    run_exit_code = self._run_items_via_hooks(items_to_run)
-
-                    duration = time.monotonic() - start
+                if not items_to_run:
                     send_message(
                         self.sock,
                         {
                             "type": "result",
                             "mutant": mutant_name,
-                            "exit_code": run_exit_code,
-                            "duration": duration,
+                            "exit_code": 33,
+                            "duration": 0.0,
                         },
                     )
-                except SystemExit as exc:
-                    duration = time.monotonic() - start
-                    exit_code = int(exc.code) if isinstance(exc.code, int) else 1
-                    send_message(
-                        self.sock,
-                        {
-                            "type": "result",
-                            "mutant": mutant_name,
-                            "exit_code": exit_code,
-                            "duration": duration,
-                        },
-                    )
-                except BaseException:
-                    duration = time.monotonic() - start
-                    send_message(
-                        self.sock,
-                        {
-                            "type": "error",
-                            "mutant": mutant_name,
-                            "message": traceback.format_exc(),
-                            "duration": duration,
-                        },
-                    )
-                finally:
-                    self._reset_run_state()
-                    self._restore_source_modules()
-                    irradiate_harness.active_mutant = None
+                    continue
+
+                if self._fork_mode:
+                    self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
+                else:
+                    self._run_in_process(mutant_name, items_to_run, start)
 
         return True  # Signal to pytest that we handled the run loop
 

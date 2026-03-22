@@ -67,6 +67,12 @@ enum Commands {
         #[arg(long)]
         isolate: bool,
 
+        /// Disable fork-per-mutant execution; use legacy in-process mode instead.
+        /// Fork mode (the default) runs each mutant's tests in a forked child process,
+        /// preventing all state leakage between mutants.
+        #[arg(long)]
+        no_fork: bool,
+
         /// After the main run, re-test survived mutants in isolate mode to detect
         /// false negatives from warm-session state leakage. No-op when --isolate is set.
         #[arg(long)]
@@ -135,6 +141,7 @@ async fn main() -> Result<()> {
             worker_recycle_after,
             max_worker_memory,
             isolate,
+            no_fork,
             verify_survivors,
             fail_under,
             diff,
@@ -168,6 +175,7 @@ async fn main() -> Result<()> {
                 do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
                 fail_under,
                 diff_ref: diff,
+                fork: !no_fork,
             })
             .await
         }
