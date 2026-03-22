@@ -43,6 +43,10 @@ pub struct FunctionMutations {
     pub start_line: usize,
     /// 1-indexed end line of the function in the source file.
     pub end_line: usize,
+    /// Byte offset of the function definition start in the source file.
+    /// Combined with `Mutation.start` (byte offset within the function source),
+    /// gives the absolute byte position in the file: `byte_offset + mutation.start`.
+    pub byte_offset: usize,
 }
 
 /// Collect all function mutations from a Python source file.
@@ -70,6 +74,41 @@ use libcst_native::parse_module;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_function_byte_offset_at_file_start() {
+        // A single function at byte 0: byte_offset must be 0.
+        let source = "def foo(x):\n    return x + 1\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        assert_eq!(fms[0].byte_offset, 0, "function at top of file must have byte_offset 0");
+    }
+
+    #[test]
+    fn test_function_byte_offset_not_at_file_start() {
+        // Function preceded by module-level code.
+        let source = "X = 1\n\ndef foo(x):\n    return x + 1\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let expected = source.find("def foo").unwrap();
+        assert_eq!(
+            fms[0].byte_offset, expected,
+            "byte_offset must point at the 'd' of 'def'"
+        );
+    }
+
+    #[test]
+    fn test_multiple_functions_have_distinct_byte_offsets() {
+        let source = "def a(x):\n    return x + 1\n\ndef b(x):\n    return x - 1\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 2);
+        let offset_a = source.find("def a").unwrap();
+        let offset_b = source.find("def b").unwrap();
+        let fm_a = fms.iter().find(|f| f.name == "a").unwrap();
+        let fm_b = fms.iter().find(|f| f.name == "b").unwrap();
+        assert_eq!(fm_a.byte_offset, offset_a);
+        assert_eq!(fm_b.byte_offset, offset_b);
+    }
 
     #[test]
     fn test_collect_binop_mutations() {

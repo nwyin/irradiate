@@ -261,6 +261,7 @@ fn collect_function_mutations(
         mutations,
         start_line,
         end_line,
+        byte_offset: fn_start,
     })
 }
 

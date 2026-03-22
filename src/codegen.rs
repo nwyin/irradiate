@@ -254,6 +254,8 @@ pub fn mutate_file(
                     end: mutation.end,
                     original: mutation.original.clone(),
                     replacement: mutation.replacement.clone(),
+                    source_file: module_name.to_string(),
+                    fn_byte_offset: fm.byte_offset,
                 })
                 .collect::<Vec<_>>()
         })
@@ -264,6 +266,17 @@ pub fn mutate_file(
         mutant_names: all_mutant_names,
         descriptors,
     })
+}
+
+/// Convert an absolute byte offset in a source string to `(line, column)`, both 1-indexed.
+///
+/// `line` is the 1-indexed line number; `column` is the 1-indexed byte column within that line.
+/// Used to convert `fn_byte_offset + mutation.start` into a human-readable file position.
+pub fn byte_offset_to_location(source: &str, byte_offset: usize) -> (usize, usize) {
+    let prefix = &source[..byte_offset.min(source.len())];
+    let line = prefix.matches('\n').count() + 1;
+    let col = prefix.len() - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0) + 1;
+    (line, col)
 }
 
 /// Find the index of the trampoline for (class_name, func_name) in function_mutations.
@@ -318,6 +331,82 @@ fn indent_code(code: &str, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mutation::collect_file_mutations;
+
+    // --- byte_offset_to_location ---
+
+    #[test]
+    fn test_byte_offset_to_location_start_of_file() {
+        // INV-2: offset 0 → (1, 1)
+        assert_eq!(byte_offset_to_location("abc", 0), (1, 1));
+    }
+
+    #[test]
+    fn test_byte_offset_to_location_start_of_second_line() {
+        // INV-1: "line1\nline2\nline3" at offset 6 → (2, 1)
+        assert_eq!(byte_offset_to_location("line1\nline2\nline3", 6), (2, 1));
+    }
+
+    #[test]
+    fn test_byte_offset_to_location_mid_line() {
+        // "ab\ncd" — offset 4 is 'c' + 1 = 'd' which is col 2 on line 2
+        assert_eq!(byte_offset_to_location("ab\ncd", 4), (2, 2));
+    }
+
+    #[test]
+    fn test_byte_offset_to_location_clamps_to_end() {
+        // Offset past end must not panic; clamps to source.len()
+        let source = "abc";
+        let _ = byte_offset_to_location(source, 100);
+    }
+
+    // --- descriptor source_file and fn_byte_offset ---
+
+    #[test]
+    fn test_descriptor_source_file_is_module_name() {
+        let source = "def add(a, b):\n    return a + b\n";
+        let result = mutate_file(source, "mymod.core", None).unwrap();
+        for desc in &result.descriptors {
+            assert_eq!(
+                desc.source_file, "mymod.core",
+                "source_file must be the module name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_descriptor_fn_byte_offset_matches_function_start() {
+        // A file where the function does NOT start at byte 0 — there's a module-level line first.
+        let source = "X = 1\n\ndef add(a, b):\n    return a + b\n";
+        let result = mutate_file(source, "mod", None).unwrap();
+
+        // fn_byte_offset must be the byte position of `def` in source.
+        let fn_pos = source.find("def add").expect("def must be present");
+        for desc in &result.descriptors {
+            assert_eq!(
+                desc.fn_byte_offset, fn_pos,
+                "fn_byte_offset must point at the function's def keyword"
+            );
+        }
+    }
+
+    #[test]
+    fn test_absolute_mutation_position_is_correct() {
+        // INV-3: fn_byte_offset + mutation.start gives the absolute byte position.
+        let source = "X = 1\n\ndef add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+
+        for mutation in &fm.mutations {
+            let abs = fm.byte_offset + mutation.start;
+            let original_slice = &source[abs..abs + mutation.end - mutation.start];
+            assert_eq!(
+                original_slice, mutation.original,
+                "absolute position must index the original text in the file"
+            );
+        }
+    }
 
     #[test]
     fn test_mutate_simple_file() {
