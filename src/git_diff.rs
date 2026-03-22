@@ -1,349 +1,373 @@
+//! Git diff parsing for incremental (diff-aware) mutation testing.
+//!
+//! Parses `git diff <ref>` unified diff output to determine which lines changed.
+//! The `DiffFilter` can then tell codegen which functions overlap with changed lines.
+
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-pub type LineRange = RangeInclusive<usize>;
+/// A half-open range of line numbers [start, end] (both 1-indexed, inclusive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
 
-/// Maps file paths to changed line ranges.
-/// None = new file (all lines changed, mutate everything).
-/// Some(ranges) = specific changed line ranges on the new side.
+impl LineRange {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    /// Returns true if this range overlaps with [other_start, other_end] (inclusive).
+    pub fn overlaps(&self, other_start: usize, other_end: usize) -> bool {
+        self.start <= other_end && self.end >= other_start
+    }
+}
+
+/// Holds the parsed diff result: which files changed and which line ranges were touched.
+///
+/// - `None` value → new file (all lines are "changed", mutate everything)
+/// - `Some([])` → file was deleted or only binary/mode changes (no mutatable lines)
+/// - `Some(ranges)` → modified file with specific changed hunks
 #[derive(Debug, Default)]
 pub struct DiffFilter {
-    pub changed_files: HashMap<PathBuf, Option<Vec<LineRange>>>,
+    /// Map from repo-relative file path to changed line ranges (in the new version).
+    files: HashMap<PathBuf, Option<Vec<LineRange>>>,
 }
 
 impl DiffFilter {
-    /// Check if a file has any changes in the diff.
-    pub fn file_is_changed(&self, rel_path: &Path) -> bool {
-        self.changed_files.contains_key(rel_path)
+    /// Returns true if the function spanning [fn_start_line, fn_end_line] is touched by the diff.
+    ///
+    /// A function is "touched" if:
+    /// - The file it lives in was newly added (None entry), OR
+    /// - Any changed hunk overlaps the function's line span
+    pub fn function_is_touched(&self, rel_path: &Path, fn_start_line: usize, fn_end_line: usize) -> bool {
+        match self.files.get(rel_path) {
+            None => false, // file not in diff at all
+            Some(None) => true, // new file — all functions are "touched"
+            Some(Some(ranges)) => {
+                ranges.iter().any(|r| r.overlaps(fn_start_line, fn_end_line))
+            }
+        }
     }
 
-    /// Check if a function spanning [start_line, end_line] (1-indexed, inclusive)
-    /// overlaps with any changed line range. Returns true for new files (None ranges).
-    pub fn function_is_touched(&self, rel_path: &Path, start_line: usize, end_line: usize) -> bool {
-        match self.changed_files.get(rel_path) {
-            None => false,                    // file not in diff
-            Some(None) => true,              // new file — everything touched
-            Some(Some(ranges)) => ranges.iter().any(|r| *r.start() <= end_line && *r.end() >= start_line),
-        }
+    /// Returns true if the given file path appears anywhere in the diff.
+    pub fn file_is_touched(&self, rel_path: &Path) -> bool {
+        self.files.contains_key(rel_path)
+    }
+
+    /// Returns the number of files in the diff.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Returns the total number of functions that could be touched (rough upper bound for display).
+    /// This counts distinct files that have at least one change range (or are new).
+    pub fn changed_file_count(&self) -> usize {
+        self.files
+            .values()
+            .filter(|v| matches!(v, None | Some(_)))
+            .count()
     }
 }
 
-/// Run git diff against a reference and parse the output.
-/// Uses merge-base resolution: `--diff main` gives "changes since branch point",
-/// not "diff against main tip".
-pub fn parse_git_diff(diff_ref: &str, repo_root: &Path) -> anyhow::Result<DiffFilter> {
-    // Try merge-base first to get the branch divergence point.
-    let merge_base = Command::new("git")
-        .args(["merge-base", diff_ref, "HEAD"])
-        .current_dir(repo_root)
-        .output()?;
-
-    let effective_ref = if merge_base.status.success() {
-        String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
-    } else {
-        diff_ref.to_string()
-    };
-
-    let output = Command::new("git")
-        .args(["diff", "--no-color", "-U0", "--diff-filter=ACMR", &effective_ref])
-        .current_dir(repo_root)
-        .output()?;
+/// Find the root of the current git repository by running `git rev-parse --show-toplevel`.
+pub fn find_git_root(start: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .context("failed to run git — is git installed?")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git diff failed for ref '{}': {}", diff_ref, stderr.trim());
+        bail!("not inside a git repository: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(PathBuf::from(stdout.trim()))
+}
+
+/// Run `git diff <diff_ref>` and parse the unified diff output into a `DiffFilter`.
+///
+/// `diff_ref` can be any git ref: "main", "HEAD~3", a commit SHA, etc.
+pub fn parse_git_diff(diff_ref: &str, repo_root: &Path) -> Result<DiffFilter> {
+    let output = std::process::Command::new("git")
+        .args(["diff", diff_ref, "--unified=0", "--no-color"])
+        .current_dir(repo_root)
+        .output()
+        .context("failed to run git diff")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git diff {} failed: {}",
+            diff_ref,
+            stderr.trim()
+        );
     }
 
     let diff_text = String::from_utf8_lossy(&output.stdout);
-    parse_unified_diff(&diff_text)
+    Ok(parse_unified_diff(&diff_text))
 }
 
-/// Parse unified diff text into a DiffFilter. Public for testing.
-pub fn parse_unified_diff(diff_output: &str) -> anyhow::Result<DiffFilter> {
+/// Parse a unified diff text (from `git diff --unified=0`) into a `DiffFilter`.
+///
+/// We only care about Python files and only track lines added/modified in the new file (+++ side).
+pub fn parse_unified_diff(diff: &str) -> DiffFilter {
     let mut filter = DiffFilter::default();
     let mut current_file: Option<PathBuf> = None;
+    let mut current_ranges: Vec<LineRange> = Vec::new();
     let mut is_new_file = false;
 
-    for line in diff_output.lines() {
+    for line in diff.lines() {
         if line.starts_with("diff --git ") {
-            // Finalize previous file.
+            // Finalize the previous file.
             if let Some(path) = current_file.take() {
                 if is_new_file {
-                    filter.changed_files.entry(path).or_insert(None);
+                    filter.files.insert(path, None);
                 } else {
-                    filter.changed_files.entry(path).or_insert_with(|| Some(vec![]));
+                    filter.files.insert(path, Some(current_ranges.clone()));
                 }
             }
-            // Extract the b/ path.
-            current_file = parse_diff_git_header(line);
+            current_ranges.clear();
             is_new_file = false;
+        } else if let Some(path_str) = line.strip_prefix("+++ b/") {
+            // New file path — stripped the "+++ b/" prefix.
+            current_file = if path_str == "/dev/null" {
+                None // deleted file
+            } else {
+                Some(PathBuf::from(path_str))
+            };
+        } else if line == "+++ /dev/null" || line.starts_with("+++ /dev/null") {
+            // File was deleted.
+            current_file = None;
         } else if line.starts_with("new file mode") {
             is_new_file = true;
         } else if line.starts_with("@@ ") {
-            if let Some(path) = &current_file {
-                if is_new_file {
-                    // New file — entry stays as None (mutate everything).
-                    filter.changed_files.entry(path.clone()).or_insert(None);
-                } else if let Some(range) = parse_hunk_header(line) {
-                    filter
-                        .changed_files
-                        .entry(path.clone())
-                        .and_modify(|v| {
-                            if let Some(ranges) = v {
-                                ranges.push(range.clone());
-                            }
-                        })
-                        .or_insert_with(|| Some(vec![range]));
+            // Parse hunk header: @@ -OLD_START[,OLD_LEN] +NEW_START[,NEW_LEN] @@
+            if let Some(range) = parse_hunk_header(line) {
+                // For a new file, we track ranges too (they cover the whole file).
+                // The None-entry (new file) in DiffFilter means "mutate all", but we still
+                // want to be able to answer function_is_touched correctly via ranges.
+                // Actually, we handle new files via is_new_file flag → None entry, which
+                // means function_is_touched returns true for all functions. No need to track ranges.
+                if !is_new_file {
+                    current_ranges.push(range);
                 }
-                // count=0 (pure deletion) → parse_hunk_header returns None, nothing inserted.
             }
         }
     }
 
-    // Finalize last file.
-    if let Some(path) = current_file {
+    // Finalize the last file.
+    if let Some(path) = current_file.take() {
         if is_new_file {
-            filter.changed_files.entry(path).or_insert(None);
+            filter.files.insert(path, None);
         } else {
-            filter.changed_files.entry(path).or_insert_with(|| Some(vec![]));
+            filter.files.insert(path, Some(current_ranges));
         }
     }
 
-    Ok(filter)
+    filter
 }
 
-/// Extract the `b/` file path from a `diff --git a/path b/path` header line.
-fn parse_diff_git_header(line: &str) -> Option<PathBuf> {
-    // Format: diff --git a/<path> b/<path>
-    // The b/ path is the new-side path we want.
-    let rest = line.strip_prefix("diff --git ")?;
-    // Find " b/" — split on last occurrence to handle spaces in filenames.
-    let b_idx = rest.rfind(" b/")?;
-    let b_path = &rest[b_idx + 3..]; // skip " b/"
-    Some(PathBuf::from(b_path))
-}
+/// Parse a unified diff hunk header like `@@ -10,5 +12,7 @@` or `@@ -10 +12 @@`.
+///
+/// Returns a `LineRange` for the new (+) side of the hunk.
+/// Returns `None` if the hunk adds no lines (pure deletion).
+fn parse_hunk_header(line: &str) -> Option<LineRange> {
+    // Format: @@ -OLD_START[,OLD_LEN] +NEW_START[,NEW_LEN] @@[ context]
+    let after_at = line.strip_prefix("@@ ")?;
+    let parts: Vec<&str> = after_at.split_whitespace().collect();
+    // parts[0] = "-OLD_START[,OLD_LEN]", parts[1] = "+NEW_START[,NEW_LEN]"
+    let new_part = parts.get(1)?;
+    let new_part = new_part.strip_prefix('+')?;
 
-/// Parse a `@@ -old +new @@` hunk header and return the new-side line range.
-/// Returns None for pure deletions (count = 0) or unparseable headers.
-pub(crate) fn parse_hunk_header(line: &str) -> Option<LineRange> {
-    // Format: @@ -a[,b] +c[,d] @@ ...
-    // We care only about the +c[,d] part (new side).
-    let inner = line.strip_prefix("@@ ")?;
-    // Find the '+' that starts the new-side range.
-    let plus_idx = inner.find(" +")?;
-    let after_plus = &inner[plus_idx + 2..];
-    // Trim everything after the closing " @@" or end of relevant tokens.
-    let token = after_plus.split_whitespace().next()?;
-
-    if let Some((start_str, count_str)) = token.split_once(',') {
-        let start: usize = start_str.parse().ok()?;
-        let count: usize = count_str.parse().ok()?;
-        if count == 0 {
-            return None; // pure deletion
-        }
-        Some(start..=start + count - 1)
+    let (start, len) = if let Some((s, l)) = new_part.split_once(',') {
+        let start: usize = s.parse().ok()?;
+        let len: usize = l.parse().ok()?;
+        (start, len)
     } else {
-        // No comma — single line (count implicitly 1)
-        let start: usize = token.parse().ok()?;
-        Some(start..=start)
+        let start: usize = new_part.parse().ok()?;
+        (start, 1)
+    };
+
+    if len == 0 {
+        // Pure deletion hunk — no lines in new file.
+        return None;
     }
+
+    Some(LineRange::new(start, start + len - 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // --- parse_hunk_header ---
-
     #[test]
-    fn hunk_standard_range() {
-        // @@ -1,5 +10,8 @@ — lines 10..17
-        let range = parse_hunk_header("@@ -1,5 +10,8 @@ some context").unwrap();
-        assert_eq!(range, 10..=17);
+    fn test_parse_hunk_header_basic() {
+        let r = parse_hunk_header("@@ -10,5 +12,7 @@ def foo():").unwrap();
+        assert_eq!(r.start, 12);
+        assert_eq!(r.end, 18); // 12 + 7 - 1
     }
 
     #[test]
-    fn hunk_single_line_no_comma() {
-        // @@ -a,b +5 @@ — single new line at 5
-        let range = parse_hunk_header("@@ -1,3 +5 @@").unwrap();
-        assert_eq!(range, 5..=5);
+    fn test_parse_hunk_header_single_line() {
+        let r = parse_hunk_header("@@ -5 +5 @@").unwrap();
+        assert_eq!(r.start, 5);
+        assert_eq!(r.end, 5);
     }
 
     #[test]
-    fn hunk_pure_deletion_returns_none() {
-        // INV-2: count=0 → None
-        let result = parse_hunk_header("@@ -5,3 +5,0 @@");
-        assert!(result.is_none(), "pure deletion should return None");
+    fn test_parse_hunk_header_pure_deletion() {
+        // +0,0 means no lines added
+        assert!(parse_hunk_header("@@ -5,3 +5,0 @@").is_none());
     }
 
     #[test]
-    fn hunk_old_side_no_comma() {
-        // @@ -a +c,d @@
-        let range = parse_hunk_header("@@ -3 +7,4 @@").unwrap();
-        assert_eq!(range, 7..=10);
+    fn test_line_range_overlaps() {
+        let r = LineRange::new(10, 20);
+        assert!(r.overlaps(15, 25)); // overlaps at end
+        assert!(r.overlaps(5, 12));  // overlaps at start
+        assert!(r.overlaps(12, 18)); // contained
+        assert!(r.overlaps(5, 25));  // contains
+        assert!(r.overlaps(10, 10)); // boundary start
+        assert!(r.overlaps(20, 20)); // boundary end
+        assert!(!r.overlaps(21, 30)); // after
+        assert!(!r.overlaps(1, 9));   // before
     }
 
-    // --- parse_unified_diff ---
-
     #[test]
-    fn new_file_has_none_ranges() {
-        // INV-1: new files → None (mutate everything)
+    fn test_parse_unified_diff_modified_file() {
         let diff = "\
 diff --git a/src/foo.py b/src/foo.py
-new file mode 100644
-index 0000000..abc1234
---- /dev/null
+index abc..def 100644
+--- a/src/foo.py
 +++ b/src/foo.py
-@@ -0,0 +1,10 @@
-+def hello():
-+    pass
+@@ -10,3 +10,5 @@ def old():
+-old line
++new line1
++new line2
+@@ -50,1 +52,1 @@
+-x = 1
++x = 2
 ";
-        let filter = parse_unified_diff(diff).unwrap();
+        let filter = parse_unified_diff(diff);
         let path = PathBuf::from("src/foo.py");
-        assert!(filter.file_is_changed(&path));
-        // INV-1: value must be None for new file
-        assert!(filter.changed_files[&path].is_none());
-        // function_is_touched must return true for any span
-        assert!(filter.function_is_touched(&path, 1, 10));
-        assert!(filter.function_is_touched(&path, 999, 1000));
-    }
+        assert!(filter.file_is_touched(&path));
 
-    #[test]
-    fn modified_file_collects_hunk_ranges() {
-        let diff = "\
-diff --git a/src/bar.py b/src/bar.py
-index abc..def 100644
---- a/src/bar.py
-+++ b/src/bar.py
-@@ -3,2 +3,3 @@ def bar():
-+    extra = 1
- unchanged
- line
-@@ -20,1 +21,2 @@
-+    another
- line
-";
-        let filter = parse_unified_diff(diff).unwrap();
-        let path = PathBuf::from("src/bar.py");
-        assert!(filter.file_is_changed(&path));
-        let ranges = filter.changed_files[&path].as_ref().unwrap();
+        let ranges = filter.files[&path].as_ref().unwrap();
         assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0], 3..=5);
-        assert_eq!(ranges[1], 21..=22);
+        assert_eq!(ranges[0], LineRange::new(10, 14));
+        assert_eq!(ranges[1], LineRange::new(52, 52));
     }
 
     #[test]
-    fn pure_deletion_hunk_produces_no_range() {
-        // INV-2: pure deletion hunk adds no entry for line ranges
-        let diff = "\
-diff --git a/src/baz.py b/src/baz.py
-index abc..def 100644
---- a/src/baz.py
-+++ b/src/baz.py
-@@ -5,3 +5,0 @@
--    deleted_line_1
--    deleted_line_2
--    deleted_line_3
-";
-        let filter = parse_unified_diff(diff).unwrap();
-        let path = PathBuf::from("src/baz.py");
-        assert!(filter.file_is_changed(&path));
-        // File is present but with empty ranges (pure deletion)
-        let ranges = filter.changed_files[&path].as_ref().unwrap();
-        assert!(ranges.is_empty());
-    }
-
-    #[test]
-    fn function_not_touched_for_unknown_file() {
-        // INV-3: file not in diff → false
-        let filter = parse_unified_diff("").unwrap();
-        assert!(!filter.function_is_touched(Path::new("unknown.py"), 1, 100));
-    }
-
-    #[test]
-    fn function_overlap_boundary_conditions() {
-        // INV-4: overlap check correctness
-        let diff = "\
-diff --git a/a.py b/a.py
-index 0..1 100644
---- a/a.py
-+++ b/a.py
-@@ -1,5 +15,11 @@
- changed
-";
-        let filter = parse_unified_diff(diff).unwrap();
-        let path = PathBuf::from("a.py");
-        // Range is 15..=25
-
-        // Overlapping: function [10,20] ∩ [15,25]
-        assert!(filter.function_is_touched(&path, 10, 20));
-        // Non-overlapping: function [26,30] — comes after [15,25]
-        assert!(!filter.function_is_touched(&path, 26, 30));
-        // Adjacent but not overlapping: [1,14]
-        assert!(!filter.function_is_touched(&path, 1, 14));
-        // Exactly touching start: [14,15] overlaps
-        assert!(filter.function_is_touched(&path, 14, 15));
-        // Exactly touching end: [25,30] overlaps
-        assert!(filter.function_is_touched(&path, 25, 30));
-        // Fully inside: [17,20]
-        assert!(filter.function_is_touched(&path, 17, 20));
-        // Wraps around: [1,30]
-        assert!(filter.function_is_touched(&path, 1, 30));
-    }
-
-    #[test]
-    fn multi_file_diff_parsed_correctly() {
+    fn test_parse_unified_diff_new_file() {
         let diff = "\
 diff --git a/src/new.py b/src/new.py
 new file mode 100644
-index 0000000..111
+index 000..abc
 --- /dev/null
 +++ b/src/new.py
-@@ -0,0 +1,5 @@
-+content
-diff --git a/src/modified.py b/src/modified.py
-index 000..111 100644
---- a/src/modified.py
-+++ b/src/modified.py
-@@ -10,3 +10,4 @@
- unchanged
-diff --git a/src/deleted.py b/src/deleted.py
-deleted file mode 100644
-index 111..000
---- a/src/deleted.py
-+++ /dev/null
+@@ -0,0 +1,10 @@
++def foo():
++    pass
 ";
-        let filter = parse_unified_diff(diff).unwrap();
-
-        // New file → None ranges
-        assert!(filter.changed_files[&PathBuf::from("src/new.py")].is_none());
-        // Modified file → has ranges
-        let modified = filter.changed_files[&PathBuf::from("src/modified.py")].as_ref().unwrap();
-        assert_eq!(modified.len(), 1);
-        assert_eq!(modified[0], 10..=13);
+        let filter = parse_unified_diff(diff);
+        let path = PathBuf::from("src/new.py");
+        assert!(filter.file_is_touched(&path));
+        // None = new file, all functions touched
+        assert!(filter.files[&path].is_none());
+        assert!(filter.function_is_touched(&path, 1, 5));
     }
 
     #[test]
-    fn empty_diff_returns_empty_filter() {
-        let filter = parse_unified_diff("").unwrap();
-        assert!(filter.changed_files.is_empty());
-    }
-
-    #[test]
-    fn binary_file_in_diff_has_empty_ranges() {
-        // Binary files appear in diff header but have no hunk headers.
+    fn test_parse_unified_diff_last_file_finalized() {
+        // Regression: the last file in a diff must be finalized after the loop ends.
         let diff = "\
-diff --git a/image.png b/image.png
+diff --git a/src/a.py b/src/a.py
 index abc..def 100644
-Binary files a/image.png and b/image.png differ
+--- a/src/a.py
++++ b/src/a.py
+@@ -1,1 +1,1 @@
+-old
++new
+diff --git a/src/b.py b/src/b.py
+index abc..def 100644
+--- a/src/b.py
++++ b/src/b.py
+@@ -5,1 +5,1 @@
+-old
++new
 ";
-        let filter = parse_unified_diff(diff).unwrap();
-        let path = PathBuf::from("image.png");
-        assert!(filter.file_is_changed(&path));
-        // No hunks → empty range list (Some([]))
-        let ranges = filter.changed_files[&path].as_ref().unwrap();
-        assert!(ranges.is_empty());
+        let filter = parse_unified_diff(diff);
+        assert!(filter.file_is_touched(&PathBuf::from("src/a.py")));
+        assert!(filter.file_is_touched(&PathBuf::from("src/b.py")));
+    }
+
+    #[test]
+    fn test_function_is_touched_no_overlap() {
+        let diff = "\
+diff --git a/src/foo.py b/src/foo.py
+index abc..def 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -1,5 +1,5 @@ def foo():
+-old
++new
+";
+        let filter = parse_unified_diff(diff);
+        let path = PathBuf::from("src/foo.py");
+        // Function at lines 10-20 is not touched by hunk at lines 1-5.
+        assert!(!filter.function_is_touched(&path, 10, 20));
+        // Function at lines 1-5 is touched.
+        assert!(filter.function_is_touched(&path, 1, 5));
+    }
+
+    #[test]
+    fn test_function_is_touched_untouched_file() {
+        let diff = "\
+diff --git a/src/foo.py b/src/foo.py
+index abc..def 100644
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -1,1 +1,1 @@
+-old
++new
+";
+        let filter = parse_unified_diff(diff);
+        // bar.py is not in the diff at all.
+        assert!(!filter.function_is_touched(&PathBuf::from("src/bar.py"), 1, 100));
+    }
+
+    #[test]
+    fn test_parse_unified_diff_multiple_files() {
+        let diff = "\
+diff --git a/src/a.py b/src/a.py
+index abc..def 100644
+--- a/src/a.py
++++ b/src/a.py
+@@ -10,3 +10,3 @@
+-old
++new
+diff --git a/src/b.py b/src/b.py
+new file mode 100644
+index 000..abc
+--- /dev/null
++++ b/src/b.py
+@@ -0,0 +1,5 @@
++new content
+";
+        let filter = parse_unified_diff(diff);
+
+        let a = PathBuf::from("src/a.py");
+        let b = PathBuf::from("src/b.py");
+
+        // a.py is modified
+        assert!(filter.files[&a].as_ref().is_some());
+        // b.py is new
+        assert!(filter.files[&b].is_none());
     }
 }

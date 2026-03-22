@@ -76,6 +76,11 @@ enum Commands {
         /// Value must be between 0.0 and 100.0. Only applied when at least one mutant is tested.
         #[arg(long, value_parser = parse_fail_under)]
         fail_under: Option<f64>,
+
+        /// Only mutate functions changed since this git ref (e.g., main, HEAD~3).
+        /// Requires a git repository.
+        #[arg(long)]
+        diff: Option<String>,
     },
 
     /// Display mutation testing results
@@ -132,6 +137,7 @@ async fn main() -> Result<()> {
             isolate,
             verify_survivors,
             fail_under,
+            diff,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -161,6 +167,7 @@ async fn main() -> Result<()> {
                 verify_survivors,
                 do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
                 fail_under,
+                diff_ref: diff,
             })
             .await
         }

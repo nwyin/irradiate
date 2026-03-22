@@ -42,6 +42,9 @@ pub struct RunConfig {
     /// Fail with exit code 1 when mutation score (killed / tested * 100) is below this value.
     /// `None` = no threshold check.
     pub fail_under: Option<f64>,
+    /// Only mutate functions changed since this git ref (e.g., "main", "HEAD~3").
+    /// `None` = mutate everything (default full-run behaviour).
+    pub diff_ref: Option<String>,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -70,11 +73,27 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let project_dir = std::env::current_dir()?;
     let mutants_dir = project_dir.join("mutants");
 
+    // Resolve diff filter when --diff is specified.
+    let diff_filter = if let Some(ref diff_ref) = config.diff_ref {
+        let repo_root = crate::git_diff::find_git_root(&project_dir)?;
+        let filter = crate::git_diff::parse_git_diff(diff_ref, &repo_root)?;
+        eprintln!(
+            "Generating mutants (incremental: diff against {diff_ref})..."
+        );
+        Some((filter, repo_root))
+    } else {
+        eprintln!("Generating mutants...");
+        None
+    };
+
     // Phase 1: Mutation generation
-    eprintln!("Generating mutants...");
     let start = Instant::now();
-    let generation =
-        generate_mutants(&config.paths_to_mutate, &mutants_dir, &config.do_not_mutate)?;
+    let generation = generate_mutants(
+        &config.paths_to_mutate,
+        &mutants_dir,
+        &config.do_not_mutate,
+        diff_filter.as_ref().map(|(f, r)| (f, r.as_path())),
+    )?;
     let gen_time = start.elapsed();
     eprintln!(
         "  done in {:.0}ms ({} mutants across {} files)",
@@ -807,6 +826,7 @@ fn generate_mutants(
     paths_to_mutate: &Path,
     mutants_dir: &Path,
     do_not_mutate: &[String],
+    diff_filter: Option<(&crate::git_diff::DiffFilter, &Path)>,
 ) -> Result<GenerationOutput> {
     // Clean mutants dir
     if mutants_dir.exists() {
@@ -870,7 +890,27 @@ fn generate_mutants(
                 }
             }
 
-            if let Some(mutated) = mutate_file(&source, &module_name) {
+            // Diff-level filtering: compute path relative to repo root for diff lookup.
+            // File paths in the diff are relative to the repo root.
+            let per_file_diff = if let Some((filter, repo_root)) = diff_filter {
+                let repo_rel = py_file.strip_prefix(repo_root).unwrap_or(py_file);
+                if !filter.file_is_touched(repo_rel) {
+                    // File unchanged: copy verbatim for package integrity, generate no mutants.
+                    let dest = mutants_dir.join(rel_path);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&dest, &source)?;
+                    return Ok(None);
+                }
+                Some((filter, repo_rel.to_path_buf()))
+            } else {
+                None
+            };
+
+            let file_diff_arg = per_file_diff.as_ref().map(|(f, p)| (*f, p.as_path()));
+
+            if let Some(mutated) = mutate_file(&source, &module_name, file_diff_arg) {
                 // Write mutated file
                 let dest = mutants_dir.join(rel_path);
                 if let Some(parent) = dest.parent() {
@@ -2006,7 +2046,7 @@ mod tests {
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
+        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
 
         // Both files must be present in mutants/
         assert!(
@@ -2041,7 +2081,7 @@ mod tests {
         // utils.py — only constants, no mutations
         std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
+        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
         assert!(
@@ -2086,7 +2126,7 @@ mod tests {
         std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points directly at the package directory "src/mypkg"
-        generate_mutants(&pkg, mutants_tmp.path(), &[]).unwrap();
+        generate_mutants(&pkg, mutants_tmp.path(), &[], None).unwrap();
 
         // Files must land under mutants/mypkg/, not directly in mutants/
         let mutants_pkg = mutants_tmp.path().join("mypkg");
@@ -2124,7 +2164,7 @@ mod tests {
         std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points at the source root "src" (no __init__.py there)
-        generate_mutants(&src, mutants_tmp.path(), &[]).unwrap();
+        generate_mutants(&src, mutants_tmp.path(), &[], None).unwrap();
 
         // Files must land under mutants/simple_lib/
         assert!(
@@ -2150,7 +2190,7 @@ mod tests {
         std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // Should not panic even when parent() returns an empty component
-        let result = generate_mutants(tmp.path(), mutants_tmp.path(), &[]);
+        let result = generate_mutants(tmp.path(), mutants_tmp.path(), &[], None);
         assert!(
             result.is_ok(),
             "should not fail for package dirs with no parent prefix"
@@ -2227,7 +2267,7 @@ mod tests {
         // Build pattern that matches config.py. Since the test uses absolute paths,
         // we match using just the filename via **.
         let pattern = "**/config.py".to_string();
-        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[pattern]).unwrap();
+        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[pattern], None).unwrap();
 
         // config.py should NOT be in the mutant names (skipped)
         for module in result.names_by_module.keys() {
@@ -2261,7 +2301,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[]).unwrap();
+        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
         assert!(
             !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
@@ -2368,7 +2408,7 @@ mod tests {
 
         // Generate real mutants — the trampoline `if active == 'fail': raise …` must be present.
         let tmp_mutants = tempfile::tempdir().unwrap();
-        generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[])
+        generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[], None)
             .expect("mutant generation should succeed for fixture");
 
         let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
@@ -2811,5 +2851,168 @@ mod tests {
         assert!(serialized.contains("\"survived\""));
         assert!(serialized.contains("\"killed\""));
         assert!(serialized.contains("\"no_tests\""));
+    }
+
+    // --- generate_mutants: diff filter integration tests ---
+
+    /// INV-1: Unchanged files are copied verbatim to mutants/ but produce zero mutants.
+    #[test]
+    fn test_diff_filter_unchanged_file_copied_no_mutants() {
+        use crate::git_diff::DiffFilter;
+
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // A file with a function that would generate mutations.
+        std::fs::write(
+            src_tmp.path().join("lib.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+
+        // Build a DiffFilter that doesn't include lib.py at all (file unchanged).
+        let filter = DiffFilter::default();
+        let repo_root = src_tmp.path();
+
+        let result = generate_mutants(
+            src_tmp.path(),
+            mutants_tmp.path(),
+            &[],
+            Some((&filter, repo_root)),
+        )
+        .unwrap();
+
+        // No mutants should be generated.
+        assert!(
+            result.names_by_module.is_empty(),
+            "unchanged file should produce no mutants; got: {:?}",
+            result.names_by_module
+        );
+
+        // But the file should still be copied.
+        assert!(
+            mutants_tmp.path().join("lib.py").exists(),
+            "unchanged file must be copied to mutants/ for package integrity"
+        );
+    }
+
+    /// INV-2: Unchanged functions within a changed file produce zero mutants.
+    #[test]
+    fn test_diff_filter_unchanged_function_in_changed_file_skipped() {
+
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        // Two functions; only `bar` (lines 4-5) is "changed".
+        let source = "def foo(a, b):\n    return a + b\n\ndef bar(x):\n    return x - 1\n";
+        std::fs::write(src_tmp.path().join("lib.py"), source).unwrap();
+
+        // Build a DiffFilter touching only bar's lines (4-5) via a minimal diff string.
+        let diff_text = "\
+diff --git a/lib.py b/lib.py
+index abc..def 100644
+--- a/lib.py
++++ b/lib.py
+@@ -4,2 +4,2 @@ def bar(x):
+-    return x - 1
++    return x - 2
+";
+        let filter = crate::git_diff::parse_unified_diff(diff_text);
+        let repo_root = src_tmp.path();
+
+        let result = generate_mutants(
+            src_tmp.path(),
+            mutants_tmp.path(),
+            &[],
+            Some((&filter, repo_root)),
+        )
+        .unwrap();
+
+        // Should have mutants only for bar, not foo.
+        let all_names: Vec<&String> = result.names_by_module.values().flatten().collect();
+        assert!(
+            !all_names.is_empty(),
+            "bar should have been mutated"
+        );
+        // None of the mutant names should reference x_foo.
+        for name in &all_names {
+            assert!(
+                !name.contains("x_foo"),
+                "foo was not in the diff, should not be mutated; got: {name}"
+            );
+        }
+        // All mutant names should reference x_bar.
+        assert!(
+            all_names.iter().any(|n| n.contains("x_bar")),
+            "bar should have mutants; names: {all_names:?}"
+        );
+    }
+
+    /// INV-3: Without --diff, behaviour is identical to before (no regression).
+    #[test]
+    fn test_no_diff_filter_produces_same_results() {
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_a = tempfile::tempdir().unwrap();
+        let mutants_b = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            src_tmp.path().join("lib.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+
+        let result_no_filter =
+            generate_mutants(src_tmp.path(), mutants_a.path(), &[], None).unwrap();
+        let result_none_filter =
+            generate_mutants(src_tmp.path(), mutants_b.path(), &[], None).unwrap();
+
+        assert_eq!(
+            result_no_filter.names_by_module.len(),
+            result_none_filter.names_by_module.len(),
+            "None diff_filter must produce same result as no filter"
+        );
+    }
+
+    /// INV-4: New file (None entry in DiffFilter) gets all functions mutated.
+    #[test]
+    fn test_diff_filter_new_file_all_functions_mutated() {
+        let src_tmp = tempfile::tempdir().unwrap();
+        let mutants_tmp = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            src_tmp.path().join("new_lib.py"),
+            "def foo(a, b):\n    return a + b\n\ndef bar(x):\n    return x - 1\n",
+        )
+        .unwrap();
+
+        // Simulate new file: parse_unified_diff with new file mode.
+        let diff_text = "\
+diff --git a/new_lib.py b/new_lib.py
+new file mode 100644
+index 000..abc
+--- /dev/null
++++ b/new_lib.py
+@@ -0,0 +1,5 @@
++def foo(a, b):
++    return a + b
++
++def bar(x):
++    return x - 1
+";
+        let filter = crate::git_diff::parse_unified_diff(diff_text);
+        let repo_root = src_tmp.path();
+
+        let result = generate_mutants(
+            src_tmp.path(),
+            mutants_tmp.path(),
+            &[],
+            Some((&filter, repo_root)),
+        )
+        .unwrap();
+
+        let all_names: Vec<&String> = result.names_by_module.values().flatten().collect();
+        // Both foo and bar should have mutants.
+        assert!(all_names.iter().any(|n| n.contains("x_foo")), "foo should be mutated in new file");
+        assert!(all_names.iter().any(|n| n.contains("x_bar")), "bar should be mutated in new file");
     }
 }

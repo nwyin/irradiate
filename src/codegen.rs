@@ -2,8 +2,10 @@
 //! mutated version with all functions trampolined.
 
 use crate::cache::MutantCacheDescriptor;
+use crate::git_diff::DiffFilter;
 use crate::mutation::{collect_file_mutations, FunctionMutations};
 use crate::trampoline::{generate_trampoline, trampoline_impl, TrampolineOutput};
+use std::path::Path;
 
 /// Result of mutating a single Python source file.
 #[derive(Debug)]
@@ -18,9 +20,23 @@ pub struct MutatedFile {
 
 /// Generate the mutated version of a Python source file.
 ///
-/// Returns None if no mutations were found.
-pub fn mutate_file(source: &str, module_name: &str) -> Option<MutatedFile> {
-    let function_mutations = collect_file_mutations(source);
+/// When `diff_filter` is provided, only functions touched by the diff are mutated.
+/// `diff_filter` is `(filter, file_rel_path)` where `file_rel_path` is the path
+/// relative to the git repository root (used to look up the file in the diff).
+///
+/// Returns None if no mutations were found (after filtering).
+pub fn mutate_file(
+    source: &str,
+    module_name: &str,
+    diff_filter: Option<(&DiffFilter, &Path)>,
+) -> Option<MutatedFile> {
+    let mut function_mutations = collect_file_mutations(source);
+
+    // Filter to only functions touched by the diff when in incremental mode.
+    if let Some((filter, rel_path)) = diff_filter {
+        function_mutations
+            .retain(|fm| filter.function_is_touched(rel_path, fm.start_line, fm.end_line));
+    }
 
     if function_mutations.is_empty() {
         return None;
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn test_mutate_simple_file() {
         let source = "def add(a, b):\n    return a + b\n";
-        let result = mutate_file(source, "simple_lib").unwrap();
+        let result = mutate_file(source, "simple_lib", None).unwrap();
 
         assert!(
             result.source.contains("import irradiate_harness"),
@@ -350,7 +366,7 @@ mod tests {
     #[test]
     fn test_mutate_file_no_mutations() {
         let source = "# just a comment\npass\n";
-        let result = mutate_file(source, "empty");
+        let result = mutate_file(source, "empty", None);
         assert!(
             result.is_none(),
             "Should return None for files with no mutations"
@@ -360,7 +376,7 @@ mod tests {
     #[test]
     fn test_mutate_file_preserves_imports() {
         let source = "import os\nimport sys\n\ndef add(a, b):\n    return a + b\n";
-        let result = mutate_file(source, "my_mod").unwrap();
+        let result = mutate_file(source, "my_mod", None).unwrap();
 
         assert!(
             result.source.contains("import os"),
@@ -375,7 +391,7 @@ mod tests {
     #[test]
     fn test_mutate_file_multiple_functions() {
         let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
-        let result = mutate_file(source, "math_lib").unwrap();
+        let result = mutate_file(source, "math_lib", None).unwrap();
 
         assert!(
             result.source.contains("x_add__irradiate_orig"),
@@ -398,7 +414,7 @@ class Calculator:
     def add(self, a, b):
         return a + b
 ";
-        let result = mutate_file(source, "calc").unwrap();
+        let result = mutate_file(source, "calc", None).unwrap();
 
         // The wrapper `def add(self, a, b)` must be INSIDE the class body,
         // i.e. it must appear indented after `class Calculator:`.
@@ -446,7 +462,7 @@ class Finder:
     def search(self, query):
         return query in self.path
 ";
-        let result = mutate_file(source, "finder").unwrap();
+        let result = mutate_file(source, "finder", None).unwrap();
 
         // Parse the output: both __init__ and search wrappers must be inside the class
         let lines: Vec<&str> = result.source.lines().collect();
@@ -480,7 +496,7 @@ class Finder:
     #[test]
     fn test_mutated_functions_not_duplicated() {
         let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
-        let result = mutate_file(source, "m").unwrap();
+        let result = mutate_file(source, "m", None).unwrap();
 
         // The original function definitions should NOT appear in the output
         // (they're replaced by the trampoline arrangement)
@@ -505,7 +521,7 @@ class Finder:
     #[test]
     fn test_top_level_wrapper_at_module_level() {
         let source = "def add(a, b):\n    return a + b\n";
-        let result = mutate_file(source, "m").unwrap();
+        let result = mutate_file(source, "m", None).unwrap();
 
         // The wrapper `def add(` must NOT be indented (indent == 0)
         let wrapper_line = result
@@ -532,7 +548,7 @@ class Calc:
     def add(self, a, b):
         return a + b
 ";
-        let result = mutate_file(source, "m").unwrap();
+        let result = mutate_file(source, "m", None).unwrap();
 
         // The mangled orig function definition must be indented (inside the class body),
         // NOT at module level (indent 0).
@@ -567,7 +583,7 @@ class Calc:
     fn test_top_level_mangled_code_at_module_level() {
         // INV-3: for top-level functions, mangled orig/variants/dict stay at module level.
         let source = "def add(a, b):\n    return a + b\n";
-        let result = mutate_file(source, "m").unwrap();
+        let result = mutate_file(source, "m", None).unwrap();
 
         let orig_line = result
             .source
@@ -593,7 +609,7 @@ class Processor:
     def run(self, x):
         return x - 1
 ";
-        let result = mutate_file(source, "mixed").unwrap();
+        let result = mutate_file(source, "mixed", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         // top-level `compute` wrapper must be at indent 0
@@ -643,7 +659,7 @@ class Beta:
     def process(self, x):
         return x - 1
 ";
-        let result = mutate_file(source, "dual").unwrap();
+        let result = mutate_file(source, "dual", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let alpha_pos = lines
@@ -710,7 +726,7 @@ class Beta:
         // INV-1: single-line docstring then from __future__ → both before preamble.
         let source =
             "\"\"\"Module docstring.\"\"\"\n\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let doc_pos = lines
@@ -740,7 +756,7 @@ class Beta:
     fn test_multiline_docstring_before_future_import() {
         // INV-2: multi-line docstring before from __future__ → both before preamble.
         let source = "\"\"\"Multi-line\ndocstring here.\n\"\"\"\n\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let future_pos = lines
@@ -771,7 +787,7 @@ class Beta:
     fn test_docstring_only_no_future_import() {
         // Docstring without __future__ import — docstring should stay before preamble.
         let source = "\"\"\"Just a docstring.\"\"\"\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let doc_pos = lines
@@ -802,7 +818,7 @@ class Markup:
     ):
         return 1 + 2
 ";
-        let result = mutate_file(source, "markup").unwrap();
+        let result = mutate_file(source, "markup", None).unwrap();
 
         // The body `return 1 + 2` must appear exactly once (in the mangled orig).
         // If the body leaked as orphan code in the class, it would appear twice.
@@ -844,7 +860,7 @@ def build(
 ):
     return x + y
 ";
-        let result = mutate_file(source, "top").unwrap();
+        let result = mutate_file(source, "top", None).unwrap();
 
         // No orphan standalone `)` lines
         for line in result.source.lines() {
@@ -889,7 +905,7 @@ class Markup:
     ) -> str:
         return 1 + 2
 ";
-        let result = mutate_file(source, "markup").unwrap();
+        let result = mutate_file(source, "markup", None).unwrap();
 
         // The body must appear exactly once (only in the mangled orig, not as orphan).
         let body_count = result.source.matches("return 1 + 2").count();
@@ -948,7 +964,7 @@ class Calc:
     def add(self, a, b):
         return a + b
 ";
-        let result = mutate_file(source, "calc").unwrap();
+        let result = mutate_file(source, "calc", None).unwrap();
 
         // Wrapper must be inside class (indented)
         let wrapper_line = result
@@ -973,7 +989,7 @@ class Calc:
     fn test_future_import_before_preamble() {
         // INV-1: from __future__ import annotations must appear before the trampoline preamble.
         let source = "from __future__ import annotations\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let future_pos = result
             .source
             .lines()
@@ -994,7 +1010,7 @@ class Calc:
     fn test_leading_comment_and_future_import_before_preamble() {
         // INV-2: leading comments and blank lines before __future__ are preserved in their original position.
         let source = "# comment\nfrom __future__ import annotations\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let comment_pos = lines
@@ -1024,7 +1040,7 @@ class Calc:
     fn test_no_future_import_preamble_first() {
         // INV-3: files without __future__ imports still have preamble first (existing behavior).
         let source = "import os\n\ndef foo():\n    return 1\n";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let preamble_pos = result
             .source
             .lines()
@@ -1051,7 +1067,7 @@ class Single:
     def only(self, x):
         return x + 1
 ";
-        let result = mutate_file(source, "single").unwrap();
+        let result = mutate_file(source, "single", None).unwrap();
 
         // class body should not be empty — the wrapper must be there
         let lines: Vec<&str> = result.source.lines().collect();
@@ -1088,7 +1104,7 @@ def make_value(x):
 
 RESULT = make_value(42)
 ";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let wrapper_pos = lines
@@ -1125,7 +1141,7 @@ def make_b(x):
 A = make_a(10)
 B = make_b(20)
 ";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let wrapper_a = lines
@@ -1175,7 +1191,7 @@ def factory(n):
     return n * 2
 X = factory(5)
 ";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let wrapper_pos = lines
@@ -1210,7 +1226,7 @@ X = factory(5)
         // This ensures that even if nothing calls the function at module level,
         // the output is always in the correct order.
         let source = "def add(a, b):\n    return a + b\n";
-        let result = mutate_file(source, "m").unwrap();
+        let result = mutate_file(source, "m", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let orig_pos = lines
@@ -1245,7 +1261,7 @@ def make_cached_stream_func(stream):
 
 CACHED = make_cached_stream_func(42)
 ";
-        let result = mutate_file(source, "mod").unwrap();
+        let result = mutate_file(source, "mod", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 
         let orig_pos = lines
@@ -1322,7 +1338,7 @@ CACHED = make_cached_stream_func(42)
         // Target 1, P1: mutate_file never panics on arbitrary string input.
         #[test]
         fn prop_mutate_file_no_panic(source in ".*") {
-            let _ = mutate_file(&source, "test_mod");
+            let _ = mutate_file(&source, "test_mod", None);
         }
 
         // Target 1, P3: `from __future__` appears before the trampoline preamble.
@@ -1340,7 +1356,7 @@ CACHED = make_cached_stream_func(42)
             } else {
                 body
             };
-            if let Some(result) = mutate_file(&source, "test_mod") {
+            if let Some(result) = mutate_file(&source, "test_mod", None) {
                 if result.source.contains("from __future__") {
                     let lines: Vec<&str> = result.source.lines().collect();
                     let future_pos = lines
@@ -1368,7 +1384,7 @@ CACHED = make_cached_stream_func(42)
             op   in prop_oneof![Just("+"),   Just("-"),   Just("*"),   Just("//")],
         ) {
             let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
-            if let Some(result) = mutate_file(&source, "test_mod") {
+            if let Some(result) = mutate_file(&source, "test_mod", None) {
                 for name in &result.mutant_names {
                     prop_assert!(name.starts_with("test_mod."), "must be module-qualified: {name}");
                     prop_assert!(name.contains("__irradiate_"), "must have __irradiate_: {name}");
@@ -1392,7 +1408,7 @@ CACHED = make_cached_stream_func(42)
             use crate::mutation::collect_file_mutations;
             let source = format!("def {func}({a}, {b}):\n    return {a} {op} {b}\n");
             let fms = collect_file_mutations(&source);
-            if let Some(result) = mutate_file(&source, "test_mod") {
+            if let Some(result) = mutate_file(&source, "test_mod", None) {
                 for fm in &fms {
                     let def_pattern = format!("def {}(", fm.name);
                     prop_assert!(
@@ -1428,7 +1444,7 @@ CACHED = make_cached_stream_func(42)
             } else {
                 body
             };
-            if let Some(result) = mutate_file(&source, "test_mod") {
+            if let Some(result) = mutate_file(&source, "test_mod", None) {
                 prop_assert!(
                     is_valid_python(&result.source),
                     "output not parseable Python for input:\n{source}\noutput:\n{}",
