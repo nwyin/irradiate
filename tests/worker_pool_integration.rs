@@ -31,7 +31,7 @@ fn fixture_dir() -> PathBuf {
 fn generate_test_mutants() -> (tempfile::TempDir, Vec<String>) {
     let source = fs::read_to_string(fixture_dir().join("src/simple_lib/__init__.py")).unwrap();
     let mutated =
-        codegen::mutate_file(&source, "simple_lib").expect("fixture should produce mutations");
+        codegen::mutate_file(&source, "simple_lib", None).expect("fixture should produce mutations");
 
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("simple_lib")).unwrap();
@@ -47,7 +47,7 @@ fn generate_mutants_for_project(
 ) -> (tempfile::TempDir, Vec<String>) {
     let source = fs::read_to_string(project_dir.join(source_rel_path)).unwrap();
     let mutated =
-        codegen::mutate_file(&source, module_name).expect("fixture should produce mutations");
+        codegen::mutate_file(&source, module_name, None).expect("fixture should produce mutations");
 
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join(module_name)).unwrap();
@@ -1010,6 +1010,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         verify_survivors: false,
         do_not_mutate: vec![],
         fail_under: None,
+        diff_ref: None,
     }
 }
 

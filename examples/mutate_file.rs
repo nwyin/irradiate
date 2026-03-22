@@ -15,7 +15,7 @@ def greet(name):
     return "Hello, " + name
 "#;
 
-    match mutate_file(source, "simple_lib") {
+    match mutate_file(source, "simple_lib", None) {
         Some(result) => {
             println!(
                 "=== Mutated source ({} mutants) ===\n",

@@ -89,12 +89,38 @@ pub fn find_git_root(start: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(stdout.trim()))
 }
 
+/// Try to resolve the merge-base between `diff_ref` and HEAD.
+///
+/// Returns `Some(sha)` if merge-base succeeds, `None` if it fails (e.g. unrelated
+/// histories, detached HEAD, or `diff_ref` is already a commit SHA / relative ref).
+fn resolve_merge_base(diff_ref: &str, repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["merge-base", diff_ref, "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !sha.is_empty() {
+            return Some(sha);
+        }
+    }
+    None
+}
+
 /// Run `git diff <diff_ref>` and parse the unified diff output into a `DiffFilter`.
 ///
 /// `diff_ref` can be any git ref: "main", "HEAD~3", a commit SHA, etc.
+/// When `diff_ref` is a branch name, we resolve it via `git merge-base` first
+/// so that `--diff main` means "changes since this branch diverged from main"
+/// rather than "diff between working tree and main's current tip".
 pub fn parse_git_diff(diff_ref: &str, repo_root: &Path) -> Result<DiffFilter> {
+    // Resolve merge-base so branch names compare against the divergence point.
+    let effective_ref = resolve_merge_base(diff_ref, repo_root).unwrap_or_else(|| diff_ref.to_string());
+
     let output = std::process::Command::new("git")
-        .args(["diff", diff_ref, "--unified=0", "--no-color"])
+        .args(["diff", &effective_ref, "--unified=0", "--no-color"])
         .current_dir(repo_root)
         .output()
         .context("failed to run git diff")?;

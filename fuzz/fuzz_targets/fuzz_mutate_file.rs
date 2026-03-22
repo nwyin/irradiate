@@ -8,5 +8,5 @@ fuzz_target!(|data: &[u8]| {
         Some(idx) => (&s[..idx], &s[idx + 1..]),
         None => (s, "fuzz_module"),
     };
-    let _ = irradiate::codegen::mutate_file(source, module_name);
+    let _ = irradiate::codegen::mutate_file(source, module_name, None);
 });
