@@ -39,6 +39,10 @@ pub struct FunctionMutations {
     pub is_generator: bool,
     /// Mutations found within this function body.
     pub mutations: Vec<Mutation>,
+    /// 1-indexed start line of the function in the source file.
+    pub start_line: usize,
+    /// 1-indexed end line of the function in the source file.
+    pub end_line: usize,
 }
 
 /// Collect all function mutations from a Python source file.

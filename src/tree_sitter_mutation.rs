@@ -246,6 +246,10 @@ fn collect_function_mutations(
         return None;
     }
 
+    // tree-sitter positions are 0-indexed; convert to 1-indexed line numbers.
+    let start_line = function_node.start_position().row + 1;
+    let end_line = function_node.end_position().row + 1;
+
     Some(FunctionMutations {
         name,
         class_name: class_name.map(ToOwned::to_owned),
@@ -255,6 +259,8 @@ fn collect_function_mutations(
         is_async,
         is_generator,
         mutations,
+        start_line,
+        end_line,
     })
 }
 
@@ -1765,6 +1771,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Line span tests ---
+
+    #[test]
+    fn line_span_single_function_at_top_of_file() {
+        // INV-2: first line of file is 1; INV-1: start_line <= end_line
+        let source = "def f(x):\n    return x + 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        assert_eq!(fm.start_line, 1, "function starts on line 1");
+        assert_eq!(fm.end_line, 2, "function ends on line 2");
+        assert!(fm.start_line <= fm.end_line, "INV-1: start_line <= end_line");
+    }
+
+    #[test]
+    fn line_span_function_not_at_line_one() {
+        // Function that starts on line 3 (two blank lines precede it)
+        let source = "\n\ndef g(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        assert_eq!(fm.start_line, 3, "function starts on line 3");
+        assert_eq!(fm.end_line, 4, "function ends on line 4");
+        assert!(fm.start_line <= fm.end_line, "INV-1: start_line <= end_line");
+    }
+
+    #[test]
+    fn line_spans_multiple_functions() {
+        // Two functions; verify each gets independent correct spans.
+        let source = concat!(
+            "def first(x):\n",   // line 1
+            "    return x + 1\n", // line 2
+            "\n",                  // line 3
+            "def second(y):\n",   // line 4
+            "    return y - 1\n", // line 5
+        );
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 2, "expected two functions");
+
+        let first = fms.iter().find(|f| f.name == "first").expect("first");
+        let second = fms.iter().find(|f| f.name == "second").expect("second");
+
+        assert_eq!(first.start_line, 1);
+        assert_eq!(first.end_line, 2);
+        assert_eq!(second.start_line, 4);
+        assert_eq!(second.end_line, 5);
+
+        assert!(first.start_line <= first.end_line, "INV-1 for first");
+        assert!(second.start_line <= second.end_line, "INV-1 for second");
+        assert!(first.end_line < second.start_line, "functions must not overlap");
+    }
+
+    #[test]
+    fn line_span_class_method() {
+        // Method inside a class; line numbers are absolute in the source file.
+        let source = concat!(
+            "class Foo:\n",       // line 1
+            "    def bar(self):\n", // line 2
+            "        return 1\n",  // line 3
+        );
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        assert_eq!(fm.name, "bar");
+        assert_eq!(fm.start_line, 2, "method starts on line 2");
+        assert_eq!(fm.end_line, 3, "method ends on line 3");
+        assert!(fm.start_line <= fm.end_line, "INV-1 for method");
+    }
+
+    #[test]
+    fn line_span_multiline_function_body() {
+        // Longer function; end_line must be the last line of the def block.
+        let source = concat!(
+            "def compute(a, b, c):\n", // line 1
+            "    x = a + b\n",          // line 2
+            "    y = b - c\n",          // line 3
+            "    return x + y\n",       // line 4
+        );
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        assert_eq!(fm.start_line, 1);
+        assert_eq!(fm.end_line, 4);
+        assert!(fm.start_line <= fm.end_line, "INV-1");
     }
 
 }
