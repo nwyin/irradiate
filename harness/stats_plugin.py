@@ -76,7 +76,8 @@ class IrradiateStatsPlugin:
             return False
         except irradiate_harness.ProgrammaticFailException:
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[irradiate] fail-path validation error: {e}", file=sys.stderr)
             return False
         finally:
             irradiate_harness.active_mutant = None

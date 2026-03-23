@@ -267,8 +267,17 @@ class MutationWorkerPlugin:
                 continue
 
             if msg["type"] == "run":
-                mutant_name = msg["mutant"]
-                test_ids = msg["tests"]
+                try:  # pragma: no mutate
+                    mutant_name = msg["mutant"]
+                    test_ids = msg["tests"]
+                except KeyError as e:  # pragma: no mutate
+                    send_message(self.sock, {
+                        "type": "error",
+                        "mutant": None,
+                        "message": f"malformed run message: missing field {e}",
+                        "duration": 0.0,
+                    })
+                    continue
 
                 start = time.monotonic()
 
