@@ -1,0 +1,12 @@
+[project]
+name = "async_gen_project"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.irradiate]
+paths_to_mutate = "async_stream/"
+tests_dir = "tests/"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
