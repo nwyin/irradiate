@@ -277,6 +277,35 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // mutants_dir is handled by the MutantFinder import hook, not PYTHONPATH.
     let pythonpath = build_pythonpath(&harness_dir, &config.paths_to_mutate);
 
+    // Pre-spawn workers before stats so they boot (~480ms) in parallel with
+    // stats collection (~3-4s). Workers only need harness + PYTHONPATH + socket,
+    // none of which depend on stats results.
+    let pre_spawned = if !config.isolate && !config.no_stats {
+        let pool_config = PoolConfig {
+            num_workers: config.workers,
+            python: config.python.clone(),
+            project_dir: project_dir.clone(),
+            mutants_dir: mutants_dir.clone(),
+            tests_dir: PathBuf::from(&config.tests_dir),
+            timeout_multiplier: config.timeout_multiplier,
+            pythonpath: pythonpath.clone(),
+            worker_recycle_after: config.worker_recycle_after,
+            max_worker_memory_mb: config.max_worker_memory_mb,
+            pytest_add_cli_args: config.pytest_add_cli_args.clone(),
+            ..Default::default()
+        };
+        let num_workers = config.workers.min(total_mutants);
+        match crate::orchestrator::pre_spawn_pool(&pool_config, &harness_dir, num_workers) {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                tracing::warn!("Pre-spawn failed, will spawn later: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Phase 2: Stats collection + validation
     // When stats are enabled, a single pytest run collects coverage, timing,
     // and performs an in-process fail probe — replacing the old separate clean
@@ -523,8 +552,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 ..Default::default()
             };
             let progress = crate::progress::ProgressBar::new(total_mutants);
-            let (results, worker_trace) =
-                run_worker_pool(&pool_config, execution_work, Some(progress)).await?;
+            let (results, worker_trace) = if let Some(pool) = pre_spawned {
+                // Workers were pre-spawned during stats — they're already booted
+                crate::orchestrator::run_worker_pool_pre_spawned(
+                    &pool_config, execution_work, Some(progress), pool,
+                ).await?
+            } else {
+                run_worker_pool(&pool_config, execution_work, Some(progress)).await?
+            };
             trace.merge(worker_trace);
             results
         };

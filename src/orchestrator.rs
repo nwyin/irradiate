@@ -90,6 +90,55 @@ enum WorkerEvent {
     },
 }
 
+/// Workers that have been spawned but not yet dispatched work.
+///
+/// Created by `pre_spawn_pool()` so workers can boot (Python startup + pytest
+/// collection) in parallel with stats collection or other pipeline phases.
+pub struct PreSpawnedPool {
+    listener: UnixListener,
+    processes: Vec<Child>,
+    socket_path: PathBuf,
+    harness_dir: PathBuf,
+}
+
+/// Spawn workers early so they can boot during stats collection.
+///
+/// Workers connect to the socket and run pytest collection (~480ms), then wait
+/// for the "ready" handshake. By the time stats finishes and work items are
+/// built, workers are already warm and ready to receive work.
+pub fn pre_spawn_pool(
+    config: &PoolConfig,
+    harness_dir: &Path,
+    num_workers: usize,
+) -> Result<PreSpawnedPool> {
+    let socket_name = format!(
+        "irradiate-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    );
+    let socket_path = std::env::temp_dir().join(socket_name);
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = UnixListener::bind(&socket_path).context("Failed to bind unix socket")?;
+    info!("Pre-spawning {num_workers} workers on {}", socket_path.display());
+
+    let mut processes: Vec<Child> = Vec::new();
+    for i in 0..num_workers {
+        let child = spawn_worker(i, config, harness_dir, &socket_path)?;
+        processes.push(child);
+    }
+
+    Ok(PreSpawnedPool {
+        listener,
+        processes,
+        socket_path,
+        harness_dir: harness_dir.to_path_buf(),
+    })
+}
+
 /// Run a pool of pytest workers against a list of work items.
 ///
 /// Returns the results for all mutants.
@@ -106,46 +155,44 @@ pub async fn run_worker_pool(
     let harness_dir =
         harness::extract_harness(&config.project_dir).context("Failed to extract harness")?;
 
-    // Create unix socket in /tmp to avoid macOS path length limit (104 bytes)
-    let socket_name = format!(
-        "irradiate-{}-{}.sock",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos()
-    );
-    let socket_path = std::env::temp_dir().join(socket_name);
-    let _ = std::fs::remove_file(&socket_path);
-
-    let listener = UnixListener::bind(&socket_path).context("Failed to bind unix socket")?;
-    info!("Orchestrator listening on {}", socket_path.display());
-
     let num_workers = config.num_workers.min(work_items.len());
+    let pre_spawned = pre_spawn_pool(config, &harness_dir, num_workers)?;
 
-    // Spawn initial workers
-    let mut processes: Vec<Child> = Vec::new();
-    for i in 0..num_workers {
-        let child = spawn_worker(i, config, &harness_dir, &socket_path)?;
-        processes.push(child);
+    run_worker_pool_pre_spawned(config, work_items, progress, pre_spawned).await
+}
+
+/// Run a pool using pre-spawned workers.
+///
+/// Use this when workers were spawned early (via `pre_spawn_pool`) to overlap
+/// worker boot time with other pipeline phases like stats collection.
+pub async fn run_worker_pool_pre_spawned(
+    config: &PoolConfig,
+    work_items: Vec<WorkItem>,
+    progress: Option<crate::progress::ProgressBar>,
+    pre_spawned: PreSpawnedPool,
+) -> Result<(Vec<MutantResult>, TraceLog)> {
+    if work_items.is_empty() {
+        // Clean up pre-spawned resources
+        let _ = std::fs::remove_file(&pre_spawned.socket_path);
+        return Ok((vec![], TraceLog::new()));
     }
 
     // Accept connections and dispatch work
     let mut trace = TraceLog::new();
     let results = dispatch_work(
-        listener,
-        processes,
+        pre_spawned.listener,
+        pre_spawned.processes,
         work_items,
         config,
-        &harness_dir,
-        &socket_path,
+        &pre_spawned.harness_dir,
+        &pre_spawned.socket_path,
         progress,
         &mut trace,
     )
     .await?;
 
     // Clean up socket
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&pre_spawned.socket_path);
 
     Ok((results, trace))
 }
