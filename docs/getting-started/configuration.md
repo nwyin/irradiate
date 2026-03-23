@@ -47,6 +47,8 @@ All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 --covered-only        Skip mutants with no test coverage
 --no-stats            Skip coverage collection; test all mutants against all tests
 --fail-under <SCORE>  Exit 1 if mutation score is below this threshold (0-100)
+--sample <N>          Test a random subset of mutants (0.0-1.0 = fraction, >1 = count)
+--sample-seed <N>     RNG seed for --sample [default: 0]
 ```
 
 ### Execution

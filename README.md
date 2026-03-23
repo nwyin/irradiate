@@ -39,6 +39,9 @@ irradiate run
 # Only test functions changed since main
 irradiate run --diff main
 
+# Test 10% of mutants (fast CI feedback)
+irradiate run --sample 0.1
+
 # Generate JSON report (Stryker mutation-testing-report-schema v2)
 irradiate run --report json
 
@@ -102,6 +105,29 @@ Content-addressable cache keyed on SHA-256 of function body + test IDs + operato
 
 `@property`, `@classmethod`, and `@staticmethod` are handled natively via a descriptor-aware trampoline. Other decorated functions are skipped (source-patching fallback planned — see [#13](https://github.com/nwyin/irradiate/issues/13)).
 
+### Sampling (`--sample`)
+
+Test a random subset of mutants for fast CI feedback. Academic research shows 5-10% random sampling gives 99% R² correlation with the full mutation score.
+
+- `--sample 0.1`: test 10% of mutants
+- `--sample 100`: test exactly 100 mutants
+- `--sample-seed 42`: override RNG seed (default: 0 for reproducibility)
+
+Sampling is operator-stratified — every mutation category is proportionally represented.
+
+### CI integration
+
+Drop-in [GitHub Actions composite action](docs/guide/ci-integration.md):
+
+```yaml
+- uses: nwyin/irradiate@v0
+  with:
+    diff: origin/main
+    fail-under: "80"
+```
+
+Auto-detects GitHub Actions and emits inline `::warning` annotations on survived mutants, plus a Markdown step summary.
+
 ### Performance tuning
 
 - `--workers N`: control parallelism (defaults to CPU count)
@@ -123,7 +149,8 @@ Content-addressable cache keyed on SHA-256 of function body + test IDs + operato
 | **Incremental** | — | `--diff` with merge-base |
 | **Reports** | Terminal only | JSON, HTML, GitHub Actions annotations |
 | **Decorator support** | Skip all | @property/@classmethod/@staticmethod handled |
-| **CI integration** | Manual | `--fail-under`, GitHub annotations, step summary |
+| **Sampling** | — | `--sample` with operator stratification |
+| **CI integration** | Manual | `--fail-under`, GitHub Actions action, annotations, step summary |
 | **Isolation** | Fork only | Warm-session + `--isolate` + `--verify-survivors` |
 
 ## Acknowledgments

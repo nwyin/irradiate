@@ -10,7 +10,7 @@ irradiate provides a composite action for drop-in CI integration. It auto-detect
 - uses: actions/checkout@v4
   with:
     fetch-depth: 0
-- uses: nwyin/irradiate@v0.1.1
+- uses: nwyin/irradiate@v0
   with:
     diff: origin/main
     fail-under: "80"
@@ -41,7 +41,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: nwyin/irradiate@v0.1.1
+      - uses: nwyin/irradiate@v0
         id: mutants
         with:
           diff: origin/main
@@ -95,7 +95,7 @@ Cache irradiate's content-addressable result store between runs:
 For nightly or release-branch checks, run against all code:
 
 ```yaml
-      - uses: nwyin/irradiate@v0.1.1
+      - uses: nwyin/irradiate@v0
         with:
           fail-under: "70"
           report: html
