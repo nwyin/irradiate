@@ -34,6 +34,28 @@ Both produce the same output code. We now emit only `return_value`.
 
 **Source**: internal analysis. ~9% mutant reduction on typical code.
 
+### String operator dedup
+
+`"hello"` previously generated two mutations:
+- `string_mutation`: `"hello"` → `"XXhelloXX"`
+- `string_emptying`: `"hello"` → `""`
+
+Both test whether code is sensitive to string content. We now emit only
+`string_emptying` — if code doesn't catch `""`, it won't catch `"XXhelloXX"` either.
+
+**Source**: internal analysis. ~2.5% mutant reduction on typical code.
+
+### Arg removal dedup
+
+`f(a, b)` previously generated both None-replacement and argument removal:
+- `f(None, b)` — replace with None (preserves arity)
+- `f(b)` — remove entirely (changes arity)
+
+Argument removal usually just crashes with `TypeError`, producing a trivially
+killed mutant that wastes test time. We now emit only None-replacement.
+
+**Source**: internal analysis. ~1.9% mutant reduction on typical code.
+
 ### Kaminski ROR (Relational Operator Replacement)
 
 Kaminski et al. proved via truth tables that for any relational expression `a op b`,
@@ -125,12 +147,6 @@ Zhang et al., "Operator-based and Random Mutant Selection: Better Together"
 (ASE 2013).
 
 ## Planned strategies
-
-### Operator dedup — string, arg_removal
-
-Two remaining dedup opportunities (tracked in GitHub issues #14-#15):
-- `string_mutation` + `string_emptying`: both test string content sensitivity (~2.5%)
-- `arg_removal` None-replacement + removal: both test argument usage (~1.9%)
 
 ### Mutation levels (`--level 1/2/3`)
 

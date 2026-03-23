@@ -704,17 +704,8 @@ fn add_string_mutation(
         return;
     }
 
-    let replacement = format!("{prefix}{quote}XX{inner}XX{quote}");
-    if replacement != text {
-        record_mutation(
-            text,
-            &replacement,
-            "string_mutation",
-            node.start_byte() - fn_start,
-            mutations,
-        );
-    }
-
+    // Only emit string_emptying — string_mutation (XX prefix/suffix) is redundant.
+    // If the code doesn't catch "", it won't catch "XXhelloXX" either.
     if !inner.is_empty() {
         let empty = format!("{prefix}{quote}{quote}");
         record_mutation(
@@ -1371,21 +1362,8 @@ fn add_arg_removal_mutations(
             );
         }
 
-        if args.len() > 1 {
-            let new_args: Vec<&str> = args
-                .iter()
-                .enumerate()
-                .filter_map(|(j, candidate)| (i != j).then_some(candidate.text))
-                .collect();
-            let new_call = format!("{function_text}({})", new_args.join(", "));
-            record_mutation(
-                node_text(source, node),
-                &new_call,
-                "arg_removal",
-                node.start_byte() - fn_start,
-                mutations,
-            );
-        }
+        // Argument removal (dropping the arg entirely) is redundant with None-replacement.
+        // Removal usually just crashes with TypeError, wasting test time.
     }
 }
 

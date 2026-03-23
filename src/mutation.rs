@@ -202,15 +202,19 @@ mod tests {
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
 
+        // string_mutation (XX variant) was removed as redundant with string_emptying.
         let string_mut = fms[0]
             .mutations
             .iter()
             .find(|m| m.operator == "string_mutation");
-        assert!(string_mut.is_some(), "Should find string mutation");
-        assert!(
-            string_mut.unwrap().replacement.contains("XX"),
-            "Should add XX prefix/suffix"
-        );
+        assert!(string_mut.is_none(), "string_mutation should no longer be emitted");
+
+        let empty_mut = fms[0]
+            .mutations
+            .iter()
+            .find(|m| m.operator == "string_emptying");
+        assert!(empty_mut.is_some(), "Should find string_emptying mutation");
+        assert_eq!(empty_mut.unwrap().replacement, "\"\"");
     }
 
     #[test]
@@ -229,7 +233,7 @@ mod tests {
         let string_muts: Vec<_> = fms[0]
             .mutations
             .iter()
-            .filter(|m| m.operator == "string_mutation")
+            .filter(|m| m.operator == "string_emptying")
             .collect();
         assert!(string_muts.is_empty(), "Docstrings should not be mutated");
     }
@@ -601,7 +605,7 @@ mod tests {
             for m in fm
                 .mutations
                 .iter()
-                .filter(|m| m.operator == "string_mutation")
+                .filter(|m| m.operator == "string_emptying")
             {
                 // The replacement must be a valid Python string literal.
                 // For '"', it must be delimited by single-quotes: starts with ' ends with '
@@ -632,7 +636,7 @@ mod tests {
             for m in fm
                 .mutations
                 .iter()
-                .filter(|m| m.operator == "string_mutation")
+                .filter(|m| m.operator == "string_emptying")
             {
                 if m.original == "\"'\"" {
                     // Must be delimited by double-quotes
@@ -646,21 +650,17 @@ mod tests {
         }
     }
 
-    // INV-3: Normal string mutations must still work after the delimiter-char fix.
+    // INV-3: Normal string gets string_emptying after the delimiter-char fix.
     #[test]
-    fn test_string_mutation_normal_strings_unaffected() {
+    fn test_string_emptying_normal_strings() {
         let source = "def greet():\n    return \"hello\"\n";
         let fms = collect_file_mutations(source);
         let string_mut = fms[0]
             .mutations
             .iter()
-            .find(|m| m.operator == "string_mutation");
-        assert!(string_mut.is_some(), "Normal string must still be mutated");
-        assert_eq!(
-            string_mut.unwrap().replacement,
-            "\"XXhelloXX\"",
-            "Normal string mutation should produce XXhelloXX"
-        );
+            .find(|m| m.operator == "string_emptying");
+        assert!(string_mut.is_some(), "Normal string must get string_emptying");
+        assert_eq!(string_mut.unwrap().replacement, "\"\"");
     }
 
     // INV-1: Applying string mutation to a delimiter-char string must produce parseable Python.
@@ -676,7 +676,7 @@ mod tests {
         for m in fm
             .mutations
             .iter()
-            .filter(|m| m.operator == "string_mutation")
+            .filter(|m| m.operator == "string_emptying")
         {
             let mutated_func = apply_mutation(&fm.source, m);
             assert!(
@@ -763,7 +763,7 @@ mod tests {
         super::mutations_by_operator(source, "arg_removal")
     }
 
-    // INV-1: f(a, b) → 4 arg_removal mutations: replace each arg + remove each arg
+    // INV-1: f(a, b) → 2 arg_removal mutations: replace each arg with None (removal dropped)
     #[test]
     fn test_arg_removal_two_args() {
         let source = "def foo(a, b):\n    f(a, b)\n";
@@ -771,8 +771,8 @@ mod tests {
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
         assert_eq!(
             muts.len(),
-            4,
-            "f(a, b) must produce 4 arg_removal mutations; got: {replacements:?}"
+            2,
+            "f(a, b) must produce 2 arg_removal mutations; got: {replacements:?}"
         );
         assert!(
             replacements.iter().any(|r| r.contains("f(None, b)")),
@@ -781,14 +781,6 @@ mod tests {
         assert!(
             replacements.iter().any(|r| r.contains("f(a, None)")),
             "missing f(a, None)"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(b)")),
-            "missing f(b)"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(a)")),
-            "missing f(a)"
         );
     }
 
@@ -849,7 +841,7 @@ mod tests {
         assert!(muts.is_empty(), "f() must produce 0 arg_removal mutations");
     }
 
-    // INV-7: f(a, b=2) handles keyword args correctly
+    // INV-7: f(a, b=2) handles keyword args correctly (None-replacement only)
     #[test]
     fn test_arg_removal_keyword_arg() {
         let source = "def foo(a):\n    f(a, b=2)\n";
@@ -857,8 +849,8 @@ mod tests {
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
         assert_eq!(
             muts.len(),
-            4,
-            "f(a, b=2) must produce 4 arg_removal mutations; got: {replacements:?}"
+            2,
+            "f(a, b=2) must produce 2 arg_removal mutations; got: {replacements:?}"
         );
         assert!(
             replacements.iter().any(|r| r.contains("f(None, b=2)")),
@@ -868,17 +860,9 @@ mod tests {
             replacements.iter().any(|r| r.contains("f(a, b=None)")),
             "missing f(a, b=None)"
         );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(b=2)")),
-            "missing f(b=2)"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(a)")),
-            "missing f(a)"
-        );
     }
 
-    // Three-arg call: f(a, b, c) → 6 mutations (replace each × 3 + remove each × 3)
+    // Three-arg call: f(a, b, c) → 3 mutations (replace each with None)
     #[test]
     fn test_arg_removal_three_args() {
         let source = "def foo(a, b, c):\n    f(a, b, c)\n";
@@ -886,10 +870,9 @@ mod tests {
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
         assert_eq!(
             muts.len(),
-            6,
-            "f(a, b, c) must produce 6 arg_removal mutations; got: {replacements:?}"
+            3,
+            "f(a, b, c) must produce 3 arg_removal mutations; got: {replacements:?}"
         );
-        // replace mutations
         assert!(
             replacements.iter().any(|r| r.contains("f(None, b, c)")),
             "missing f(None, b, c)"
@@ -902,45 +885,24 @@ mod tests {
             replacements.iter().any(|r| r.contains("f(a, b, None)")),
             "missing f(a, b, None)"
         );
-        // removal mutations
-        assert!(
-            replacements.iter().any(|r| r.contains("f(b, c)")),
-            "missing f(b, c) — remove first"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(a, c)")),
-            "missing f(a, c) — remove middle"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(a, b)")),
-            "missing f(a, b) — remove last"
-        );
     }
 
-    // None arg in multi-arg call: removal is generated even though replace is skipped
+    // None arg in multi-arg call: only non-None args get None-replacement
     #[test]
     fn test_arg_removal_none_arg_in_multi_arg() {
         let source = "def foo(b):\n    f(None, b)\n";
         let muts = arg_removal_mutations(source);
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
-        // arg 0 (None): no replace (already None), but remove → f(b)
-        // arg 1 (b): replace → f(None, None), remove → f(None)
+        // arg 0 (None): already None → skip
+        // arg 1 (b): replace → f(None, None)
         assert_eq!(
             muts.len(),
-            3,
-            "f(None, b) must produce 3 arg_removal mutations; got: {replacements:?}"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(b)")),
-            "missing f(b)"
+            1,
+            "f(None, b) must produce 1 arg_removal mutation; got: {replacements:?}"
         );
         assert!(
             replacements.iter().any(|r| r.contains("f(None, None)")),
             "missing f(None, None)"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(None)")),
-            "missing f(None)"
         );
     }
 
@@ -962,29 +924,23 @@ mod tests {
         }
     }
 
-    // Mixed: star and normal args together — only non-starred args get mutations
+    // Mixed: star and normal args together — only non-starred args get None-replacement
     #[test]
     fn test_arg_removal_mixed_star_and_normal() {
         // f(a, *args) — arg 0 is normal, arg 1 is starred
         let source = "def foo(a, args):\n    f(a, *args)\n";
         let muts = arg_removal_mutations(source);
-        // arg 0 (a): replace with None (1 mutation); no removal because starred args.len()=2 BUT
-        // *args is skipped, so the removal loop sees len=2 > 1 and removes arg 0 → f(*args)
         let replacements: Vec<&str> = muts.iter().map(|m| m.replacement.as_str()).collect();
-        // arg 0 produces: replace → f(None, *args), remove → f(*args)
-        // arg 1 (*args): skipped entirely
+        // arg 0 produces: replace → f(None, *args)
+        // arg 1 (*args): skipped entirely (starred)
         assert_eq!(
             muts.len(),
-            2,
-            "f(a, *args) must produce 2 arg_removal mutations; got: {replacements:?}"
+            1,
+            "f(a, *args) must produce 1 arg_removal mutation; got: {replacements:?}"
         );
         assert!(
             replacements.iter().any(|r| r.contains("f(None, *args)")),
             "missing f(None, *args)"
-        );
-        assert!(
-            replacements.iter().any(|r| r.contains("f(*args)")),
-            "missing f(*args)"
         );
     }
 
@@ -1996,15 +1952,13 @@ mod string_emptying_tests {
         super::mutations_by_operator(source, "string_emptying")
     }
 
-    // INV-1: Non-empty string gets both string_mutation (XX) and string_emptying ("") mutations.
+    // INV-1: Non-empty string gets string_emptying only (string_mutation removed as redundant).
     #[test]
-    fn test_nonempty_string_gets_both_mutations() {
+    fn test_nonempty_string_gets_emptying_only() {
         let source = "def greet():\n    return \"hello\"\n";
         let fms = collect_file_mutations(source);
         let all_muts: Vec<_> = fms.into_iter().flat_map(|fm| fm.mutations.into_iter()).collect();
-        let xx_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "string_mutation").collect();
         let empty_muts: Vec<_> = all_muts.iter().filter(|m| m.operator == "string_emptying").collect();
-        assert!(!xx_muts.is_empty(), "should find string_mutation (XX) for non-empty string");
         assert!(!empty_muts.is_empty(), "should find string_emptying for non-empty string");
         assert_eq!(empty_muts[0].replacement, "\"\"", "emptying replacement should be empty string");
     }
@@ -4407,7 +4361,7 @@ mod statement_deletion_tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         for m in &fms[0].mutations {
-            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+            if m.operator == "string_emptying" {
                 let span_text = &fms[0].source[m.start..m.end];
                 assert_eq!(
                     span_text, m.original,
@@ -4425,7 +4379,7 @@ mod statement_deletion_tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         for m in &fms[0].mutations {
-            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+            if m.operator == "string_emptying" {
                 let mutated = apply_mutation(&fms[0].source, m);
                 assert!(
                     parses_as_python(&mutated),
@@ -4447,7 +4401,7 @@ mod statement_deletion_tests {
         let string_muts: Vec<_> = fms[0]
             .mutations
             .iter()
-            .filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying")
+            .filter(|m| m.operator == "string_emptying")
             .collect();
         assert!(!string_muts.is_empty(), "Expected string mutations for parenthesized dict value");
         for m in &string_muts {
@@ -4472,7 +4426,7 @@ mod statement_deletion_tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         for m in &fms[0].mutations {
-            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+            if m.operator == "string_emptying" {
                 let span_text = &fms[0].source[m.start..m.end];
                 assert_eq!(span_text, m.original, "Regression: bare string span wrong for operator {}", m.operator);
             }
@@ -4486,7 +4440,7 @@ mod statement_deletion_tests {
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         for m in &fms[0].mutations {
-            if m.operator == "string_mutation" || m.operator == "string_emptying" {
+            if m.operator == "string_emptying" {
                 let span_text = &fms[0].source[m.start..m.end];
                 assert_eq!(span_text, m.original, "INV-1 violated for b-string in parens");
                 let mutated = apply_mutation(&fms[0].source, m);
@@ -4507,8 +4461,8 @@ mod statement_deletion_tests {
         let parens = "def f():\n    return (\n        \"hello\"\n    )\n";
         let bare_fms = collect_file_mutations(bare);
         let parens_fms = collect_file_mutations(parens);
-        let bare_count = bare_fms[0].mutations.iter().filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying").count();
-        let parens_count = parens_fms[0].mutations.iter().filter(|m| m.operator == "string_mutation" || m.operator == "string_emptying").count();
+        let bare_count = bare_fms[0].mutations.iter().filter(|m| m.operator == "string_emptying").count();
+        let parens_count = parens_fms[0].mutations.iter().filter(|m| m.operator == "string_emptying").count();
         assert_eq!(
             bare_count, parens_count,
             "INV-3: parenthesized string should produce same mutation count as bare string"
