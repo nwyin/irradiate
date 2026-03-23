@@ -198,12 +198,34 @@ pub fn mutate_file(
                 }
 
                 // Now strip the body: any lines at a deeper indent than func_indent.
+                // Track triple-quote state so multi-line strings with zero-indent
+                // content (e.g. f"""...\ntext at col 0\n""") don't prematurely end the body.
+                let mut in_triple_quote = false;
                 while i < lines.len() {
                     let next = lines[i];
                     let next_trimmed = next.trim_start();
                     let next_indent = next.len() - next_trimmed.len();
-                    // Function ends when we hit a non-empty line at same or lesser indent.
-                    if !next_trimmed.is_empty() && next_indent <= func_indent {
+
+                    // Snapshot: were we inside a triple-quoted string at the START of this line?
+                    let was_in_tq = in_triple_quote;
+
+                    // Count triple-quote toggles on this line.
+                    let dq = next.matches("\"\"\"").count();
+                    let sq = next.matches("'''").count();
+                    let toggles = dq + sq;
+                    if toggles % 2 != 0 {
+                        in_triple_quote = !in_triple_quote;
+                    }
+
+                    // Function ends when we hit a non-empty line at same or lesser indent,
+                    // but only if we were NOT inside a triple-quoted string when this line started.
+                    // A line that closes a triple-quote (e.g. `Address failures."""`) is still
+                    // part of the function body even though it may be at zero indent.
+                    if !was_in_tq
+                        && !in_triple_quote
+                        && !next_trimmed.is_empty()
+                        && next_indent <= func_indent
+                    {
                         break;
                     }
                     i += 1;
