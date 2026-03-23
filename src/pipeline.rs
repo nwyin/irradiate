@@ -73,8 +73,59 @@ struct ScheduledMutant {
     cache_key: Option<String>,
 }
 
+/// Validate that the environment is ready to run mutation testing.
+///
+/// Checks that paths exist and Python/pytest are usable before doing any work,
+/// so the user gets a clear error message immediately rather than after mutation
+/// generation completes.
+fn validate_environment(config: &RunConfig) -> Result<()> {
+    // Check that --paths-to-mutate exists.
+    if !config.paths_to_mutate.exists() {
+        bail!(
+            "--paths-to-mutate path '{}' does not exist",
+            config.paths_to_mutate.display()
+        );
+    }
+
+    // Check that --tests-dir exists.
+    if !Path::new(&config.tests_dir).exists() {
+        bail!("--tests-dir path '{}' does not exist", config.tests_dir);
+    }
+
+    // Check that --python is executable.
+    let python_ok = std::process::Command::new(&config.python)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !python_ok {
+        bail!(
+            "Python interpreter '{}' not found. Set --python to a valid Python path.",
+            config.python.display()
+        );
+    }
+
+    // Check that pytest is importable.
+    let pytest_ok = std::process::Command::new(&config.python)
+        .args(["-c", "import pytest"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !pytest_ok {
+        bail!(
+            "pytest not found in '{}'. Install with: {} -m pip install pytest",
+            config.python.display(),
+            config.python.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Run the full mutation testing pipeline.
 pub async fn run(config: RunConfig) -> Result<()> {
+    validate_environment(&config)?;
+
     let project_dir = std::env::current_dir()?;
     let mutants_dir = project_dir.join("mutants");
 
@@ -3067,5 +3118,99 @@ index 000..abc
         // Both foo and bar should have mutants.
         assert!(all_names.iter().any(|n| n.contains("x_foo")), "foo should be mutated in new file");
         assert!(all_names.iter().any(|n| n.contains("x_bar")), "bar should be mutated in new file");
+    }
+
+    // --- validate_environment tests ---
+
+    fn make_run_config_for_env_test(
+        paths_to_mutate: PathBuf,
+        tests_dir: String,
+        python: PathBuf,
+    ) -> RunConfig {
+        RunConfig {
+            paths_to_mutate,
+            tests_dir,
+            workers: 1,
+            timeout_multiplier: 10.0,
+            no_stats: true,
+            covered_only: false,
+            python,
+            mutant_filter: None,
+            worker_recycle_after: None,
+            max_worker_memory_mb: 0,
+            isolate: false,
+            verify_survivors: false,
+            do_not_mutate: vec![],
+            fail_under: None,
+            diff_ref: None,
+            report: None,
+            report_output: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_environment_nonexistent_python_errors() {
+        // INV: A nonexistent Python path must produce a clear error before any work starts.
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a real paths_to_mutate and tests_dir so only the python check fires.
+        std::fs::write(tmp.path().join("lib.py"), "def foo(): pass").unwrap();
+        std::fs::create_dir(tmp.path().join("tests")).unwrap();
+
+        let config = make_run_config_for_env_test(
+            tmp.path().join("lib.py"),
+            tmp.path().join("tests").to_string_lossy().to_string(),
+            PathBuf::from("/nonexistent/python/interpreter"),
+        );
+
+        let result = validate_environment(&config);
+        assert!(result.is_err(), "must error on nonexistent python");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("Python interpreter"),
+            "error should mention python not found; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_environment_nonexistent_paths_to_mutate_errors() {
+        // INV: A nonexistent --paths-to-mutate must produce a clear error, not a silent empty run.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("tests")).unwrap();
+
+        let config = make_run_config_for_env_test(
+            tmp.path().join("nonexistent_src"),
+            tmp.path().join("tests").to_string_lossy().to_string(),
+            PathBuf::from("python3"),
+        );
+
+        let result = validate_environment(&config);
+        assert!(result.is_err(), "must error on nonexistent paths_to_mutate");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("paths-to-mutate") || msg.contains("does not exist"),
+            "error should mention paths-to-mutate; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_environment_nonexistent_tests_dir_errors() {
+        // INV: A nonexistent --tests-dir must produce a clear error before mutation generation.
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a real paths_to_mutate so only the tests_dir check fires.
+        std::fs::write(tmp.path().join("lib.py"), "def foo(): pass").unwrap();
+
+        let config = make_run_config_for_env_test(
+            tmp.path().join("lib.py"),
+            tmp.path().join("nonexistent_tests").to_string_lossy().to_string(),
+            PathBuf::from("python3"),
+        );
+
+        let result = validate_environment(&config);
+        assert!(result.is_err(), "must error on nonexistent tests_dir");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("tests-dir") || msg.contains("does not exist"),
+            "error should mention tests-dir; got: {msg}"
+        );
     }
 }
