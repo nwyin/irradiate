@@ -213,7 +213,7 @@ pub fn mutate_file(
                     let dq = next.matches("\"\"\"").count();
                     let sq = next.matches("'''").count();
                     let toggles = dq + sq;
-                    if toggles % 2 != 0 {
+                    if !toggles.is_multiple_of(2) {
                         in_triple_quote = !in_triple_quote;
                     }
 

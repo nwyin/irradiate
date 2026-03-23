@@ -208,27 +208,29 @@ def test_namespace_package_is_not_cached(tmp_mutants):
 
 
 # ---------------------------------------------------------------------------
-# INV-9: spec.cached is None for all non-namespace specs
+# INV-9: spec has_location=True so __file__ is set on loaded modules
 # ---------------------------------------------------------------------------
 
 
-def test_module_spec_cached_is_none(tmp_mutants):
+def test_module_spec_has_location(tmp_mutants):
     tmp_mutants.mkdir()
     (tmp_mutants / "thing.py").write_text("")
     finder = MutantFinder(tmp_mutants)
     spec = finder.find_spec("thing", None)
     assert spec is not None
-    assert spec.cached is None
+    assert spec.has_location is True
+    assert spec.origin is not None
 
 
-def test_package_spec_cached_is_none(tmp_mutants):
+def test_package_spec_has_location(tmp_mutants):
     pkg = tmp_mutants / "pkg"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("")
     finder = MutantFinder(tmp_mutants)
     spec = finder.find_spec("pkg", None)
     assert spec is not None
-    assert spec.cached is None
+    assert spec.has_location is True
+    assert spec.origin is not None
 
 
 # ---------------------------------------------------------------------------

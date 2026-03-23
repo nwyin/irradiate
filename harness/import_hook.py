@@ -10,6 +10,7 @@ handles WHICH variant runs based on irradiate_harness.active_mutant.
 """
 
 import importlib.abc
+import importlib.util
 from importlib.machinery import ModuleSpec, SourceFileLoader
 from pathlib import Path
 
@@ -53,18 +54,14 @@ class MutantFinder(importlib.abc.MetaPathFinder):
             return spec
 
         loader = SourceFileLoader(fullname, str(resolved_path))
-        if kind == "package":
-            spec = ModuleSpec(fullname, loader, origin=str(resolved_path), is_package=True)
-            spec.submodule_search_locations = [str(resolved_path.parent)]
-        else:  # "module"
-            spec = ModuleSpec(fullname, loader, origin=str(resolved_path))
+        is_package = kind == "package"
 
-        # Set has_location so __file__ is populated on the loaded module.
-        # Disable bytecode caching by clearing spec.cached.
-        spec.has_location = True
-        spec.cached = None
-
-        return spec
+        return importlib.util.spec_from_file_location(
+            fullname,
+            resolved_path,
+            loader=loader,
+            submodule_search_locations=[str(resolved_path.parent)] if is_package else None,
+        )
 
     def invalidate_caches(self):
         self._cache.clear()
