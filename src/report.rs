@@ -21,7 +21,7 @@ use crate::stats::TestStats;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Self-contained HTML template that loads mutation-testing-elements from unpkg CDN.
 /// `REPORT_JSON_PLACEHOLDER` is replaced with the serialised Stryker JSON at write time.
@@ -275,7 +275,7 @@ pub fn build_stryker_report(
     descriptors: &[MutantCacheDescriptor],
     stats: Option<&TestStats>,
     project_root: &Path,
-    paths_to_mutate: &Path,
+    paths_to_mutate: &[PathBuf],
 ) -> serde_json::Value {
     // Index: mutant_name → descriptor
     let desc_by_name: HashMap<&str, &MutantCacheDescriptor> =
@@ -405,33 +405,46 @@ pub fn build_stryker_report(
 /// Mutant name format: `module.x_func__irradiate_N`
 /// Module "simple_lib" → check for `paths_to_mutate/simple_lib/__init__.py`
 /// or `paths_to_mutate/simple_lib.py`.
-fn derive_file_key_from_name(name: &str, project_root: &Path, paths_to_mutate: &Path) -> String {
+fn derive_file_key_from_name(name: &str, project_root: &Path, paths_to_mutate: &[PathBuf]) -> String {
     let module = name.split('.').next().unwrap_or(name);
     let module_path = module.replace('.', "/");
 
-    // Resolve paths_to_mutate relative to project_root if needed.
-    let base = if paths_to_mutate.is_absolute() {
-        paths_to_mutate.to_path_buf()
-    } else {
-        project_root.join(paths_to_mutate)
-    };
+    // Try each source path in order.
+    for p in paths_to_mutate {
+        let base = if p.is_absolute() {
+            p.clone()
+        } else {
+            project_root.join(p)
+        };
 
-    // Prefer package (__init__.py) over module file (.py)
-    let init_candidate = base.join(&module_path).join("__init__.py");
-    let mod_candidate = base.join(format!("{module_path}.py"));
+        let init_candidate = base.join(&module_path).join("__init__.py");
+        let mod_candidate = base.join(format!("{module_path}.py"));
 
-    let abs_path = if init_candidate.exists() {
-        init_candidate
-    } else if mod_candidate.exists() {
-        mod_candidate
-    } else {
-        // Fall back to .py path even if it doesn't exist
-        mod_candidate
-    };
+        if init_candidate.exists() {
+            return init_candidate
+                .strip_prefix(project_root)
+                .unwrap_or(&init_candidate)
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+        if mod_candidate.exists() {
+            return mod_candidate
+                .strip_prefix(project_root)
+                .unwrap_or(&mod_candidate)
+                .to_string_lossy()
+                .replace('\\', "/");
+        }
+    }
 
-    abs_path
+    // Fall back to first path's .py candidate
+    let first = paths_to_mutate.first().map_or_else(
+        || project_root.to_path_buf(),
+        |p| if p.is_absolute() { p.clone() } else { project_root.join(p) },
+    );
+    let fallback = first.join(format!("{module_path}.py"));
+    fallback
         .strip_prefix(project_root)
-        .unwrap_or(&abs_path)
+        .unwrap_or(&fallback)
         .to_string_lossy()
         .replace('\\', "/")
 }
@@ -640,7 +653,7 @@ mod tests {
     #[test]
     fn test_schema_version_present() {
         let results = vec![make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1)];
-        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         assert_eq!(report["schemaVersion"], "2");
     }
 
@@ -674,7 +687,7 @@ mod tests {
             make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1),
             make_result("mod.x_g__irradiate_1", MutantStatus::Survived, 0.2),
         ];
-        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
 
         // Collect all mutant ids from the report
         let mut found_ids: Vec<String> = Vec::new();
@@ -726,7 +739,7 @@ mod tests {
         )];
 
         let report =
-            build_stryker_report(&results, &descriptors, None, tmp.path(), Path::new("src"));
+            build_stryker_report(&results, &descriptors, None, tmp.path(), &[PathBuf::from("src")]);
 
         // schemaVersion
         assert_eq!(report["schemaVersion"], "2");
@@ -753,7 +766,7 @@ mod tests {
     /// Report includes framework name and version.
     #[test]
     fn test_framework_field() {
-        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         assert_eq!(report["framework"]["name"], "irradiate");
         assert!(
             report["framework"]["version"].as_str().is_some(),
@@ -766,7 +779,7 @@ mod tests {
     fn test_result_without_descriptor_included() {
         let results = vec![make_result("unknown.x_h__irradiate_1", MutantStatus::Survived, 0.0)];
         let report =
-            build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+            build_stryker_report(&results, &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         let files = report["files"].as_object().unwrap();
         let all_mutants: Vec<_> = files.values().flat_map(|f| f["mutants"].as_array().unwrap().iter()).collect();
         assert_eq!(all_mutants.len(), 1);
@@ -781,7 +794,7 @@ mod tests {
     /// INV-1: Output file contains `<!DOCTYPE html>`.
     #[test]
     fn test_html_report_is_valid_html() {
-        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("report.html");
         write_html_report(&report, &out).unwrap();
@@ -792,7 +805,7 @@ mod tests {
     /// INV-2: Output contains the mutation-testing-elements script tag.
     #[test]
     fn test_html_report_contains_script_tag() {
-        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("report.html");
         write_html_report(&report, &out).unwrap();
@@ -811,7 +824,7 @@ mod tests {
     #[test]
     fn test_html_report_contains_json_not_placeholder() {
         let results = vec![make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1)];
-        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("report.html");
         write_html_report(&report, &out).unwrap();
@@ -835,7 +848,7 @@ mod tests {
     /// INV-4: Output is self-contained (single file, no local file references).
     #[test]
     fn test_html_report_is_self_contained() {
-        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), &[PathBuf::from("src")]);
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("report.html");
         write_html_report(&report, &out).unwrap();
@@ -868,7 +881,7 @@ mod tests {
 
         let results = vec![make_result("mod.x_foo__irradiate_1", MutantStatus::Killed, 0.1)];
         let report =
-            build_stryker_report(&results, &[], Some(&stats), Path::new("/p"), Path::new("src"));
+            build_stryker_report(&results, &[], Some(&stats), Path::new("/p"), &[PathBuf::from("src")]);
 
         let files = report["files"].as_object().unwrap();
         let mutants: Vec<_> = files

@@ -416,7 +416,7 @@ def test_mark_once():
     let (_tmp, _) =
         generate_mutants_for_project(project.path(), "src/stateful/__init__.py", "stateful");
     let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[project.path().join("src")]);
     let mutants_dir = _tmp.path().to_path_buf();
     let test_stats =
         stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests", &[])
@@ -512,7 +512,7 @@ async fn test_module_global_restore_between_runs() {
     let (_tmp, _) =
         generate_mutants_for_project(project.path(), "src/leaky/__init__.py", "leaky");
     let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[project.path().join("src")]);
     let mutants_dir = _tmp.path().to_path_buf();
 
     // Use stats collection to discover the actual test ID format (pytest nodeids vary).
@@ -690,7 +690,7 @@ async fn build_session_fixture_project(
     );
 
     let harness_dir = harness::extract_harness(project.path()).expect("harness extraction");
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[project.path().join("src")]);
     let mutants_dir = _mutants_tmp.path().to_path_buf();
 
     // Collect the real test ID via stats
@@ -818,7 +818,7 @@ async fn test_worker_crash_produces_error_not_hang() {
     );
 
     let harness_dir = harness::extract_harness(&crash_project).expect("harness extraction");
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &crash_project.join("src"));
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[crash_project.join("src")]);
     let mutants_dir = _tmp.path().to_path_buf();
 
     // Use stats collection to discover the real test node ID (format varies by pytest/OS).
@@ -969,7 +969,7 @@ async fn test_stats_collection() {
     let harness_dir = harness::extract_harness(&fixture).expect("harness extraction");
 
     let mutants_dir = _tmp.path().to_path_buf();
-    let pythonpath = pipeline::build_pythonpath(&harness_dir, &fixture.join("src"));
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[fixture.join("src")]);
     let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, &mutants_dir, "tests", &[])
         .expect("Stats collection should succeed");
 
@@ -998,7 +998,7 @@ async fn test_stats_collection() {
 /// Build a minimal RunConfig for run_isolated tests.
 fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipeline::RunConfig {
     irradiate::pipeline::RunConfig {
-        paths_to_mutate,
+        paths_to_mutate: vec![paths_to_mutate],
         tests_dir: "tests".to_string(),
         workers: 1,
         timeout_multiplier: 10.0,

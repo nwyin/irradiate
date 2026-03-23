@@ -16,7 +16,7 @@ use std::time::Instant;
 
 /// Configuration for a mutation testing run.
 pub struct RunConfig {
-    pub paths_to_mutate: PathBuf,
+    pub paths_to_mutate: Vec<PathBuf>,
     pub tests_dir: String,
     pub workers: usize,
     pub timeout_multiplier: f64,
@@ -82,12 +82,14 @@ struct ScheduledMutant {
 /// so the user gets a clear error message immediately rather than after mutation
 /// generation completes.
 fn validate_environment(config: &RunConfig) -> Result<()> {
-    // Check that --paths-to-mutate exists.
-    if !config.paths_to_mutate.exists() {
-        bail!(
-            "--paths-to-mutate path '{}' does not exist",
-            config.paths_to_mutate.display()
-        );
+    // Check that --paths-to-mutate entries exist.
+    if config.paths_to_mutate.is_empty() {
+        bail!("--paths-to-mutate: at least one path is required");
+    }
+    for p in &config.paths_to_mutate {
+        if !p.exists() {
+            bail!("--paths-to-mutate path '{}' does not exist", p.display());
+        }
     }
 
     // Check that --tests-dir exists.
@@ -282,12 +284,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
                     .map(|(prefix, _)| prefix)
                     .unwrap_or(mutant_name);
                 let tests = stats.tests_for_function_by_duration(func_key);
-                if tests.is_empty() && config.covered_only {
-                    return None; // skip uncovered
-                }
                 if tests.is_empty() {
-                    // No coverage info — run all tests (shortest first for fail-fast)
-                    stats.all_tests_by_duration()
+                    if config.covered_only {
+                        return None; // completely exclude from results
+                    }
+                    // No coverage → leave test_ids empty → marked NoTests at scheduling time.
+                    // Previously ran all tests against uncovered functions, which is very expensive
+                    // for large projects and almost never catches anything.
+                    vec![]
                 } else {
                     tests
                 }
@@ -551,7 +555,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 
     // Print summary
-    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts);
+    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts, &generation.descriptors_by_name);
 
     // Emit GitHub Actions annotations (no-op outside GitHub Actions).
     let all_descriptors: Vec<_> = generation.descriptors_by_name.values().cloned().collect();
@@ -660,8 +664,12 @@ pub fn results(
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("irradiate-report.{fmt}")));
         let file_config = crate::config::load_config(&project_dir)?;
-        let paths_to_mutate =
-            PathBuf::from(file_config.paths_to_mutate.unwrap_or_else(|| "src".to_string()));
+        let paths_to_mutate: Vec<PathBuf> = file_config
+            .paths_to_mutate
+            .unwrap_or_else(|| vec!["src".to_string()])
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         // Load stats for coveredBy if available
         let stats_path = project_dir.join(".irradiate").join("stats.json");
         let stats = if stats_path.exists() {
@@ -894,9 +902,17 @@ pub async fn run_isolated(
 /// All six subprocess invocations (validate_clean_run, validate_fail_run,
 /// discover_tests, collect_stats, spawn_worker, run_isolated) must use this
 /// function so that PYTHONPATH is constructed identically everywhere.
-pub fn build_pythonpath(harness_dir: &Path, paths_to_mutate: &Path) -> String {
-    let source_parent = paths_to_mutate.parent().unwrap_or(paths_to_mutate);
-    format!("{}:{}", harness_dir.display(), source_parent.display())
+pub fn build_pythonpath(harness_dir: &Path, paths_to_mutate: &[PathBuf]) -> String {
+    let mut parts = vec![harness_dir.display().to_string()];
+    let mut seen = std::collections::HashSet::new();
+    for p in paths_to_mutate {
+        let source_parent = p.parent().unwrap_or(p);
+        let s = source_parent.display().to_string();
+        if seen.insert(s.clone()) {
+            parts.push(s);
+        }
+    }
+    parts.join(":")
 }
 
 /// Returns true if `path` matches the glob `pattern`.
@@ -965,7 +981,7 @@ fn write_file_with_parents(path: &Path, content: impl AsRef<[u8]>) -> Result<()>
 }
 
 fn generate_mutants(
-    paths_to_mutate: &Path,
+    paths_to_mutate: &[PathBuf],
     mutants_dir: &Path,
     do_not_mutate: &[String],
     diff_filter: Option<(&crate::git_diff::DiffFilter, &Path)>,
@@ -975,61 +991,64 @@ fn generate_mutants(
         std::fs::remove_dir_all(mutants_dir)?;
     }
 
-    // Walk the source directory for .py files
-    let py_files = find_python_files(paths_to_mutate)?;
+    // Collect (py_file, strip_base) pairs from all paths.
+    let mut file_entries: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-    // Determine the strip base for computing relative paths.
-    //
-    // When paths_to_mutate IS a package directory (contains __init__.py), we
-    // strip its parent so the package name is preserved in mutants/.
-    //   e.g. paths_to_mutate="src/click", file="src/click/types.py"
-    //        strip "src/" → rel_path="click/types.py" → mutants/click/types.py  ✓
-    //
-    // When paths_to_mutate is a single file, strip its parent directory.
-    //   e.g. paths_to_mutate="src/hive/config.py"
-    //        strip "src/hive/" → rel_path="config.py" → mutants/config.py
-    //
-    // When paths_to_mutate is a source root (no __init__.py), we strip it
-    // directly — current behaviour preserved.
-    //   e.g. paths_to_mutate="src", file="src/simple_lib/__init__.py"
-    //        strip "src/" → rel_path="simple_lib/__init__.py"  ✓
-    let strip_base = if paths_to_mutate.is_file() {
-        // For single files, find the outermost package boundary by walking up
-        // from the file's directory while __init__.py exists.
-        let mut base = paths_to_mutate.parent().unwrap_or(paths_to_mutate);
-        while base.join("__init__.py").exists() {
-            base = match base.parent() {
-                Some(p) => p,
-                None => break,
-            };
-        }
-        base
-    } else if paths_to_mutate.join("__init__.py").exists() {
-        paths_to_mutate.parent().unwrap_or(paths_to_mutate)
-    } else {
-        paths_to_mutate
-    };
+    for path in paths_to_mutate {
+        let py_files = find_python_files(path)?;
 
-    // When mutating a single file, copy all sibling package files to mutants/
-    // for import integrity. Without this, the import hook intercepts the package
-    // but can't find sibling modules (e.g., hive.db when only hive.config is mutated).
-    if paths_to_mutate.is_file() {
-        let package_root = if paths_to_mutate.parent().unwrap_or(paths_to_mutate) != strip_base {
-            // strip_base is above the file's directory — walk from strip_base
-            strip_base
+        // Determine the strip base for computing relative paths.
+        //
+        // When the path IS a package directory (contains __init__.py), we
+        // strip its parent so the package name is preserved in mutants/.
+        //   e.g. path="src/click", file="src/click/types.py"
+        //        strip "src/" → rel_path="click/types.py" → mutants/click/types.py  ✓
+        //
+        // When the path is a single file, walk up to the outermost package boundary.
+        //   e.g. path="src/hive/config.py"
+        //        strip "src/" → rel_path="hive/config.py" → mutants/hive/config.py
+        //
+        // When the path is a source root (no __init__.py), we strip it directly.
+        //   e.g. path="src", file="src/simple_lib/__init__.py"
+        //        strip "src/" → rel_path="simple_lib/__init__.py"  ✓
+        let strip_base = if path.is_file() {
+            let mut base = path.parent().unwrap_or(path);
+            while base.join("__init__.py").exists() {
+                base = match base.parent() {
+                    Some(p) => p,
+                    None => break,
+                };
+            }
+            base.to_path_buf()
+        } else if path.join("__init__.py").exists() {
+            path.parent().unwrap_or(path).to_path_buf()
         } else {
-            paths_to_mutate.parent().unwrap_or(paths_to_mutate)
+            path.to_path_buf()
         };
-        let siblings = find_python_files(package_root)?;
-        for sibling in &siblings {
-            if sibling == paths_to_mutate {
-                continue; // skip the target file — it'll be mutated below
+
+        // When mutating a single file, copy all sibling package files to mutants/
+        // for import integrity.
+        if path.is_file() {
+            let package_root = if path.parent().unwrap_or(path) != strip_base.as_path() {
+                strip_base.as_path()
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let siblings = find_python_files(package_root)?;
+            for sibling in &siblings {
+                if sibling == path {
+                    continue; // skip the target file — it'll be mutated below
+                }
+                if let Ok(rel) = sibling.strip_prefix(&strip_base) {
+                    let dest = mutants_dir.join(rel);
+                    let content = std::fs::read_to_string(sibling)?;
+                    write_file_with_parents(&dest, &content)?;
+                }
             }
-            if let Ok(rel) = sibling.strip_prefix(strip_base) {
-                let dest = mutants_dir.join(rel);
-                let content = std::fs::read_to_string(sibling)?;
-                write_file_with_parents(&dest, &content)?;
-            }
+        }
+
+        for py_file in py_files {
+            file_entries.push((py_file, strip_base.clone()));
         }
     }
 
@@ -1039,9 +1058,9 @@ fn generate_mutants(
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
     type MutantEntry = Option<(String, Vec<String>, Vec<MutantCacheDescriptor>)>;
-    let results: Vec<Result<MutantEntry>> = py_files
+    let results: Vec<Result<MutantEntry>> = file_entries
         .par_iter()
-        .map(|py_file| -> Result<MutantEntry> {
+        .map(|(py_file, strip_base)| -> Result<MutantEntry> {
             let source = std::fs::read_to_string(py_file)?;
 
             // Compute module name from file path relative to strip_base.
@@ -1508,7 +1527,12 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Print the run summary. Returns (killed, survived) counts for threshold checking.
-fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: CacheCounts) -> (usize, usize) {
+fn print_summary(
+    results: &[MutantResult],
+    elapsed_secs: f64,
+    cache_counts: CacheCounts,
+    descriptors: &HashMap<String, MutantCacheDescriptor>,
+) -> (usize, usize) {
     let mut killed = 0usize;
     let mut survived = 0usize;
     let mut no_tests = 0usize;
@@ -1564,7 +1588,22 @@ fn print_summary(results: &[MutantResult], elapsed_secs: f64, cache_counts: Cach
         eprintln!("Survived mutants:");
         for r in results {
             if r.status == MutantStatus::Survived {
-                eprintln!("  {}", r.mutant_name);
+                if let Some(desc) = descriptors.get(&r.mutant_name) {
+                    let (rel_line, _col) =
+                        crate::codegen::byte_offset_to_location(&desc.function_source, desc.start);
+                    let abs_line = desc.fn_start_line + rel_line - 1;
+                    let file = if desc.source_file.is_empty() {
+                        &r.mutant_name
+                    } else {
+                        &desc.source_file
+                    };
+                    eprintln!(
+                        "  {file}:{abs_line}  replaced `{}` with `{}` ({})  [{}]",
+                        desc.original, desc.replacement, desc.operator, r.mutant_name,
+                    );
+                } else {
+                    eprintln!("  {}", r.mutant_name);
+                }
             }
         }
     }
@@ -1802,90 +1841,87 @@ mod tests {
 
     #[test]
     fn test_build_pythonpath_includes_source_parent() {
-        // INV-1: PYTHONPATH must be harness_dir:source_parent (2 components).
-        // mutants_dir is NOT on PYTHONPATH — the MutantFinder import hook handles it.
-        // If paths_to_mutate is "src/mylib", the parent "src" must be on the path
-        // so that `import mylib` (and sibling packages) can be resolved.
         let harness = Path::new("/tmp/harness");
-        let paths_to_mutate = Path::new("src/mylib");
+        let paths = vec![PathBuf::from("src/mylib")];
 
-        let result = build_pythonpath(harness, paths_to_mutate);
+        let result = build_pythonpath(harness, &paths);
 
-        assert!(
-            result.contains("/tmp/harness"),
-            "harness dir must be in PYTHONPATH"
-        );
-        assert!(
-            result.contains("src"),
-            "source parent must be in PYTHONPATH"
-        );
-        // "src/mylib" itself must NOT appear — only its parent
-        assert!(
-            !result.contains("src/mylib"),
-            "paths_to_mutate itself must not appear — only its parent"
-        );
-        // mutants_dir must NOT be in PYTHONPATH — hook handles it
+        assert!(result.contains("/tmp/harness"), "harness dir must be in PYTHONPATH");
+        assert!(result.contains("src"), "source parent must be in PYTHONPATH");
+        assert!(!result.contains("src/mylib"), "paths_to_mutate itself must not appear");
         let parts: Vec<&str> = result.split(':').collect();
         assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
     }
 
     #[test]
     fn test_build_pythonpath_order() {
-        // harness_dir must come first (hook install before test collection),
-        // then source_parent for untouched siblings.
-        // mutants_dir is handled by MutantFinder hook, NOT in PYTHONPATH.
         let harness = Path::new("/h");
-        let paths_to_mutate = Path::new("src/lib");
+        let paths = vec![PathBuf::from("src/lib")];
 
-        let result = build_pythonpath(harness, paths_to_mutate);
+        let result = build_pythonpath(harness, &paths);
         let parts: Vec<&str> = result.split(':').collect();
 
-        assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
+        assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "/h", "harness must be first");
         assert_eq!(parts[1], "src", "source parent must be second");
     }
 
     #[test]
     fn test_build_pythonpath_root_fallback() {
-        // If paths_to_mutate has no parent (e.g. a bare filename with no dir component),
-        // it falls back to itself rather than panicking.
         let harness = Path::new("/h");
-        // A bare path like "mylib" has no meaningful parent — parent() returns ""
-        let paths_to_mutate = Path::new("mylib");
+        let paths = vec![PathBuf::from("mylib")];
 
-        // Should not panic
-        let result = build_pythonpath(harness, paths_to_mutate);
+        let result = build_pythonpath(harness, &paths);
         assert!(!result.is_empty());
         let parts: Vec<&str> = result.split(':').collect();
-        assert_eq!(parts.len(), 2, "PYTHONPATH must have exactly 2 components");
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
-    fn test_build_pythonpath_all_six_sites_identical() {
-        // INV-1: All six subprocess invocations must produce the same string
-        // given the same inputs. This test encodes that invariant by calling
-        // build_pythonpath multiple times and asserting equality.
+    fn test_build_pythonpath_deterministic() {
         let harness = Path::new("/tmp/h");
-        let src = Path::new("project/src");
+        let paths = vec![PathBuf::from("project/src")];
 
-        let a = build_pythonpath(harness, src);
-        let b = build_pythonpath(harness, src);
+        let a = build_pythonpath(harness, &paths);
+        let b = build_pythonpath(harness, &paths);
         assert_eq!(a, b, "build_pythonpath must be deterministic");
     }
 
     #[test]
     fn test_build_pythonpath_no_mutants_dir() {
-        // mutants_dir must NOT appear in PYTHONPATH — it is passed as
-        // IRRADIATE_MUTANTS_DIR env var to activate the MutantFinder hook.
         let harness = Path::new("/tmp/harness");
-        let paths_to_mutate = Path::new("src/mylib");
+        let paths = vec![PathBuf::from("src/mylib")];
         let mutants_dir_str = "/tmp/mutants";
 
-        let result = build_pythonpath(harness, paths_to_mutate);
-        assert!(
-            !result.contains(mutants_dir_str),
-            "mutants_dir must not be in PYTHONPATH — hook handles it"
-        );
+        let result = build_pythonpath(harness, &paths);
+        assert!(!result.contains(mutants_dir_str), "mutants_dir must not be in PYTHONPATH");
+    }
+
+    #[test]
+    fn test_build_pythonpath_multiple_paths() {
+        let harness = Path::new("/h");
+        let paths = vec![PathBuf::from("src/a"), PathBuf::from("lib/b")];
+
+        let result = build_pythonpath(harness, &paths);
+        let parts: Vec<&str> = result.split(':').collect();
+
+        assert_eq!(parts.len(), 3, "harness + 2 distinct source parents");
+        assert_eq!(parts[0], "/h");
+        assert_eq!(parts[1], "src");
+        assert_eq!(parts[2], "lib");
+    }
+
+    #[test]
+    fn test_build_pythonpath_deduplicates_parents() {
+        let harness = Path::new("/h");
+        let paths = vec![PathBuf::from("src/a"), PathBuf::from("src/b")];
+
+        let result = build_pythonpath(harness, &paths);
+        let parts: Vec<&str> = result.split(':').collect();
+
+        assert_eq!(parts.len(), 2, "shared parent 'src' should appear once");
+        assert_eq!(parts[0], "/h");
+        assert_eq!(parts[1], "src");
     }
 
     // --- path_to_module tests ---
@@ -2207,7 +2243,7 @@ mod tests {
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
 
         // Both files must be present in mutants/
         assert!(
@@ -2242,7 +2278,7 @@ mod tests {
         // utils.py — only constants, no mutations
         std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
 
-        generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
         assert!(
@@ -2287,7 +2323,7 @@ mod tests {
         std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points directly at the package directory "src/mypkg"
-        generate_mutants(&pkg, mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[pkg.clone()], mutants_tmp.path(), &[], None).unwrap();
 
         // Files must land under mutants/mypkg/, not directly in mutants/
         let mutants_pkg = mutants_tmp.path().join("mypkg");
@@ -2325,7 +2361,7 @@ mod tests {
         std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points at the source root "src" (no __init__.py there)
-        generate_mutants(&src, mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src.clone()], mutants_tmp.path(), &[], None).unwrap();
 
         // Files must land under mutants/simple_lib/
         assert!(
@@ -2351,7 +2387,7 @@ mod tests {
         std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // Should not panic even when parent() returns an empty component
-        let result = generate_mutants(tmp.path(), mutants_tmp.path(), &[], None);
+        let result = generate_mutants(&[tmp.path().to_path_buf()], mutants_tmp.path(), &[], None);
         assert!(
             result.is_ok(),
             "should not fail for package dirs with no parent prefix"
@@ -2428,7 +2464,7 @@ mod tests {
         // Build pattern that matches config.py. Since the test uses absolute paths,
         // we match using just the filename via **.
         let pattern = "**/config.py".to_string();
-        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[pattern], None).unwrap();
+        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[pattern], None).unwrap();
 
         // config.py should NOT be in the mutant names (skipped)
         for module in result.names_by_module.keys() {
@@ -2462,7 +2498,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = generate_mutants(src_tmp.path(), mutants_tmp.path(), &[], None).unwrap();
+        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
         assert!(
             !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
@@ -2495,7 +2531,7 @@ mod tests {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2520,7 +2556,7 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2543,7 +2579,7 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2565,11 +2601,11 @@ mod tests {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
 
         // Generate real mutants — the trampoline `if active == 'fail': raise …` must be present.
         let tmp_mutants = tempfile::tempdir().unwrap();
-        generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[], None)
+        generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None)
             .expect("mutant generation should succeed for fixture");
 
         let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2588,7 +2624,7 @@ mod tests {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         // Empty mutants dir — no trampoline code, so tests will pass under active_mutant=fail
         let tmp_mutants = tempfile::tempdir().unwrap();
 
@@ -2615,7 +2651,7 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2639,7 +2675,7 @@ mod tests {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         // Empty mutants dir — tests pass, exit 0
         let tmp_mutants = tempfile::tempdir().unwrap();
 
@@ -2670,7 +2706,7 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2690,7 +2726,7 @@ mod tests {
         let fixture = subprocess_fixture_dir();
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(&fixture).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
+        let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[])
@@ -2720,7 +2756,7 @@ mod tests {
 
         let python = subprocess_fixture_python();
         let harness_dir = crate::harness::extract_harness(project.path()).expect("harness extraction");
-        let pythonpath = build_pythonpath(&harness_dir, project.path());
+        let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
         let tests = discover_tests(
@@ -2796,7 +2832,7 @@ mod tests {
     #[test]
     fn test_print_summary_returns_killed_survived() {
         let results = make_results(3, 1);
-        let (killed, survived) = print_summary(&results, 1.0, zero_cache());
+        let (killed, survived) = print_summary(&results, 1.0, zero_cache(), &HashMap::new());
         assert_eq!(killed, 3);
         assert_eq!(survived, 1);
     }
@@ -2805,7 +2841,7 @@ mod tests {
     #[test]
     fn test_print_summary_no_tested_mutants() {
         let results: Vec<MutantResult> = vec![];
-        let (killed, survived) = print_summary(&results, 0.0, zero_cache());
+        let (killed, survived) = print_summary(&results, 0.0, zero_cache(), &HashMap::new());
         assert_eq!(killed, 0);
         assert_eq!(survived, 0);
     }
@@ -3037,7 +3073,7 @@ mod tests {
         let repo_root = src_tmp.path();
 
         let result = generate_mutants(
-            src_tmp.path(),
+            &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
@@ -3083,7 +3119,7 @@ index abc..def 100644
         let repo_root = src_tmp.path();
 
         let result = generate_mutants(
-            src_tmp.path(),
+            &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
@@ -3124,9 +3160,9 @@ index abc..def 100644
         .unwrap();
 
         let result_no_filter =
-            generate_mutants(src_tmp.path(), mutants_a.path(), &[], None).unwrap();
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_a.path(), &[], None).unwrap();
         let result_none_filter =
-            generate_mutants(src_tmp.path(), mutants_b.path(), &[], None).unwrap();
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_b.path(), &[], None).unwrap();
 
         assert_eq!(
             result_no_filter.names_by_module.len(),
@@ -3165,7 +3201,7 @@ index 000..abc
         let repo_root = src_tmp.path();
 
         let result = generate_mutants(
-            src_tmp.path(),
+            &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
@@ -3186,7 +3222,7 @@ index 000..abc
         python: PathBuf,
     ) -> RunConfig {
         RunConfig {
-            paths_to_mutate,
+            paths_to_mutate: vec![paths_to_mutate],
             tests_dir,
             workers: 1,
             timeout_multiplier: 10.0,

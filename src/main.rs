@@ -27,9 +27,10 @@ enum Commands {
         /// Specific mutant names to test (default: all)
         mutant_names: Vec<String>,
 
-        /// Path(s) to source code to mutate (default: "src", overrides pyproject.toml)
+        /// Path(s) to source code to mutate (default: "src", overrides pyproject.toml).
+        /// Can be specified multiple times: --paths-to-mutate src/a.py --paths-to-mutate src/b.py
         #[arg(long)]
-        paths_to_mutate: Option<String>,
+        paths_to_mutate: Vec<String>,
 
         /// Path to test directory (default: "tests", overrides pyproject.toml)
         #[arg(long)]
@@ -172,11 +173,16 @@ async fn main() -> Result<()> {
             pytest_add_cli_args.extend(pytest_args);
 
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
-                paths_to_mutate: PathBuf::from(
-                    paths_to_mutate
-                        .or(file_config.paths_to_mutate)
-                        .unwrap_or_else(|| "src".to_string()),
-                ),
+                paths_to_mutate: {
+                    let raw = if !paths_to_mutate.is_empty() {
+                        paths_to_mutate
+                    } else {
+                        file_config
+                            .paths_to_mutate
+                            .unwrap_or_else(|| vec!["src".to_string()])
+                    };
+                    raw.into_iter().map(PathBuf::from).collect()
+                },
                 tests_dir: tests_dir
                     .or(file_config.tests_dir)
                     .unwrap_or_else(|| "tests".to_string()),

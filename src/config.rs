@@ -22,9 +22,8 @@ pub struct ToolConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct IrradiateConfig {
     /// Accepts a string (`"src"`) or array of strings (`["src/a.py", "src/b.py"]`).
-    /// When an array is given, the first element is used (multi-path support is TODO).
-    #[serde(default, deserialize_with = "deserialize_string_or_first_of_vec")]
-    pub paths_to_mutate: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec_opt_str")]
+    pub paths_to_mutate: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_first_of_vec")]
     pub tests_dir: Option<String>,
     pub do_not_mutate: Option<Vec<String>>,
@@ -37,8 +36,8 @@ pub struct IrradiateConfig {
     pub pytest_add_cli_args: Option<Vec<String>>,
 }
 
-/// Deserialize `paths_to_mutate` from either a TOML string or an array of strings.
-/// When given an array, takes the first element (multi-path is TODO).
+/// Deserialize a field that accepts either a TOML string or array of strings.
+/// When given an array, takes the first element only.
 fn deserialize_string_or_first_of_vec<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -59,9 +58,7 @@ where
         }
 
         fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            // Take first element; ignore the rest (multi-path support is TODO).
             if let Some(first) = seq.next_element::<String>()? {
-                // Drain remaining elements.
                 while seq.next_element::<String>()?.is_some() {}
                 Ok(Some(first))
             } else {
@@ -79,6 +76,53 @@ where
     }
 
     deserializer.deserialize_any(StringOrFirstOfVec)
+}
+
+/// Deserialize `paths_to_mutate` from either a TOML string (wrapped in a Vec)
+/// or an array of strings.
+fn deserialize_string_or_vec_opt_str<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct StringOrVecStr;
+
+    impl<'de> Visitor<'de> for StringOrVecStr {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(vec![v.to_string()]))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                v.push(item);
+            }
+            if v.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(v))
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVecStr)
 }
 
 /// Deserialize `pytest_add_cli_args` from either a TOML string (split on whitespace,
@@ -164,7 +208,7 @@ debug = true
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         let irr = config.tool.irradiate.as_ref().unwrap();
-        assert_eq!(irr.paths_to_mutate.as_deref(), Some("lib"));
+        assert_eq!(irr.paths_to_mutate, Some(vec!["lib".to_string()]));
         assert_eq!(irr.tests_dir.as_deref(), Some("test"));
         assert!(irr.debug.unwrap());
         let do_not_mutate = irr.do_not_mutate.as_ref().unwrap();
@@ -207,9 +251,8 @@ future_unknown_key = "something"
                 .irradiate
                 .as_ref()
                 .unwrap()
-                .paths_to_mutate
-                .as_deref(),
-            Some("src")
+                .paths_to_mutate,
+            Some(vec!["src".to_string()])
         );
     }
 
@@ -250,7 +293,7 @@ pytest_add_cli_args = ["-v", "--tb=short"]
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         let m = config.tool.irradiate.as_ref().unwrap();
-        assert_eq!(m.paths_to_mutate.as_deref(), Some("src"));
+        assert_eq!(m.paths_to_mutate, Some(vec!["src".to_string()]));
         assert_eq!(m.tests_dir.as_deref(), Some("tests"));
         assert_eq!(m.do_not_mutate.as_ref().unwrap().len(), 2);
         assert_eq!(m.also_copy.as_ref().unwrap(), &["data/"]);
@@ -292,7 +335,7 @@ paths_to_mutate = "src"
         )
         .unwrap();
         let cfg = load_config(tmp.path()).unwrap();
-        assert_eq!(cfg.paths_to_mutate.as_deref(), Some("src"));
+        assert_eq!(cfg.paths_to_mutate, Some(vec!["src".to_string()]));
     }
 
     // INV-4: [tool.irradiate] takes priority over [tool.mutmut] when both are present.
@@ -305,6 +348,20 @@ paths_to_mutate = "src"
         )
         .unwrap();
         let cfg = load_config(tmp.path()).unwrap();
-        assert_eq!(cfg.paths_to_mutate.as_deref(), Some("irr_src"));
+        assert_eq!(cfg.paths_to_mutate, Some(vec!["irr_src".to_string()]));
+    }
+
+    #[test]
+    fn test_paths_to_mutate_array() {
+        let toml_str = r#"
+[tool.irradiate]
+paths_to_mutate = ["src/a.py", "src/b.py"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert_eq!(
+            irr.paths_to_mutate,
+            Some(vec!["src/a.py".to_string(), "src/b.py".to_string()])
+        );
     }
 }
