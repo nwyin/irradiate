@@ -1,0 +1,157 @@
+name: "irradiate — mutation testing for Python"
+description: "Run mutation testing on your Python project with irradiate. Auto-annotates survived mutants in PR diffs."
+branding:
+  icon: "zap"
+  color: "yellow"
+
+inputs:
+  version:
+    description: "irradiate version to install (e.g. '0.1.1'). Default: latest."
+    required: false
+    default: ""
+  paths-to-mutate:
+    description: "Source paths to mutate (space-separated). Overrides pyproject.toml."
+    required: false
+    default: ""
+  tests-dir:
+    description: "Path to test directory. Overrides pyproject.toml."
+    required: false
+    default: ""
+  diff:
+    description: "Only mutate functions changed since this git ref (e.g. 'origin/main'). Great for PR checks."
+    required: false
+    default: ""
+  fail-under:
+    description: "Fail the step if mutation score is below this percentage (0-100)."
+    required: false
+    default: ""
+  sample:
+    description: "Test a random subset of mutants. Values 0.0-1.0 are fractions, >1 are absolute counts."
+    required: false
+    default: ""
+  report:
+    description: "Generate a report ('json' or 'html')."
+    required: false
+    default: ""
+  report-output:
+    description: "Output path for the report file."
+    required: false
+    default: ""
+  workers:
+    description: "Number of parallel workers. Default: number of CPUs."
+    required: false
+    default: ""
+  python-version:
+    description: "Python version to use. Default: '3.12'."
+    required: false
+    default: "3.12"
+  extra-args:
+    description: "Additional arguments passed directly to `irradiate run`."
+    required: false
+    default: ""
+
+outputs:
+  score:
+    description: "Mutation score as a percentage (e.g. '85.7')."
+    value: ${{ steps.run.outputs.score }}
+  killed:
+    description: "Number of killed mutants."
+    value: ${{ steps.run.outputs.killed }}
+  survived:
+    description: "Number of survived mutants."
+    value: ${{ steps.run.outputs.survived }}
+  total:
+    description: "Total number of mutants tested."
+    value: ${{ steps.run.outputs.total }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install irradiate
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          pip install "irradiate==${{ inputs.version }}"
+        else
+          pip install irradiate
+        fi
+
+    - name: Install project test dependencies
+      shell: bash
+      run: |
+        if [ -f pyproject.toml ]; then
+          pip install -e ".[dev]" 2>/dev/null || pip install -e ".[test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+        fi
+        pip install pytest
+
+    - name: Run irradiate
+      id: run
+      shell: bash
+      run: |
+        args=""
+
+        if [ -n "${{ inputs.paths-to-mutate }}" ]; then
+          for p in ${{ inputs.paths-to-mutate }}; do
+            args="$args --paths-to-mutate $p"
+          done
+        fi
+
+        if [ -n "${{ inputs.tests-dir }}" ]; then
+          args="$args --tests-dir ${{ inputs.tests-dir }}"
+        fi
+
+        if [ -n "${{ inputs.diff }}" ]; then
+          args="$args --diff ${{ inputs.diff }}"
+        fi
+
+        if [ -n "${{ inputs.fail-under }}" ]; then
+          args="$args --fail-under ${{ inputs.fail-under }}"
+        fi
+
+        if [ -n "${{ inputs.sample }}" ]; then
+          args="$args --sample ${{ inputs.sample }}"
+        fi
+
+        if [ -n "${{ inputs.report }}" ]; then
+          args="$args --report ${{ inputs.report }}"
+        fi
+
+        if [ -n "${{ inputs.report-output }}" ]; then
+          args="$args --output ${{ inputs.report-output }}"
+        fi
+
+        if [ -n "${{ inputs.workers }}" ]; then
+          args="$args --workers ${{ inputs.workers }}"
+        fi
+
+        if [ -n "${{ inputs.extra-args }}" ]; then
+          args="$args ${{ inputs.extra-args }}"
+        fi
+
+        # Run and capture output for parsing
+        set +e
+        irradiate run $args 2>&1 | tee /tmp/irradiate-output.txt
+        exit_code=${PIPESTATUS[0]}
+        set -e
+
+        # Parse outputs
+        killed=$(grep -oP 'Killed:\s+\K\d+' /tmp/irradiate-output.txt || echo 0)
+        survived=$(grep -oP 'Survived:\s+\K\d+' /tmp/irradiate-output.txt || echo 0)
+        total=$((killed + survived))
+        if [ "$total" -gt 0 ]; then
+          score=$(echo "scale=1; $killed * 100 / $total" | bc)
+        else
+          score="0.0"
+        fi
+
+        echo "score=$score" >> "$GITHUB_OUTPUT"
+        echo "killed=$killed" >> "$GITHUB_OUTPUT"
+        echo "survived=$survived" >> "$GITHUB_OUTPUT"
+        echo "total=$total" >> "$GITHUB_OUTPUT"
+
+        exit $exit_code
