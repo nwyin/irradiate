@@ -122,7 +122,8 @@ pub fn pre_spawn_pool(
     let socket_path = std::env::temp_dir().join(socket_name);
     let _ = std::fs::remove_file(&socket_path);
 
-    let listener = UnixListener::bind(&socket_path).context("Failed to bind unix socket")?;
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("Failed to bind unix socket at {}", socket_path.display()))?;
     info!("Pre-spawning {num_workers} workers on {}", socket_path.display());
 
     let mut processes: Vec<Child> = Vec::new();
@@ -223,7 +224,10 @@ fn spawn_worker(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("Failed to spawn worker {id}"))?;
+        .with_context(|| format!(
+            "Failed to spawn worker {id} — is '{}' a valid Python interpreter?",
+            config.python.display()
+        ))?;
 
     info!("Spawned worker {id} with pid {}", child.id().unwrap_or(0));
     Ok(child)
@@ -564,10 +568,47 @@ async fn dispatch_work(
             && pending_accepts == 0
             && worker_senders.is_empty()
         {
-            error!(
-                "No available workers; marking {} remaining items as errors",
-                work_queue.len()
-            );
+            // Try to capture stderr from crashed worker processes for diagnostics
+            let mut stderr_snippet = String::new();
+            for proc in processes.iter_mut() {
+                if let Some(stderr) = proc.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 2048];
+                    let mut async_stderr = stderr;
+                    if let Ok(Ok(n)) = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        async_stderr.read(&mut buf),
+                    ).await {
+                        if n > 0 {
+                            let text = String::from_utf8_lossy(&buf[..n]);
+                            if !text.trim().is_empty() {
+                                stderr_snippet = text.trim().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+
+            if stderr_snippet.is_empty() {
+                error!(
+                    "No available workers; marking {} remaining items as errors. \
+                     All workers crashed or failed to start. Check that your test suite runs \
+                     cleanly with: pytest {}",
+                    work_queue.len(),
+                    config.tests_dir.display(),
+                );
+            } else {
+                error!(
+                    "No available workers; marking {} remaining items as errors. \
+                     All workers crashed or failed to start.\n\
+                     Worker stderr:\n{}\n\
+                     Check that your test suite runs cleanly with: pytest {}",
+                    work_queue.len(),
+                    stderr_snippet,
+                    config.tests_dir.display(),
+                );
+            }
+
             for item in work_queue.drain(..).rev() {
                 if let Some(ref mut pb) = progress {
                     pb.record(MutantStatus::Error);
@@ -598,7 +639,11 @@ async fn dispatch_work(
                         let mut line = String::new();
                         match timeout(Duration::from_secs(10), buf_reader.read_line(&mut line)).await {
                             Ok(Ok(0)) => {
-                                error!("Worker {worker_id}: disconnected before sending ready message");
+                                error!(
+                                    "Worker {worker_id}: disconnected before sending ready message. \
+                                     Common causes: import error in your source code, missing dependency, \
+                                     or incompatible pytest plugin."
+                                );
                             }
                             Ok(Ok(_)) => {
                                 match serde_json::from_str::<WorkerMessage>(line.trim()) {
@@ -673,7 +718,10 @@ async fn dispatch_work(
                                 error!("Worker {worker_id}: error reading ready message: {e}");
                             }
                             Err(_) => {
-                                error!("Worker {worker_id}: timeout reading ready message");
+                                error!(
+                                    "Worker {worker_id}: timeout reading ready message (10s). \
+                                     This usually means test collection is very slow or the worker is stuck."
+                                );
                             }
                         }
                     }
@@ -681,7 +729,10 @@ async fn dispatch_work(
                         error!("Failed to accept worker connection: {e}");
                     }
                     Err(_) => {
-                        error!("Timeout waiting for worker connection");
+                        error!(
+                            "Timeout waiting for worker connection (30s). \
+                             The worker process may have crashed during startup."
+                        );
                     }
                 }
             }
@@ -796,7 +847,10 @@ async fn dispatch_work(
                             // Expected: we asked this worker to shut down for recycling
                             debug!("Worker {worker_id}: recycled cleanly");
                         } else {
-                            warn!("Worker {worker_id} disconnected unexpectedly");
+                            warn!(
+                                "Worker {worker_id} disconnected unexpectedly — \
+                                 the worker process may have crashed"
+                            );
                             // Record any active mutant as error
                             if let Some(mutant_name) = active_mutants.remove(&worker_id) {
                                 if let Some(ref mut pb) = progress {

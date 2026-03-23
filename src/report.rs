@@ -15,6 +15,7 @@
 //!
 //! Schema reference: <https://github.com/stryker-mutator/mutation-testing-elements>
 
+use anyhow::Context;
 use crate::cache::MutantCacheDescriptor;
 use crate::protocol::{MutantResult, MutantStatus};
 use crate::stats::TestStats;
@@ -50,7 +51,8 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 pub fn write_html_report(report_json: &serde_json::Value, output_path: &Path) -> anyhow::Result<()> {
     let json_str = serde_json::to_string(report_json)?;
     let html = HTML_TEMPLATE.replace("REPORT_JSON_PLACEHOLDER", &json_str);
-    std::fs::write(output_path, html)?;
+    std::fs::write(output_path, html)
+        .with_context(|| format!("Failed to write HTML report to {}", output_path.display()))?;
     Ok(())
 }
 

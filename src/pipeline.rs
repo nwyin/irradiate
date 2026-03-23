@@ -236,7 +236,11 @@ pub async fn run(config: RunConfig) -> Result<()> {
     );
 
     if generation.descriptors_by_name.is_empty() {
-        eprintln!("No mutations found.");
+        let paths_str: Vec<_> = config.paths_to_mutate.iter().map(|p| p.display().to_string()).collect();
+        eprintln!(
+            "No mutations found in {}. Check that your source files contain functions to mutate.",
+            paths_str.join(", ")
+        );
         return Ok(());
     }
 
@@ -689,7 +693,8 @@ pub async fn run(config: RunConfig) -> Result<()> {
             crate::report::write_html_report(&report, &output_path)?;
         } else {
             let json_str = serde_json::to_string_pretty(&report)?;
-            std::fs::write(&output_path, json_str)?;
+            std::fs::write(&output_path, &json_str)
+                .with_context(|| format!("Failed to write report to {}", output_path.display()))?;
         }
         eprintln!("Report written to {}", output_path.display());
     }
@@ -840,7 +845,8 @@ pub fn results(
             crate::report::write_html_report(&report_val, &output_path)?;
         } else {
             let json_str = serde_json::to_string_pretty(&report_val)?;
-            std::fs::write(&output_path, json_str)?;
+            std::fs::write(&output_path, &json_str)
+                .with_context(|| format!("Failed to write report to {}", output_path.display()))?;
         }
         eprintln!("Report written to {}", output_path.display());
         return Ok(());
