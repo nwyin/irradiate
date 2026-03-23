@@ -71,9 +71,35 @@ pub fn apply_mutation(func_source: &str, mutation: &Mutation) -> String {
 #[cfg(test)]
 use libcst_native::parse_module;
 
+/// Return all mutations from `source` whose operator equals `operator`.
+///
+/// Convenience for test modules that need to filter by operator without
+/// repeating the flat-map + filter chain everywhere.
+#[cfg(test)]
+fn mutations_by_operator(source: &str, operator: &str) -> Vec<Mutation> {
+    collect_file_mutations(source)
+        .into_iter()
+        .flat_map(|fm| fm.mutations)
+        .filter(|m| m.operator == operator)
+        .collect()
+}
+
+/// Assert that the byte slice `fm.source[m.start..m.end]` equals `m.original`.
+///
+/// Use instead of the inline `assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), …)`
+/// to keep span-validity checks uniform and reduce noise.
+#[cfg(test)]
+fn assert_span_matches_original(fm: &FunctionMutations, m: &Mutation) {
+    assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `"def add(a, b):\n    return a + b\n"` — the minimal two-argument function used
+    /// across many tests that need a function with a binary-operator mutation point.
+    const SIMPLE_ADD: &str = "def add(a, b):\n    return a + b\n";
 
     #[test]
     fn test_function_byte_offset_at_file_start() {
@@ -112,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_collect_binop_mutations() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
@@ -193,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_apply_mutation() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let binop = fm
@@ -683,7 +709,7 @@ mod tests {
     // INV-3: A regular function (no yield) is NOT a generator.
     #[test]
     fn test_regular_function_not_generator() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         assert!(
@@ -717,11 +743,7 @@ mod tests {
     // --- arg_removal operator tests ---
 
     fn arg_removal_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "arg_removal")
-            .collect()
+        super::mutations_by_operator(source, "arg_removal")
     }
 
     // INV-1: f(a, b) → 4 arg_removal mutations: replace each arg + remove each arg
@@ -1241,11 +1263,7 @@ mod match_case_removal_tests {
     use super::*;
 
     fn match_case_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "match_case_removal")
-            .collect()
+        super::mutations_by_operator(source, "match_case_removal")
     }
 
     // INV-1: A match with 1 case produces 0 mutations.
@@ -1446,11 +1464,7 @@ mod match_case_removal_tests {
     // --- lambda_mutation splice correctness tests ---
 
     fn lambda_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "lambda_mutation")
-            .collect()
+        super::mutations_by_operator(source, "lambda_mutation")
     }
 
     // INV-1: `lambda x: x if x else None` — body text contains `x` which also appears in
@@ -1655,11 +1669,7 @@ mod assignment_mutation_tests {
     use super::*;
 
     fn assignment_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "assignment_mutation")
-            .collect()
+        super::mutations_by_operator(source, "assignment_mutation")
     }
 
     fn assignment_mutants(source: &str) -> Vec<String> {
@@ -1790,11 +1800,7 @@ mod unary_mutation_tests {
     use super::*;
 
     fn unary_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "unary_removal")
-            .collect()
+        super::mutations_by_operator(source, "unary_removal")
     }
 
     // INV-1: `not x` → `x` removes the unary `not` operator.
@@ -1882,11 +1888,7 @@ mod unary_swap_tests {
     use super::*;
 
     fn unary_swap_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "unary_swap")
-            .collect()
+        super::mutations_by_operator(source, "unary_swap")
     }
 
     // INV-1: `-x` → `+x`
@@ -1974,11 +1976,7 @@ mod string_emptying_tests {
     use super::*;
 
     fn string_emptying_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "string_emptying")
-            .collect()
+        super::mutations_by_operator(source, "string_emptying")
     }
 
     // INV-1: Non-empty string gets both string_mutation (XX) and string_emptying ("") mutations.
@@ -2050,11 +2048,7 @@ mod float_mutation_tests {
     use super::*;
 
     fn float_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "number_mutation")
-            .collect()
+        super::mutations_by_operator(source, "number_mutation")
     }
 
     // INV-1: `1.5` → `2.5` (float + 1.0).
@@ -2121,19 +2115,11 @@ mod augassign_mutation_tests {
     use super::*;
 
     fn augop_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "augop_swap")
-            .collect()
+        super::mutations_by_operator(source, "augop_swap")
     }
 
     fn augassign_to_assign_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "augassign_to_assign")
-            .collect()
+        super::mutations_by_operator(source, "augassign_to_assign")
     }
 
     // INV-1: `a += b` → `a -= b` (augop_swap).
@@ -2979,11 +2965,7 @@ mod return_value_tests {
     use super::*;
 
     fn return_value_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "return_value")
-            .collect()
+        super::mutations_by_operator(source, "return_value")
     }
 
     // INV-1: `return a + b` → mutation replaces "a + b" with "None"
@@ -3087,7 +3069,7 @@ mod return_value_tests {
         let m = fm.mutations.iter().find(|m| m.operator == "return_value").unwrap();
 
         // The span text must equal the original
-        assert_eq!(&fm.source[m.start..m.end], m.original.as_str());
+        super::assert_span_matches_original(fm, m);
 
         // The span must NOT include "return"
         let before_span = &fm.source[..m.start];
@@ -3274,11 +3256,7 @@ mod dict_kwarg_tests {
     use super::*;
 
     fn kwarg_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations)
-            .filter(|m| m.operator == "dict_kwarg")
-            .collect()
+        super::mutations_by_operator(source, "dict_kwarg")
     }
 
     #[test]
@@ -3549,7 +3527,7 @@ mod exception_type_tests {
         // Each mutation must point to a distinct position in the source.
         assert_ne!(pairs[0].1.start, pairs[1].1.start, "mutations must target different source positions");
         for (fm, m) in &pairs {
-            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+            super::assert_span_matches_original(fm, m);
         }
     }
 
@@ -3581,7 +3559,7 @@ mod exception_type_tests {
             "mutations must be ordered by source position"
         );
         for (fm, m) in &pairs {
-            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+            super::assert_span_matches_original(fm, m);
         }
     }
 
@@ -3611,7 +3589,7 @@ mod exception_type_tests {
             "cursor must advance past first handler before searching for second (distinct positions required)"
         );
         for (fm, m) in &pairs {
-            assert_eq!(&fm.source[m.start..m.end], m.original.as_str(), "span must match original");
+            super::assert_span_matches_original(fm, m);
         }
     }
 
@@ -4230,11 +4208,7 @@ mod statement_deletion_tests {
     use libcst_native::parse_module;
 
     fn statement_deletion_mutations(source: &str) -> Vec<Mutation> {
-        let fms = collect_file_mutations(source);
-        fms.into_iter()
-            .flat_map(|fm| fm.mutations.into_iter())
-            .filter(|m| m.operator == "statement_deletion")
-            .collect()
+        super::mutations_by_operator(source, "statement_deletion")
     }
 
     // INV-1: simple assignment `x = foo()` → 1 statement_deletion with replacement "pass"

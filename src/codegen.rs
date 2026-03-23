@@ -334,6 +334,10 @@ mod tests {
     use super::*;
     use crate::mutation::collect_file_mutations;
 
+    const SIMPLE_ADD: &str = "def add(a, b):\n    return a + b\n";
+    const TWO_FUNCTIONS: &str = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
+    const CLASS_WITH_METHOD: &str = "class Calculator:\n    def add(self, a, b):\n        return a + b\n";
+
     // --- byte_offset_to_location ---
 
     #[test]
@@ -365,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_descriptor_source_file_is_module_name() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let result = mutate_file(source, "mymod.core", None).unwrap();
         for desc in &result.descriptors {
             assert_eq!(
@@ -411,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_mutate_simple_file() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let result = mutate_file(source, "simple_lib", None).unwrap();
 
         assert!(
@@ -480,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_mutate_file_multiple_functions() {
-        let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
+        let source = TWO_FUNCTIONS;
         let result = mutate_file(source, "math_lib", None).unwrap();
 
         assert!(
@@ -499,11 +503,7 @@ mod tests {
 
     #[test]
     fn test_class_method_wrapper_stays_inside_class() {
-        let source = "\
-class Calculator:
-    def add(self, a, b):
-        return a + b
-";
+        let source = CLASS_WITH_METHOD;
         let result = mutate_file(source, "calc", None).unwrap();
 
         // The wrapper `def add(self, a, b)` must be INSIDE the class body,
@@ -585,7 +585,7 @@ class Finder:
 
     #[test]
     fn test_mutated_functions_not_duplicated() {
-        let source = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";
+        let source = TWO_FUNCTIONS;
         let result = mutate_file(source, "m", None).unwrap();
 
         // The original function definitions should NOT appear in the output
@@ -610,7 +610,7 @@ class Finder:
 
     #[test]
     fn test_top_level_wrapper_at_module_level() {
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let result = mutate_file(source, "m", None).unwrap();
 
         // The wrapper `def add(` must NOT be indented (indent == 0)
@@ -672,7 +672,7 @@ class Calc:
     #[test]
     fn test_top_level_mangled_code_at_module_level() {
         // INV-3: for top-level functions, mangled orig/variants/dict stay at module level.
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let result = mutate_file(source, "m", None).unwrap();
 
         let orig_line = result
@@ -1315,7 +1315,7 @@ X = factory(5)
         // defined BEFORE the wrapper (wrapper_code) that references it.
         // This ensures that even if nothing calls the function at module level,
         // the output is always in the correct order.
-        let source = "def add(a, b):\n    return a + b\n";
+        let source = SIMPLE_ADD;
         let result = mutate_file(source, "m", None).unwrap();
         let lines: Vec<&str> = result.source.lines().collect();
 

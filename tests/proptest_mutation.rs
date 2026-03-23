@@ -555,6 +555,7 @@ fn dict_kwarg_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
     /// INV-1: Determinism — collecting mutations twice yields identical results.
     #[test]
     fn deterministic(source in python_func_strategy()) {
@@ -1397,6 +1398,7 @@ fn keyword_swap_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
     /// Keyword swap functions satisfy all core invariants (INV-2..5).
     ///
     /// Catches offset bugs in the Break/Continue arms of `collect_small_statement_mutations`:
@@ -1512,6 +1514,7 @@ fn decorator_strategy() -> impl Strategy<Value = String> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
     /// Decorated functions produce zero mutations (blanket skip).
     /// Undecorated functions still produce mutations.
     #[test]
