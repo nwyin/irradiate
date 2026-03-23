@@ -102,20 +102,35 @@ identical to the original) or trivially killed (crash immediately, wasting test 
 Structural pattern-matching rules that detected 4x more equivalents than TCE
 (Trivial Compiler Equivalence) at 1/2200th the cost.
 
-## Planned strategies
-
-### Operator dedup — string, arg_removal, condition_replacement
-
-Three remaining dedup opportunities (tracked in GitHub issues #14-#16):
-- `string_mutation` + `string_emptying`: both test string content sensitivity (~2.5%)
-- `arg_removal` None-replacement + removal: both test argument usage (~1.9%)
-- `condition_replacement` True + False: both test condition sensitivity (~7.5%)
-
 ### Sampling (`--sample N`)
 
-Random/stratified sampling of mutants. Academic consensus: 5% random sampling gives
-99% R² correlation with the full mutation score (Wong et al. 1995). A `--sample 0.1`
-flag would test only 10% of mutants.
+Randomly sample a subset of mutants for testing. Academic consensus: 5% random
+sampling gives 99% R² correlation with the full mutation score (Wong et al. 1995).
+
+**Usage**:
+- `--sample 0.1` — test 10% of mutants
+- `--sample 100` — test exactly 100 mutants
+- `--sample-seed 42` — override the RNG seed (default: 0 for reproducibility)
+
+**Stratification**: mutants are grouped by operator type, and each operator
+contributes proportionally to the sample, ensuring no operator class is
+completely unrepresented.
+
+**Interaction with other flags**: sampling is applied after `--mutant-names`,
+`--diff`, and mutation generation filters. With `--covered-only`, some sampled
+mutants may be excluded if they have no test coverage.
+
+**Source**: Wong, Mathur, "Reducing the Cost of Mutation Testing" (JSS 1995).
+Zhang et al., "Operator-based and Random Mutant Selection: Better Together"
+(ASE 2013).
+
+## Planned strategies
+
+### Operator dedup — string, arg_removal
+
+Two remaining dedup opportunities (tracked in GitHub issues #14-#15):
+- `string_mutation` + `string_emptying`: both test string content sensitivity (~2.5%)
+- `arg_removal` None-replacement + removal: both test argument usage (~1.9%)
 
 ### Mutation levels (`--level 1/2/3`)
 

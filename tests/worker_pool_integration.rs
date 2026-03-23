@@ -1015,6 +1015,8 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         diff_ref: None,
         report: None,
         report_output: None,
+        sample: None,
+        sample_seed: 0,
         pytest_add_cli_args: vec![],
     }
 }

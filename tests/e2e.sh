@@ -338,5 +338,25 @@ echo "  INV-2: add() mutants present in incremental run: OK"
 trap - EXIT
 rm -rf "$INCR_TMPDIR"
 
+# === --sample flag ===
+echo ""
+echo "=== E2E: --sample flag ==="
+rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
+
+SAMPLE_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 --sample 0.5 2>&1 )
+echo "$SAMPLE_OUTPUT"
+
+if ! echo "$SAMPLE_OUTPUT" | grep -q "Sampled"; then
+    echo "FAIL: Expected 'Sampled' in --sample output"
+    exit 1
+fi
+echo "  --sample output contains 'Sampled': OK"
+
+if ! echo "$SAMPLE_OUTPUT" | grep -q "sampled"; then
+    echo "FAIL: Expected 'sampled' note in score output"
+    exit 1
+fi
+echo "  --sample score note present: OK"
+
 echo ""
 echo "=== E2E tests: PASS ==="

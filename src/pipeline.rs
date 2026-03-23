@@ -50,6 +50,12 @@ pub struct RunConfig {
     pub report: Option<String>,
     /// Output path for the report. Defaults to `irradiate-report.<format>`.
     pub report_output: Option<std::path::PathBuf>,
+    /// Randomly sample a subset of mutants for testing.
+    /// Values in (0.0, 1.0] are fractions; values > 1 are absolute counts.
+    /// `None` = test all mutants (default).
+    pub sample: Option<f64>,
+    /// RNG seed for `--sample`. Default 0 for deterministic reproducibility.
+    pub sample_seed: u64,
     /// Extra arguments appended to every pytest invocation.
     /// Sourced from `pytest_add_cli_args` in pyproject.toml and/or `--pytest-args` CLI flag.
     pub pytest_add_cli_args: Vec<String>,
@@ -74,6 +80,65 @@ struct ScheduledMutant {
     descriptor: MutantCacheDescriptor,
     work_item: WorkItem,
     cache_key: Option<String>,
+}
+
+/// Operator-stratified random sampling of mutants.
+///
+/// Each mutation operator contributes proportionally to the sample, ensuring
+/// no operator class is completely unrepresented. Deterministic given the same
+/// seed and input.
+fn sample_mutants(
+    mutants: Vec<MutantCacheDescriptor>,
+    sample_value: f64,
+    seed: u64,
+) -> Vec<MutantCacheDescriptor> {
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    let target_count = if sample_value > 0.0 && sample_value <= 1.0 {
+        (mutants.len() as f64 * sample_value).ceil() as usize
+    } else {
+        (sample_value as usize).min(mutants.len())
+    }
+    .max(1);
+
+    if target_count >= mutants.len() {
+        return mutants;
+    }
+
+    // Group by operator, sorted alphabetically for deterministic iteration.
+    let mut by_operator: HashMap<String, Vec<MutantCacheDescriptor>> = HashMap::new();
+    for m in mutants {
+        by_operator.entry(m.operator.clone()).or_default().push(m);
+    }
+    let total: usize = by_operator.values().map(|v| v.len()).sum();
+    let mut groups: Vec<(String, Vec<MutantCacheDescriptor>)> = by_operator.into_iter().collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    let num_groups = groups.len();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut sampled = Vec::with_capacity(target_count);
+    let mut remaining = target_count;
+
+    for (i, (_op, mut group)) in groups.into_iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let share = if i == num_groups - 1 {
+            // Last group gets whatever remains to avoid rounding errors.
+            remaining.min(group.len())
+        } else {
+            let proportion = group.len() as f64 / total as f64;
+            let alloc = (proportion * target_count as f64).round() as usize;
+            alloc.max(1).min(remaining).min(group.len())
+        };
+        group.shuffle(&mut rng);
+        sampled.extend(group.into_iter().take(share));
+        remaining = remaining.saturating_sub(share);
+    }
+
+    sampled.truncate(target_count);
+    sampled
 }
 
 /// Validate that the environment is ready to run mutation testing.
@@ -183,6 +248,21 @@ pub async fn run(config: RunConfig) -> Result<()> {
             return Ok(());
         }
     }
+
+    // Apply sampling if requested.
+    let sampled_from = if let Some(sample_value) = config.sample {
+        let population = all_mutants.len();
+        all_mutants = sample_mutants(all_mutants, sample_value, config.sample_seed);
+        eprintln!(
+            "  Sampled {} of {} mutants ({:.1}%)",
+            all_mutants.len(),
+            population,
+            all_mutants.len() as f64 / population as f64 * 100.0,
+        );
+        Some(population)
+    } else {
+        None
+    };
 
     let total_mutants = all_mutants.len();
 
@@ -555,7 +635,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     }
 
     // Print summary
-    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts, &generation.descriptors_by_name);
+    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts, &generation.descriptors_by_name, sampled_from);
 
     // Emit GitHub Actions annotations (no-op outside GitHub Actions).
     let all_descriptors: Vec<_> = generation.descriptors_by_name.values().cloned().collect();
@@ -1532,6 +1612,7 @@ fn print_summary(
     elapsed_secs: f64,
     cache_counts: CacheCounts,
     descriptors: &HashMap<String, MutantCacheDescriptor>,
+    sampled_from: Option<usize>,
 ) -> (usize, usize) {
     let mut killed = 0usize;
     let mut survived = 0usize;
@@ -1565,9 +1646,15 @@ fn print_summary(
     };
 
     eprintln!();
-    eprintln!(
-        "Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
-    );
+    if let Some(population) = sampled_from {
+        eprintln!(
+            "Mutation testing complete ({total} of {population} mutants sampled in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
+        );
+    } else {
+        eprintln!(
+            "Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
+        );
+    }
     eprintln!("  Cache hits: {0}", cache_counts.hits);
     eprintln!("  Cache misses: {0}", cache_counts.misses);
     eprintln!("  Killed:    {killed}");
@@ -1582,6 +1669,9 @@ fn print_summary(
         eprintln!("  Errors:    {errors}");
     }
     eprintln!("  Score:     {score_str}");
+    if sampled_from.is_some() {
+        eprintln!("  (sampled — score is an estimate)");
+    }
 
     if survived > 0 {
         eprintln!();
@@ -2832,7 +2922,7 @@ mod tests {
     #[test]
     fn test_print_summary_returns_killed_survived() {
         let results = make_results(3, 1);
-        let (killed, survived) = print_summary(&results, 1.0, zero_cache(), &HashMap::new());
+        let (killed, survived) = print_summary(&results, 1.0, zero_cache(), &HashMap::new(), None);
         assert_eq!(killed, 3);
         assert_eq!(survived, 1);
     }
@@ -2841,7 +2931,7 @@ mod tests {
     #[test]
     fn test_print_summary_no_tested_mutants() {
         let results: Vec<MutantResult> = vec![];
-        let (killed, survived) = print_summary(&results, 0.0, zero_cache(), &HashMap::new());
+        let (killed, survived) = print_summary(&results, 0.0, zero_cache(), &HashMap::new(), None);
         assert_eq!(killed, 0);
         assert_eq!(survived, 0);
     }
@@ -3239,6 +3329,8 @@ index 000..abc
             diff_ref: None,
             report: None,
             report_output: None,
+            sample: None,
+            sample_seed: 0,
             pytest_add_cli_args: vec![],
         }
     }
@@ -3307,5 +3399,100 @@ index 000..abc
             msg.contains("tests-dir") || msg.contains("does not exist"),
             "error should mention tests-dir; got: {msg}"
         );
+    }
+
+    // --- sample_mutants tests ---
+
+    fn make_descriptor(name: &str, operator: &str) -> MutantCacheDescriptor {
+        MutantCacheDescriptor {
+            mutant_name: name.to_string(),
+            function_source: String::new(),
+            operator: operator.to_string(),
+            start: 0,
+            end: 0,
+            original: String::new(),
+            replacement: String::new(),
+            source_file: String::new(),
+            fn_byte_offset: 0,
+            fn_start_line: 0,
+        }
+    }
+
+    fn make_descriptors(counts: &[(&str, usize)]) -> Vec<MutantCacheDescriptor> {
+        let mut descs = Vec::new();
+        for (op, count) in counts {
+            for i in 0..*count {
+                descs.push(make_descriptor(&format!("m.x_{op}_{i}"), op));
+            }
+        }
+        descs
+    }
+
+    #[test]
+    fn sample_fraction() {
+        let descs = make_descriptors(&[("binop_swap", 100)]);
+        let sampled = sample_mutants(descs, 0.1, 0);
+        assert_eq!(sampled.len(), 10);
+    }
+
+    #[test]
+    fn sample_absolute_count() {
+        let descs = make_descriptors(&[("binop_swap", 100)]);
+        let sampled = sample_mutants(descs, 50.0, 0);
+        assert_eq!(sampled.len(), 50);
+    }
+
+    #[test]
+    fn sample_exceeds_total_is_noop() {
+        let descs = make_descriptors(&[("binop_swap", 10)]);
+        let sampled = sample_mutants(descs, 200.0, 0);
+        assert_eq!(sampled.len(), 10);
+    }
+
+    #[test]
+    fn sample_fraction_one_is_noop() {
+        let descs = make_descriptors(&[("binop_swap", 10)]);
+        let sampled = sample_mutants(descs, 1.0, 0);
+        assert_eq!(sampled.len(), 10);
+    }
+
+    #[test]
+    fn sample_deterministic_same_seed() {
+        let descs = make_descriptors(&[("binop_swap", 50), ("compop_swap", 30), ("condition_replacement", 20)]);
+        let a = sample_mutants(descs.clone(), 0.1, 42);
+        let b = sample_mutants(descs, 0.1, 42);
+        let names_a: Vec<_> = a.iter().map(|d| &d.mutant_name).collect();
+        let names_b: Vec<_> = b.iter().map(|d| &d.mutant_name).collect();
+        assert_eq!(names_a, names_b, "same seed must produce same sample");
+    }
+
+    #[test]
+    fn sample_different_seed_differs() {
+        let descs = make_descriptors(&[("binop_swap", 50), ("compop_swap", 30), ("condition_replacement", 20)]);
+        let a = sample_mutants(descs.clone(), 0.1, 0);
+        let b = sample_mutants(descs, 0.1, 99);
+        let names_a: Vec<_> = a.iter().map(|d| &d.mutant_name).collect();
+        let names_b: Vec<_> = b.iter().map(|d| &d.mutant_name).collect();
+        assert_ne!(names_a, names_b, "different seeds should produce different samples");
+    }
+
+    #[test]
+    fn sample_stratified_all_operators_represented() {
+        // 70/20/10 split across 3 operators, 10% sample = 10 mutants.
+        // All 3 operators should have at least 1 representative.
+        let descs = make_descriptors(&[("binop_swap", 70), ("compop_swap", 20), ("condition_replacement", 10)]);
+        let sampled = sample_mutants(descs, 0.1, 0);
+        assert_eq!(sampled.len(), 10);
+        let ops: std::collections::HashSet<_> = sampled.iter().map(|d| d.operator.as_str()).collect();
+        assert!(ops.contains("binop_swap"), "binop_swap must be represented");
+        assert!(ops.contains("compop_swap"), "compop_swap must be represented");
+        assert!(ops.contains("condition_replacement"), "condition_replacement must be represented");
+    }
+
+    #[test]
+    fn sample_empty_input() {
+        let descs: Vec<MutantCacheDescriptor> = vec![];
+        let sampled = sample_mutants(descs, 0.1, 0);
+        assert!(sampled.is_empty());
     }
 }

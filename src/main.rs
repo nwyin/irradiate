@@ -2,6 +2,16 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+fn parse_sample(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid number"))?;
+    if v <= 0.0 {
+        return Err("sample must be positive".to_string());
+    }
+    Ok(v)
+}
+
 fn parse_fail_under(s: &str) -> std::result::Result<f64, String> {
     let v: f64 = s
         .parse()
@@ -92,6 +102,15 @@ enum Commands {
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
 
+        /// Randomly sample a subset of mutants. Values 0.0-1.0 are fractions (e.g. 0.1 = 10%).
+        /// Values > 1 are absolute counts (e.g. 100 = test exactly 100 mutants).
+        #[arg(long, value_parser = parse_sample)]
+        sample: Option<f64>,
+
+        /// RNG seed for --sample (default: 0 for reproducibility)
+        #[arg(long, default_value_t = 0)]
+        sample_seed: u64,
+
         /// Extra arguments to pass to every pytest invocation (appended after config file values).
         /// Example: --pytest-args=-v --pytest-args=--tb=short
         #[arg(long = "pytest-args")]
@@ -163,6 +182,8 @@ async fn main() -> Result<()> {
             diff,
             report,
             output,
+            sample,
+            sample_seed,
             pytest_args,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
@@ -205,6 +226,8 @@ async fn main() -> Result<()> {
                 diff_ref: diff,
                 report,
                 report_output: output,
+                sample,
+                sample_seed,
                 pytest_add_cli_args,
             })
             .await
