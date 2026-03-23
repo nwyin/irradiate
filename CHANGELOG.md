@@ -2,7 +2,7 @@
 
 All notable changes to irradiate are documented here.
 
-## Unreleased
+## 0.2.0 — 2026-03-23
 
 ### Features
 
@@ -10,6 +10,7 @@ All notable changes to irradiate are documented here.
 - **Multi-file `--paths-to-mutate`** — accepts multiple paths (`--paths-to-mutate src/a.py --paths-to-mutate src/b.py`).
 - **Survivor context** — survived mutant output now shows file path, line number, and a description of what changed.
 - **Skip uncovered functions** — functions with zero test coverage are marked `NoTests` immediately during scheduling instead of running the full test suite against them. With `--covered-only`, they're excluded from results entirely.
+- **GitHub Actions composite action** — `nwyin/irradiate@v0` for drop-in CI integration with inline annotations, step summary, and score outputs.
 
 ### Performance
 
@@ -29,9 +30,15 @@ All notable changes to irradiate are documented here.
 - **String operator dedup** — `string_mutation` ("XXhelloXX") removed, only `string_emptying` ("") retained. If code doesn't catch empty string, it won't catch the wrapped version either.
 - **Arg removal dedup** — arity-changing argument removal removed, only None-replacement retained. Removal usually just crashes with TypeError.
 
+### Fixes
+
+- **Import hook no longer hijacks partially mutated packages** — when only a subset of files in a package are mutated (e.g. `--paths-to-mutate httpx/_content.py`), the import hook previously created a namespace package that shadowed the real package, breaking all other imports. Now the hook only intercepts modules with actual mutated files, and preserves the original package's search locations.
+- **Better error messages** — worker crashes now surface stderr from the failed process. Socket, spawn, timeout, and "no mutations found" errors include actionable context (paths, durations, common causes).
+
 ### Internal
 
 - **Removed libcst dependency** — all parsing and validity checks now use tree-sitter. Simpler dependency tree, faster test builds.
+- **Release workflow updates floating tags** — pushing `v0.2.0` automatically updates `v0` and `v0.2` tags for semver-compatible action references.
 
 ## 0.1.1 — 2026-03-21
 
