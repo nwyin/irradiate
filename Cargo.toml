@@ -29,4 +29,3 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
-libcst = { version = "1.8.6", default-features = false }

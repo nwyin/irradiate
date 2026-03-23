@@ -1,10 +1,10 @@
 # Project Context — irradiate
 
 ## Overview
-Mutation testing tool for Python, written in Rust — spiritual successor to mutmut. Parses Python source with libcst, generates mutant variants via trampoline code injection, then runs pytest workers over Unix sockets to classify each mutant as killed/survived.
+Mutation testing tool for Python, written in Rust — spiritual successor to mutmut. Parses Python source with tree-sitter, generates mutant variants via trampoline code injection, then runs pytest workers over Unix sockets to classify each mutant as killed/survived.
 
 ## Architecture
-- **mutation.rs** — Parse Python via libcst-native, walk the CST to collect mutation points (binop swap, compop swap, boolop swap, name/number/string/lambda mutations, method swaps, assignment mutations). Each `Mutation` carries byte-span offsets within the function source.
+- **mutation.rs** — Shared types (`Mutation`, `FunctionMutations`) and `apply_mutation`. Delegates to tree-sitter collector in `tree_sitter_mutation.rs`.
 - **trampoline.rs** — Name-mangle functions (mutmut convention: `x_func` / `xǁClassǁmethod`), generate orig + variant defs + lookup dict + trampoline wrapper that dispatches via `irradiate_harness.active_mutant`.
 - **codegen.rs** — File-level codegen: strip original function defs, prepend trampoline runtime, append all trampoline arrangements. Produces `MutatedFile` with source + mutant name list.
 - **pipeline.rs** — Full pipeline orchestration: discover .py files → mutate (rayon parallel) → write to `mutants/` dir → optional stats collection → optional forced-fail validation → dispatch to worker pool → write `.meta` results → print report. Also implements `results` and `show` subcommands.
@@ -53,7 +53,7 @@ Data flow: CLI → `pipeline::run` → `codegen::mutate_file` (parallel via rayo
 - `NEVER_MUTATE_FUNCTIONS`: `__getattribute__`, `__setattr__`, `__new__`
 
 ## Dependencies & Integration
-- **libcst (1.8.6)** — Rust port of Python's libcst; used for parsing Python source into CST for mutation point discovery. No-default-features (native parser only).
+- **tree-sitter / tree-sitter-python** — Rust-native Python parser for mutation point discovery. Byte spans come directly from the parser.
 - **tokio** — Async runtime for worker pool orchestration, Unix socket communication
 - **rayon** — Parallel mutation generation across source files
 - **clap 4** — CLI argument parsing with derive macros

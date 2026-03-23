@@ -19,7 +19,7 @@
 #
 #   irradiate   — trampoline-based: all mutant variants compiled into one file,
 #                 switching via a global variable (no per-mutant disk I/O).
-#                 Parsing via libcst (Rust-native, pyo3).
+#                 Parsing via tree-sitter (Rust-native).
 #
 #   mutmut      — separate implementation with its own worker pool and
 #                 mutant representation. Mutant counts and scheduling behavior

@@ -56,7 +56,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ### mutmut
 
-The reference implementation irradiate descends from. LibCST-based.
+The reference implementation irradiate descends from. Uses LibCST for parsing.
 
 Operators largely overlap with irradiate. Notable additions beyond irradiate's current set:
 - **String literal case mutations**: `"FooBar"`→`"foobar"`, `"foobar"`→`"FOOBAR"`

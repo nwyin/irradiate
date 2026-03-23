@@ -504,8 +504,8 @@ mod tests {
         // Assert that a binop_swap descriptor exists somewhere (not necessarily first).
         let binop_desc = result.descriptors.iter().find(|d| d.operator == "binop_swap");
         assert!(binop_desc.is_some(), "Must have at least one binop_swap descriptor");
-        // tree-sitter's function_definition node may not include the trailing newline that
-        // libcst codegen adds. Strip trailing whitespace before comparing.
+        // tree-sitter's function_definition node may not include the trailing newline.
+        // Strip trailing whitespace before comparing.
         assert_eq!(binop_desc.unwrap().function_source.trim_end(), source.trim_end());
     }
 

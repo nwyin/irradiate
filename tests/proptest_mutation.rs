@@ -4,7 +4,6 @@
 //! their documented contracts regardless of input variation.
 
 use irradiate::mutation::{apply_mutation, collect_file_mutations};
-use libcst_native::parse_module;
 use proptest::prelude::*;
 
 /// Generate a single valid Python function source with a binary/boolean/comparison expression.
@@ -930,7 +929,7 @@ proptest! {
     #[test]
     fn match_case_all_invariants(source in match_case_strategy()) {
         let fms = collect_file_mutations(&source);
-        // If libcst cannot parse match/case on this platform, skip.
+        // If tree-sitter cannot parse match/case on this platform, skip.
         prop_assume!(!fms.is_empty());
         assert_core_invariants!(fms);
     }
@@ -942,7 +941,7 @@ proptest! {
     #[test]
     fn match_case_removal_count(source in match_case_strategy()) {
         let fms = collect_file_mutations(&source);
-        // If libcst cannot parse match/case on this platform, skip.
+        // If tree-sitter cannot parse match/case on this platform, skip.
         prop_assume!(!fms.is_empty());
 
         // Count `case` lines to determine expected removal count.

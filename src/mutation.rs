@@ -81,9 +81,12 @@ pub fn apply_mutation(func_source: &str, mutation: &Mutation) -> String {
     )
 }
 
-// Used by many test modules for parse-validity assertions.
+/// Check whether source is syntactically valid Python (tree-sitter based).
+/// Used by many test modules for parse-validity assertions.
 #[cfg(test)]
-use libcst_native::parse_module;
+fn parses_as_python(source: &str) -> bool {
+    crate::tree_sitter_mutation::parse_python(source).is_some()
+}
 
 /// Return all mutations from `source` whose operator equals `operator`.
 ///
@@ -677,7 +680,7 @@ mod tests {
         {
             let mutated_func = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated_func, None).is_ok(),
+                parses_as_python(&mutated_func),
                 "Mutating '{}' → '{}' produced unparseable Python:\n{}",
                 m.original,
                 m.replacement,
@@ -950,7 +953,7 @@ mod tests {
         for m in fm.mutations.iter().filter(|m| m.operator == "arg_removal") {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "arg_removal mutation '{}' → '{}' produced unparseable Python:\n{}",
                 m.original,
                 m.replacement,
@@ -1336,7 +1339,7 @@ mod match_case_removal_tests {
         {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "Removing case produced invalid Python:\n{mutated}"
             );
         }
@@ -1562,7 +1565,7 @@ mod match_case_removal_tests {
                 {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "lambda mutation produced unparseable Python for input {:?}:\n{}",
                         source,
                         mutated
@@ -1636,7 +1639,7 @@ mod match_case_removal_tests {
         {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "Removing case produced invalid Python:\n{mutated}"
             );
         }
@@ -1671,7 +1674,7 @@ mod match_case_removal_tests {
         {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "Removing guarded case produced invalid Python:\n{mutated}"
             );
         }
@@ -1777,7 +1780,7 @@ mod assignment_mutation_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "assignment_mutation") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "assignment_mutation on {:?} produced unparseable Python:\n{}",
                         source,
                         mutated
@@ -1877,7 +1880,7 @@ mod unary_mutation_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "unary_removal") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "unary_removal mutation produced unparseable Python for {:?}:\n{}",
                         source,
                         mutated
@@ -1973,7 +1976,7 @@ mod unary_swap_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "unary_swap") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "unary_swap produced unparseable Python for {:?}:\n{}",
                         source,
                         mutated
@@ -2045,7 +2048,7 @@ mod string_emptying_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "string_emptying") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "string_emptying produced unparseable Python for {:?}:\n{}",
                         source,
                         mutated
@@ -2095,7 +2098,7 @@ mod float_mutation_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "number_mutation") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "float mutation produced unparseable Python for {:?}:\n{}",
                         source,
                         mutated
@@ -2266,7 +2269,7 @@ mod augassign_mutation_tests {
                 {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "augop mutation {:?} produced unparseable Python for {:?}:\n{}",
                         m.operator,
                         source,
@@ -2328,7 +2331,7 @@ mod ifexp_mutation_tests {
             for m in &fm.mutations {
                 let mutated = apply_mutation(&fm.source, m);
                 assert!(
-                    parse_module(&mutated, None).is_ok(),
+                    parses_as_python(&mutated),
                     "ifexp mutation {:?} produced unparseable Python:\n{}",
                     m.operator,
                     mutated
@@ -2444,7 +2447,7 @@ mod container_mutation_tests {
                 for m in &fm.mutations {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "container mutation {:?} produced unparseable Python for {:?}:\n{}",
                         m.operator,
                         source,
@@ -2481,7 +2484,7 @@ mod assert_mutation_tests {
             for m in &fm.mutations {
                 let mutated = apply_mutation(&fm.source, m);
                 assert!(
-                    parse_module(&mutated, None).is_ok(),
+                    parses_as_python(&mutated),
                     "assert mutation {:?} produced unparseable Python:\n{}",
                     m.operator,
                     mutated
@@ -2732,7 +2735,7 @@ mod yield_detection_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "default_arg") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "mutated source must parse as valid Python:\n{mutated}\n(original: {source})"
                     );
                 }
@@ -2933,7 +2936,7 @@ mod keyword_swap_tests {
         assert_ne!(kw[0].start, kw[1].start, "break and continue must be at distinct positions");
     }
 
-    // INV-4: All keyword_swap mutations produce valid Python (parse_module succeeds).
+    // INV-4: All keyword_swap mutations produce valid Python.
     #[test]
     fn test_keyword_swap_parseable() {
         let sources = [
@@ -2947,7 +2950,7 @@ mod keyword_swap_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "keyword_swap") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "keyword_swap mutation {:?} → {:?} produced unparseable Python:\n{}",
                         m.original, m.replacement, mutated
                     );
@@ -3072,7 +3075,7 @@ mod return_value_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "return_value") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "return_value mutation '{}' → '{}' produced unparseable Python:\n{}",
                         m.original,
                         m.replacement,
@@ -3360,7 +3363,7 @@ mod dict_kwarg_tests {
         for fm in &fms {
             for m in fm.mutations.iter().filter(|m| m.operator == "dict_kwarg") {
                 let mutated = apply_mutation(&fm.source, m);
-                // A mutated source is parseable if libcst can collect mutations from it.
+                // A mutated source is parseable if the parser can handle it.
                 // We only need to verify that collect_file_mutations doesn't panic.
                 let _ = collect_file_mutations(&mutated);
             }
@@ -3496,7 +3499,7 @@ mod exception_type_tests {
             .expect("must have an exception_type mutation");
         let mutated = apply_mutation(&fm.source, exc_m);
         assert!(
-            parse_module(&mutated, None).is_ok(),
+            parses_as_python(&mutated),
             "mutated source must be parseable: {mutated}"
         );
     }
@@ -3606,7 +3609,7 @@ mod exception_type_tests {
     #[test]
     fn test_duplicate_handlers_distinct_positions() {
         // Two handlers of the same exception type in the same try block.
-        // Python allows this (the second is unreachable); libcst parses it fine.
+        // Python allows this (the second is unreachable); tree-sitter parses it fine.
         // The sub-cursor must advance PAST the first handler before searching for the second,
         // so both mutations must point to distinct positions.
         // Regression: if cursor goes backward after the first handler, it re-finds the first
@@ -3672,7 +3675,7 @@ mod exception_type_tests {
         assert_eq!(m.original, "items");
         assert_eq!(m.replacement, "not (items)");
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok());
+        assert!(parses_as_python(&mutated));
     }
 
     #[test]
@@ -3685,7 +3688,7 @@ mod exception_type_tests {
         assert_eq!(m.original, "items");
         assert_eq!(m.replacement, "not (items)");
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parses_as_python(&mutated), "mutated source must be parseable: {mutated}");
     }
 
     #[test]
@@ -3698,7 +3701,7 @@ mod exception_type_tests {
         assert_eq!(m.original, "result == expected");
         assert_eq!(m.replacement, "not (result == expected)");
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parses_as_python(&mutated), "mutated source must be parseable: {mutated}");
     }
 
     #[test]
@@ -3713,7 +3716,7 @@ mod exception_type_tests {
         // The mutated function must still include the message.
         let mutated = apply_mutation(&fm.source, m);
         assert!(mutated.contains("\"expected true\""), "message must be preserved in mutated source");
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parses_as_python(&mutated), "mutated source must be parseable: {mutated}");
     }
 
     #[test]
@@ -3726,7 +3729,7 @@ mod exception_type_tests {
         assert_eq!(m.original, "flag");
         assert_eq!(m.replacement, "not (flag)");
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parses_as_python(&mutated), "mutated source must be parseable: {mutated}");
     }
 
     #[test]
@@ -3739,7 +3742,7 @@ mod exception_type_tests {
         let (fm, m) = &cn[0];
         assert_eq!(m.replacement, format!("not ({})", m.original));
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parses_as_python(&mutated), "mutated source must be parseable: {mutated}");
     }
 
     #[test]
@@ -3887,7 +3890,7 @@ mod exception_type_tests {
         assert!(originals.contains(&"b"), "inner if condition must be mutated");
         for (fm, m) in &pairs {
             let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
+            assert!(parses_as_python(&mutated), "mutated source must parse: {mutated}");
         }
     }
 
@@ -3913,7 +3916,7 @@ mod exception_type_tests {
                 assert_eq!(m.replacement, format!("not ({})", m.original), "INV-3 violated");
                 let mutated = apply_mutation(&fm.source, m);
                 assert!(
-                    parse_module(&mutated, None).is_ok(),
+                    parses_as_python(&mutated),
                     "INV-1 violated: unparseable mutant for {source}: {mutated}"
                 );
             }
@@ -3924,7 +3927,6 @@ mod exception_type_tests {
 #[cfg(test)]
 mod ternary_swap_tests {
     use super::*;
-    use libcst_native::parse_module;
 
     fn ternary_mutations(source: &str) -> Vec<(FunctionMutations, Mutation)> {
         collect_file_mutations(source)
@@ -3976,7 +3978,7 @@ mod ternary_swap_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "ternary_swap") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "mutated source must be parseable:\n{mutated}"
                     );
                 }
@@ -4053,7 +4055,6 @@ mod ternary_swap_tests {
 #[cfg(test)]
 mod loop_mutation_tests {
     use super::*;
-    use libcst_native::parse_module;
 
     /// Extract all loop_mutation mutations from a source string, returning (fm, mutation) pairs.
     fn loop_mutations_for(source: &str) -> Vec<(FunctionMutations, Mutation)> {
@@ -4075,7 +4076,7 @@ mod loop_mutation_tests {
     fn mutated_source_parses(fm: &FunctionMutations, m: &Mutation) -> bool {
         let mut result = fm.source.clone();
         result.replace_range(m.start..m.end, &m.replacement);
-        parse_module(&result, None).is_ok()
+        parses_as_python(&result)
     }
 
     // INV-1 helper: all loop_mutation results must produce parseable Python.
@@ -4242,7 +4243,6 @@ mod loop_mutation_tests {
 #[cfg(test)]
 mod statement_deletion_tests {
     use super::*;
-    use libcst_native::parse_module;
 
     fn statement_deletion_mutations(source: &str) -> Vec<Mutation> {
         super::mutations_by_operator(source, "statement_deletion")
@@ -4353,7 +4353,7 @@ mod statement_deletion_tests {
                 for m in fm.mutations.iter().filter(|m| m.operator == "statement_deletion") {
                     let mutated = apply_mutation(&fm.source, m);
                     assert!(
-                        parse_module(&mutated, None).is_ok(),
+                        parses_as_python(&mutated),
                         "statement_deletion '{}' → '{}' produced unparseable Python:\n{}",
                         m.original,
                         m.replacement,
@@ -4372,7 +4372,7 @@ mod statement_deletion_tests {
         for m in &fms[0].mutations {
             let mutated = apply_mutation(&fms[0].source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "operator {} produced unparseable output:\n{}",
                 m.operator,
                 mutated
@@ -4428,7 +4428,7 @@ mod statement_deletion_tests {
             if m.operator == "string_mutation" || m.operator == "string_emptying" {
                 let mutated = apply_mutation(&fms[0].source, m);
                 assert!(
-                    parse_module(&mutated, None).is_ok(),
+                    parses_as_python(&mutated),
                     "operator {} produced unparseable output:\n{}",
                     m.operator,
                     mutated
@@ -4457,7 +4457,7 @@ mod statement_deletion_tests {
             // INV-2: produces valid Python
             let mutated = apply_mutation(&fms[0].source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "operator {} produced unparseable output:\n{}",
                 m.operator,
                 mutated
@@ -4491,7 +4491,7 @@ mod statement_deletion_tests {
                 assert_eq!(span_text, m.original, "INV-1 violated for b-string in parens");
                 let mutated = apply_mutation(&fms[0].source, m);
                 assert!(
-                    parse_module(&mutated, None).is_ok(),
+                    parses_as_python(&mutated),
                     "operator {} produced unparseable output:\n{}",
                     m.operator,
                     mutated
@@ -4524,7 +4524,7 @@ mod statement_deletion_tests {
         for m in &fms[0].mutations {
             let mutated = apply_mutation(&fms[0].source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parses_as_python(&mutated),
                 "operator {} produced unparseable output:\n{}",
                 m.operator,
                 mutated
@@ -4723,7 +4723,7 @@ mod nonlocal_detection_tests {
     }
 
     // INV-3: Function that itself uses `nonlocal` at the top level is also skipped.
-    // (Normally only valid if nested, but libcst parses it at top level too.)
+    // (Normally only valid if nested, but tree-sitter parses it at top level too.)
     #[test]
     fn test_direct_nonlocal_skips_function() {
         let source = concat!(

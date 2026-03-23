@@ -222,7 +222,7 @@ def _hero_html() -> str:
     <h3>Why irradiate?</h3>
     <ul>
       <li><strong>Worker pool:</strong> pytest processes start once and are reused across mutants — no per-mutant Python startup overhead.</li>
-      <li><strong>Parallel mutation generation:</strong> libcst-based CST walking runs across all source files in parallel via rayon.</li>
+      <li><strong>Parallel mutation generation:</strong> tree-sitter-based parsing runs across all source files in parallel via rayon.</li>
       <li><strong>Targeted tests:</strong> stats mode identifies which tests cover each function, so only relevant tests run per mutant.</li>
       <li><strong>Compatible results:</strong> follows mutmut naming conventions; mutation scores and metadata stored as JSON for tooling.</li>
     </ul>

@@ -20,13 +20,13 @@ informative rather than perfectly apples-to-apples.
 - Compiles all function variants (original + all mutants) into a single file at
  start-up. Mutant switching is a global variable assignment — zero disk I/O per
  mutant.
-- Parses Python with libcst (Rust-native, via pyo3).
+- Parses Python with tree-sitter (Rust-native).
 - Parallelism via a persistent worker pool (workers stay alive across mutants,
   paying startup cost once per worker rather than once per mutant).
 
 ### What this means for the benchmark numbers
 
-- **Parsing speed**: libcst (Rust-native) vs parso (pure Python) differs in
+- **Parsing speed**: tree-sitter (Rust-native) vs parso (pure Python) differs in
   baseline parsing cost, though this is a one-time cost per file.
 - **Mutant counts differ**: operator coverage is not identical between tools.
   Counts will NOT match. This is expected.

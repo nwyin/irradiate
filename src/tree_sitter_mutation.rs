@@ -1,9 +1,8 @@
 //! Tree-sitter-backed mutation collector.
 //!
-//! Alternative to the libcst collector in `mutation.rs`. Uses tree-sitter for parsing so that
-//! byte spans come directly from the parser — no monotonic cursor hack needed.
+//! Uses tree-sitter for parsing so that byte spans come directly from the parser.
 //!
-//! Safety checks (matching the libcst collector):
+//! Safety checks:
 //! - Enum subclasses are skipped entirely (EnumMeta treats all class-body names as candidates).
 //! - Functions with `nonlocal` anywhere in their subtree are skipped (scope chain breaks on extract).
 //! - `len` and `isinstance` calls are not arg_removal-mutated (they're trivially killed / noisy).
@@ -179,7 +178,8 @@ pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations
     results
 }
 
-fn parse_python(source: &str) -> Option<Tree> {
+/// Parse Python source with tree-sitter, returning None if the source has syntax errors.
+pub(crate) fn parse_python(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
     let tree = parser.parse(source, None)?;
@@ -814,7 +814,7 @@ fn add_assignment_mutations(
     // Chained assignments like `a = b = c` appear in tree-sitter as nested `assignment` nodes:
     // outer has right=assignment(b, c). Skip the outer; recursion will reach the inner assignment
     // `b = c` and produce the correct `b = None` mutation, which applied to the full source
-    // yields `a = b = None` — matching the libcst collector's single-target-replacement behavior.
+    // yields `a = b = None` — single-target-replacement behavior.
     if value_node.kind() == "assignment" {
         return;
     }
@@ -1637,7 +1637,7 @@ fn subtree_contains_kind(node: Node<'_>, expected: &str) -> bool {
 /// Check if `node` (a function body block) contains a `yield` or `yield_from` at its own scope,
 /// NOT crossing into nested function_definition or lambda boundaries.
 ///
-/// This matches the libcst collector's behavior: a function is a generator only if IT yields,
+/// A function is a generator only if IT yields,
 /// not if a nested function inside it yields.
 fn body_contains_yield_at_scope(node: Node<'_>) -> bool {
     if node.kind() == "yield" || node.kind() == "yield_from" {
@@ -1826,7 +1826,6 @@ struct CallArg<'a> {
 mod tests {
     use super::*;
     use crate::mutation::apply_mutation;
-    use libcst_native::parse_module;
 
     // INV-1: every mutation has start < end and start + original.len() == end
     fn check_span_invariant(fm: &FunctionMutations) {
@@ -1868,7 +1867,7 @@ mod tests {
 
         let mutated = apply_mutation(&fm.source, mutation);
         assert!(
-            parse_module(&mutated, None).is_ok(),
+            parse_python(&mutated).is_some(),
             "tree-sitter boolop mutation must preserve parseability:\n{mutated}"
         );
         assert!(mutated.contains("or info_name is not None"));
@@ -1898,7 +1897,7 @@ mod tests {
         for m in mutations {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parse_python(&mutated).is_some(),
                 "tree-sitter arg_removal mutation must preserve parseability:\n{mutated}"
             );
         }
@@ -1941,7 +1940,7 @@ mod tests {
         for m in mutations {
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parse_python(&mutated).is_some(),
                 "tree-sitter match_case_removal must preserve parseability:\n{mutated}"
             );
         }
@@ -1983,7 +1982,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {operator} mutation"));
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parse_python(&mutated).is_some(),
                 "{operator} must parse:\n{mutated}"
             );
         }
@@ -2010,7 +2009,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {operator} mutation"));
             let mutated = apply_mutation(&fm.source, m);
             assert!(
-                parse_module(&mutated, None).is_ok(),
+                parse_python(&mutated).is_some(),
                 "{operator} must parse:\n{mutated}"
             );
         }
@@ -2302,7 +2301,7 @@ mod tests {
         assert_eq!(cond_muts.len(), 1, "> is strict → only False (Kaminski)");
         assert_eq!(cond_muts[0].replacement, "False");
         let mutated = apply_mutation(&fm.source, &cond_muts[0]);
-        assert!(parse_module(&mutated, None).is_ok());
+        assert!(parse_python(&mutated).is_some());
     }
 
     #[test]
@@ -2398,7 +2397,7 @@ mod tests {
         assert!(slice_muts.iter().any(|m| m.replacement == "1:"), "should have [1:]");
         for m in &slice_muts {
             let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
+            assert!(parse_python(&mutated).is_some(), "slice_index_removal must produce parseable Python:\n{mutated}");
         }
     }
 
@@ -2418,7 +2417,7 @@ mod tests {
         assert!(slice_muts.iter().any(|m| m.replacement == "1:5:"));
         for m in &slice_muts {
             let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
+            assert!(parse_python(&mutated).is_some(), "slice_index_removal must produce parseable Python:\n{mutated}");
         }
     }
 
@@ -2464,7 +2463,7 @@ mod tests {
         assert_eq!(slice_muts.len(), 1);
         for m in &slice_muts {
             let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
+            assert!(parse_python(&mutated).is_some(), "slice_index_removal must produce parseable Python:\n{mutated}");
         }
     }
 
