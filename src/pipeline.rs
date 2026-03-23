@@ -3165,6 +3165,7 @@ index 000..abc
             diff_ref: None,
             report: None,
             report_output: None,
+            pytest_add_cli_args: vec![],
         }
     }
 
