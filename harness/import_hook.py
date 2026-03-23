@@ -52,17 +52,17 @@ class MutantFinder(importlib.abc.MetaPathFinder):
             spec.submodule_search_locations = [str(resolved_path)]
             return spec
 
-        # Build ModuleSpec directly rather than via spec_from_file_location.
-        # spec_from_file_location sets _set_fileattr=True which causes spec.cached
-        # to recalculate from origin on access. By using ModuleSpec directly,
-        # _set_fileattr stays False (its default) so spec.cached remains None,
-        # satisfying INV-9: no bytecode caching for hook-loaded modules.
         loader = SourceFileLoader(fullname, str(resolved_path))
         if kind == "package":
             spec = ModuleSpec(fullname, loader, origin=str(resolved_path), is_package=True)
             spec.submodule_search_locations = [str(resolved_path.parent)]
         else:  # "module"
             spec = ModuleSpec(fullname, loader, origin=str(resolved_path))
+
+        # Set has_location so __file__ is populated on the loaded module.
+        # Disable bytecode caching by clearing spec.cached.
+        spec.has_location = True
+        spec.cached = None
 
         return spec
 
