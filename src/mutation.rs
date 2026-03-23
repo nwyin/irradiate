@@ -3654,20 +3654,25 @@ mod exception_type_tests {
     }
 
     #[test]
-    fn test_condition_negation_if_statement() {
-        // Critical path: `if x > 0:` → `if not (x > 0):`
+    fn test_condition_negation_if_statement_ordinal_skipped() {
+        // `if x > 0:` has an ordinal comparison → condition_negation is skipped
+        // (subsumed by Kaminski compop_swap mutations).
         let source = "def f(x):\n    if x > 0:\n        return x\n";
         let pairs = condition_negation_mutations_for(source);
-        assert_eq!(pairs.len(), 1, "one condition_negation for a single if");
+        assert_eq!(pairs.len(), 0, "ordinal comparison → condition_negation skipped (Kaminski)");
+    }
+
+    #[test]
+    fn test_condition_negation_if_non_comparison() {
+        // `if items:` is not a comparison → condition_negation IS emitted.
+        let source = "def f(items):\n    if items:\n        return items[0]\n";
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "non-comparison condition → condition_negation emitted");
         let (fm, m) = &pairs[0];
-        // INV-2
-        assert_eq!(m.operator, "condition_negation");
-        // INV-3: replacement must wrap original in `not (...)`
-        assert_eq!(m.original, "x > 0");
-        assert_eq!(m.replacement, "not (x > 0)");
-        // INV-1: mutated source must parse
+        assert_eq!(m.original, "items");
+        assert_eq!(m.replacement, "not (items)");
         let mutated = apply_mutation(&fm.source, m);
-        assert!(parse_module(&mutated, None).is_ok(), "mutated source must be parseable: {mutated}");
+        assert!(parse_module(&mutated, None).is_ok());
     }
 
     #[test]
@@ -3746,25 +3751,16 @@ mod exception_type_tests {
     }
 
     #[test]
-    fn test_condition_negation_elif_branch() {
-        // `elif` branches must also get condition_negation mutations.
+    fn test_condition_negation_elif_branch_ordinal_skipped() {
+        // Both `x > 0` and `x < 0` are ordinal comparisons → condition_negation skipped.
         let source = "def f(x):\n    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n    else:\n        return 0\n";
         let pairs = condition_negation_mutations_for(source);
-        assert_eq!(pairs.len(), 2, "if and elif each get one condition_negation");
-        // Both conditions appear in the mutations
-        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
-        assert!(originals.contains(&"x > 0"), "if condition must be mutated");
-        assert!(originals.contains(&"x < 0"), "elif condition must be mutated");
-        for (fm, m) in &pairs {
-            let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
-        }
+        assert_eq!(pairs.len(), 0, "ordinal comparisons → condition_negation skipped (Kaminski)");
     }
 
     #[test]
-    fn test_condition_negation_multi_elif_chain() {
-        // INV-1: every elif in a chain must get a condition_negation mutation.
-        // Regression test for the bug where only the first elif was processed.
+    fn test_condition_negation_multi_elif_chain_ordinal_skipped() {
+        // All conditions are ordinal comparisons (>) → all skipped.
         let source = concat!(
             "def f(x):\n",
             "    if x > 10:\n",
@@ -3777,21 +3773,27 @@ mod exception_type_tests {
             "        return 'neg'\n",
         );
         let pairs = condition_negation_mutations_for(source);
-        assert_eq!(pairs.len(), 3, "if + 2 elifs = 3 condition_negation mutations");
-        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
-        assert!(originals.contains(&"x > 10"), "if condition must be mutated");
-        assert!(originals.contains(&"x > 5"), "first elif condition must be mutated");
-        assert!(originals.contains(&"x > 0"), "second elif condition must be mutated");
-        for (fm, m) in &pairs {
-            let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
-        }
+        assert_eq!(pairs.len(), 0, "ordinal comparisons → condition_negation skipped (Kaminski)");
     }
 
     #[test]
-    fn test_condition_negation_five_elif_chain() {
-        // INV-1 with deep chain — no mutation loss for many elifs.
-        // 1 if + 4 elifs = 5 conditions total.
+    fn test_condition_negation_mixed_ordinal_and_non() {
+        // Mix of ordinal comparison and non-comparison conditions.
+        let source = concat!(
+            "def f(x, items):\n",
+            "    if x > 10:\n",
+            "        return 'high'\n",
+            "    elif items:\n",
+            "        return 'has items'\n",
+        );
+        let pairs = condition_negation_mutations_for(source);
+        assert_eq!(pairs.len(), 1, "ordinal skipped, non-comparison emitted");
+        assert_eq!(pairs[0].1.original, "items");
+    }
+
+    #[test]
+    fn test_condition_negation_five_elif_chain_ordinal_skipped() {
+        // All conditions are ordinal comparisons (==) → all skipped.
         let source = concat!(
             "def f(x):\n",
             "    if x == 1:\n",
@@ -3808,15 +3810,7 @@ mod exception_type_tests {
             "        return 'other'\n",
         );
         let pairs = condition_negation_mutations_for(source);
-        assert_eq!(pairs.len(), 5, "if + 4 elifs = 5 condition_negation mutations");
-        let originals: Vec<&str> = pairs.iter().map(|(_, m)| m.original.as_str()).collect();
-        for cond in &["x == 1", "x == 2", "x == 3", "x == 4", "x == 5"] {
-            assert!(originals.contains(cond), "condition '{cond}' must be mutated");
-        }
-        for (fm, m) in &pairs {
-            let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "mutated source must parse: {mutated}");
-        }
+        assert_eq!(pairs.len(), 0, "ordinal comparisons (==) → condition_negation skipped (Kaminski)");
     }
 
     #[test]
@@ -3900,13 +3894,16 @@ mod exception_type_tests {
     #[test]
     fn test_condition_negation_parseability_all_sites() {
         // INV-1: every condition_negation mutation must produce parseable Python across all sites.
+        // Note: ordinal comparisons in if/while are skipped (Kaminski), but assert and
+        // ternary use separate codepaths and still emit condition_negation.
         let cases = [
-            "def f(x):\n    if x > 0:\n        return x\n",
+            // Non-comparison conditions in if/while still get condition_negation:
             "def f(items):\n    while items:\n        items.pop()\n",
-            "def f(r, e):\n    assert r == e\n",
             "def f(r):\n    assert r, \"msg\"\n",
             "def f(x, y, flag):\n    return x if flag else y\n",
             "def f(a, b, c):\n    if a and b or c:\n        return 1\n",
+            // assert with comparison — assert uses add_condition_negation_assert, not statement:
+            "def f(r, e):\n    assert r == e\n",
         ];
         for source in &cases {
             let pairs = condition_negation_mutations_for(source);
@@ -4261,14 +4258,13 @@ mod statement_deletion_tests {
         assert_eq!(assign_del[0].replacement, "pass");
     }
 
-    // INV-2: `return result` → 1 statement_deletion with replacement "return None"
+    // INV-2: `return result` no longer emits statement_deletion (redundant with return_value)
     #[test]
-    fn test_stmt_del_return() {
+    fn test_stmt_del_return_no_longer_emitted() {
         let source = "def f(x):\n    return x + 1\n";
         let muts = statement_deletion_mutations(source);
         let ret_del: Vec<_> = muts.iter().filter(|m| m.replacement == "return None").collect();
-        assert_eq!(ret_del.len(), 1, "return expr must produce exactly 1 statement_deletion");
-        assert_eq!(ret_del[0].operator, "statement_deletion");
+        assert!(ret_del.is_empty(), "return statements should not produce statement_deletion (redundant with return_value)");
     }
 
     // INV-3: `print(x)` → 1 statement_deletion with replacement "pass"
@@ -4333,12 +4329,13 @@ mod statement_deletion_tests {
         assert!(aug_del.is_empty(), "augmented assign must not produce statement_deletion");
     }
 
-    // Multiple eligible statements: each gets its own independent mutation
+    // Multiple eligible statements: each gets its own independent mutation.
+    // return statements no longer emit statement_deletion (redundant with return_value).
     #[test]
     fn test_stmt_del_multiple_statements() {
         let source = "def f(x):\n    y = x + 1\n    print(y)\n    raise ValueError(\"e\")\n    return y\n";
         let muts = statement_deletion_mutations(source);
-        assert_eq!(muts.len(), 4, "four eligible statements must produce 4 statement_deletion mutations");
+        assert_eq!(muts.len(), 3, "three non-return statements must produce 3 statement_deletion mutations");
     }
 
     // INV-1+2+3: Every generated mutation must produce parseable Python when applied

@@ -11,7 +11,40 @@
 use crate::mutation::{DescriptorDecorator, FunctionMutations, Mutation};
 use tree_sitter::{Node, Parser, Tree};
 
-const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__new__"];
+/// Functions that are never mutated (whole function skipped).
+/// - Trampoline-incompatible dunders: __getattribute__, __setattr__, __new__
+/// - Display-only dunders: __repr__, __str__, __format__ (rarely assertion-tested)
+/// - Hash contract: __hash__ (tied to __eq__, mutating alone is misleading)
+const NEVER_MUTATE_FUNCTIONS: &[&str] = &[
+    "__getattribute__",
+    "__setattr__",
+    "__new__",
+    "__repr__",
+    "__str__",
+    "__format__",
+    "__hash__",
+];
+
+/// Call targets whose statement_deletion is suppressed (arid nodes).
+/// Removing a log or warning call almost never causes a test failure.
+/// Source: Google "Practical Mutation Testing at Scale" (TSE 2021).
+const ARID_CALL_TARGETS: &[&str] = &[
+    "logging.debug",
+    "logging.info",
+    "logging.warning",
+    "logging.error",
+    "logging.critical",
+    "logging.exception",
+    "logging.log",
+    "warnings.warn",
+    "logger.debug",
+    "logger.info",
+    "logger.warning",
+    "logger.error",
+    "logger.critical",
+    "logger.exception",
+    "logger.log",
+];
 
 /// Enum base classes whose methods must not be mutated.
 ///
@@ -51,17 +84,37 @@ const BINOP_SWAPS: &[(&str, &str)] = &[
     ("^", "&"),
 ];
 const BOOLOP_SWAPS: &[(&str, &str)] = &[("and", "or"), ("or", "and")];
-const COMPOP_SWAPS: &[(&str, &str)] = &[
-    ("<=", "<"),
-    (">=", ">"),
-    ("<", "<="),
-    (">", ">="),
-    ("==", "!="),
-    ("!=", "=="),
-    ("is not", "is"),
-    ("is", "is not"),
-    ("not in", "in"),
-    ("in", "not in"),
+/// Kaminski ROR sufficient mutant table (Kaminski, Ammann, Offutt, JSS 2013).
+///
+/// For ordinal operators, 3 mutants suffice: 2 relational replacements + 1 boolean
+/// (True or False). The boolean is handled by `condition_replacement`; the two
+/// relational replacements are listed here.
+///
+/// For non-ordinal operators (is/is not, in/not in), we keep simple bidirectional
+/// swap — Kaminski's ordinal analysis does not apply.
+const COMPOP_SUFFICIENT: &[(&str, &[&str])] = &[
+    ("==", &["<", ">"]),
+    ("!=", &["<=", ">="]),
+    (">", &[">=", "!="]),
+    (">=", &[">", "=="]),
+    ("<", &["<=", "!="]),
+    ("<=", &["<", "=="]),
+    ("is not", &["is"]),
+    ("is", &["is not"]),
+    ("not in", &["in"]),
+    ("in", &["not in"]),
+];
+
+/// The Kaminski-correct boolean for each ordinal operator.
+/// Strict operators (==, >, <) need False; inclusive operators (!=, >=, <=) need True.
+/// Non-ordinal operators are not in this table and get both True and False.
+const COMPOP_KAMINSKI_BOOL: &[(&str, &str)] = &[
+    ("==", "False"),
+    ("!=", "True"),
+    (">", "False"),
+    (">=", "True"),
+    ("<", "False"),
+    ("<=", "True"),
 ];
 const AUGOP_SWAPS: &[(&str, &str)] = &[
     ("+=", "-="),
@@ -408,6 +461,12 @@ fn add_binary_operator_mutation(
     let Some((_, replacement)) = BINOP_SWAPS.iter().find(|(from, _)| *from == op_text) else {
         return;
     };
+
+    // Suppress string `+` → `-`: always raises TypeError, trivially killed.
+    if op_text == "+" && *replacement == "-" && has_string_operand(node) {
+        return;
+    }
+
     record_mutation(
         op_text,
         replacement,
@@ -446,21 +505,48 @@ fn add_comparison_mutation(
     fn_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
-    let Some(op_node) = find_operator_child(node, COMPOP_SWAPS.iter().map(|(from, _)| *from))
+    let Some(op_node) =
+        find_operator_child(node, COMPOP_SUFFICIENT.iter().map(|(from, _)| *from))
     else {
         return;
     };
     let op_text = node_text(source, op_node);
-    let Some((_, replacement)) = COMPOP_SWAPS.iter().find(|(from, _)| *from == op_text) else {
+    let Some((_, replacements)) = COMPOP_SUFFICIENT.iter().find(|(from, _)| *from == op_text)
+    else {
         return;
     };
-    record_mutation(
-        op_text,
-        replacement,
-        "compop_swap",
-        op_node.start_byte() - fn_start,
-        mutations,
-    );
+
+    // Detect `len(x) <op> 0` patterns to suppress equivalent mutations.
+    // len() always returns >= 0, so certain replacements are equivalent:
+    //   len(x) > 0  → len(x) >= 0  (equivalent: both true iff len > 0)
+    //   len(x) == 0 → len(x) <= 0  (equivalent: both true iff len == 0)
+    let suppress_equiv = is_len_compared_to_zero(node, source);
+
+    for replacement in *replacements {
+        if suppress_equiv {
+            // `>` → `>=` is equivalent when LHS is len()
+            if op_text == ">" && *replacement == ">=" {
+                continue;
+            }
+            // `==` → `<=` is equivalent when LHS is len()
+            if op_text == "==" && *replacement == "<" {
+                // Kaminski sufficient for == is [<, >] — `<` on len() is always False
+                // which is still a useful mutation (forces else branch), so keep it.
+            }
+            // `>=` → `>` is fine (not equivalent for len)
+            // `<=` → `<` is equivalent when LHS is len() (both always True for 0)
+            if op_text == "<=" && *replacement == "<" {
+                continue;
+            }
+        }
+        record_mutation(
+            op_text,
+            replacement,
+            "compop_swap",
+            op_node.start_byte() - fn_start,
+            mutations,
+        );
+    }
 }
 
 fn add_not_operator_mutation(
@@ -663,17 +749,9 @@ fn add_return_statement_mutations(
         value_node.start_byte() - fn_start,
         mutations,
     );
-
-    let stmt_text = node_text(source, node);
-    if value_text.trim() != "None" {
-        record_mutation(
-            stmt_text,
-            "return None",
-            "statement_deletion",
-            node.start_byte() - fn_start,
-            mutations,
-        );
-    }
+    // Previously we also emitted a statement_deletion ("return x" → "return None")
+    // here, but that produces identical output to the return_value mutation above.
+    // Dropped to avoid testing the same semantic change twice.
 }
 
 fn add_expression_statement_mutation(
@@ -708,14 +786,17 @@ fn add_expression_statement_mutation(
             }
         }
         // All other expression statements (calls, etc.): delete to `pass`.
+        // Skip arid calls (logging, warnings) whose deletion never catches real bugs.
         _ => {
-            record_mutation(
-                stmt_text,
-                "pass",
-                "statement_deletion",
-                node.start_byte() - fn_start,
-                mutations,
-            );
+            if !is_arid_call(value_node, source) {
+                record_mutation(
+                    stmt_text,
+                    "pass",
+                    "statement_deletion",
+                    node.start_byte() - fn_start,
+                    mutations,
+                );
+            }
         }
     }
 }
@@ -806,6 +887,19 @@ fn add_condition_negation_statement(
     let condition_text = node_text(source, condition);
     if condition.kind() == "not_operator" {
         return;
+    }
+    // For simple comparisons with ordinal operators, `not (a > b)` is equivalent
+    // to `a <= b`, which is subsumed by the Kaminski compop_swap mutations.
+    // Skip condition_negation in this case to avoid redundancy.
+    if condition.kind() == "comparison_operator" {
+        let is_ordinal = find_operator_child(
+            condition,
+            COMPOP_KAMINSKI_BOOL.iter().map(|(from, _)| *from),
+        )
+        .is_some();
+        if is_ordinal {
+            return;
+        }
     }
     let replacement = format!("not ({condition_text})");
     record_mutation(
@@ -1050,10 +1144,14 @@ fn add_condition_negation_ternary(
     record_mutation(condition_text, &replacement, "condition_negation", condition.start_byte() - fn_start, mutations);
 }
 
-/// Replace condition with `True` and `False` (distinct from condition_negation).
+/// Replace condition with `True` and/or `False` (distinct from condition_negation).
 ///
 /// Applied to `if`, `elif`, `while` (via field_name "condition").
 /// Skip if the condition is already a literal `True` or `False`.
+///
+/// For simple comparison conditions (e.g., `x > 0`), only the Kaminski-sufficient
+/// boolean is emitted (True or False, not both) since the other is subsumed by the
+/// compop_swap mutations. For compound or non-comparison conditions, both are emitted.
 fn add_condition_replacement(
     node: Node<'_>,
     source: &str,
@@ -1065,23 +1163,56 @@ fn add_condition_replacement(
     };
     let condition_text = node_text(source, condition);
     let trimmed = condition_text.trim();
-    if trimmed != "True" {
-        record_mutation(
-            condition_text,
-            "True",
-            "condition_replacement",
-            condition.start_byte() - fn_start,
-            mutations,
-        );
-    }
-    if trimmed != "False" {
-        record_mutation(
-            condition_text,
-            "False",
-            "condition_replacement",
-            condition.start_byte() - fn_start,
-            mutations,
-        );
+
+    // Check if this is a simple comparison with a Kaminski-known operator.
+    let kaminski_bool = if condition.kind() == "comparison_operator" {
+        // Extract the operator from the comparison to look up its Kaminski boolean.
+        find_operator_child(condition, COMPOP_SUFFICIENT.iter().map(|(from, _)| *from))
+            .and_then(|op_node| {
+                let op = node_text(source, op_node);
+                COMPOP_KAMINSKI_BOOL
+                    .iter()
+                    .find(|(from, _)| *from == op)
+                    .map(|(_, bool_val)| *bool_val)
+            })
+    } else {
+        None
+    };
+
+    match kaminski_bool {
+        Some(sufficient_bool) => {
+            // Simple comparison: emit only the Kaminski-sufficient boolean.
+            if trimmed != sufficient_bool {
+                record_mutation(
+                    condition_text,
+                    sufficient_bool,
+                    "condition_replacement",
+                    condition.start_byte() - fn_start,
+                    mutations,
+                );
+            }
+        }
+        None => {
+            // Compound/non-comparison condition: emit both True and False.
+            if trimmed != "True" {
+                record_mutation(
+                    condition_text,
+                    "True",
+                    "condition_replacement",
+                    condition.start_byte() - fn_start,
+                    mutations,
+                );
+            }
+            if trimmed != "False" {
+                record_mutation(
+                    condition_text,
+                    "False",
+                    "condition_replacement",
+                    condition.start_byte() - fn_start,
+                    mutations,
+                );
+            }
+        }
     }
 }
 
@@ -1564,6 +1695,58 @@ fn node_text<'a>(source: &'a str, node: Node<'_>) -> &'a str {
     &source[node.start_byte()..node.end_byte()]
 }
 
+/// Check if any named child of a binary_operator node is a string literal.
+/// Used to suppress `"a" + "b"` → `"a" - "b"` (always TypeError).
+fn has_string_operand(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "string" || child.kind() == "concatenated_string" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a comparison_operator node is `len(...) <op> 0`.
+/// Returns true when the left operand is a `len(...)` call and the right operand
+/// is the integer literal `0`.
+fn is_len_compared_to_zero(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    // comparison_operator has: left_expr, right_expr (operator is an anonymous child)
+    if children.len() < 2 {
+        return false;
+    }
+    let left = children[0];
+    let right = children[children.len() - 1];
+
+    let left_is_len = left.kind() == "call"
+        && left
+            .child_by_field_name("function")
+            .is_some_and(|f| node_text(source, f) == "len");
+    let right_is_zero = node_text(source, right).trim() == "0";
+
+    left_is_len && right_is_zero
+}
+
+/// Check if a call node targets an arid function (logging, warnings, etc.).
+/// Matches both `logging.info(...)` and `logger.info(...)` style calls.
+fn is_arid_call(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    let Some(function_node) = node.child_by_field_name("function") else {
+        return false;
+    };
+    // attribute access: `logging.info(...)` → function_node is `attribute` with
+    // object=`logging` and attribute=`info`.
+    if function_node.kind() == "attribute" {
+        let call_text = node_text(source, function_node);
+        return ARID_CALL_TARGETS.contains(&call_text);
+    }
+    false
+}
+
 fn record_mutation(
     original: &str,
     replacement: &str,
@@ -1895,6 +2078,135 @@ mod tests {
         assert!(fms.is_empty());
     }
 
+    // --- NEVER_MUTATE_FUNCTIONS (display/hash dunders) ---
+
+    #[test]
+    fn tree_sitter_skips_repr_method() {
+        let source = "class C:\n    def __repr__(self):\n        return f'C({self.x})'\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty(), "__repr__ must produce zero mutations");
+    }
+
+    #[test]
+    fn tree_sitter_skips_str_method() {
+        let source = "class C:\n    def __str__(self):\n        return str(self.x)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty(), "__str__ must produce zero mutations");
+    }
+
+    #[test]
+    fn tree_sitter_skips_hash_method() {
+        let source = "class C:\n    def __hash__(self):\n        return hash(self.x)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert!(fms.is_empty(), "__hash__ must produce zero mutations");
+    }
+
+    // --- Arid call filtering ---
+
+    #[test]
+    fn tree_sitter_skips_logging_statement_deletion() {
+        let source = "def f(x):\n    logging.info('processing %s', x)\n    return x + 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let stmt_dels: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "statement_deletion" && m.original.contains("logging"))
+            .collect();
+        assert!(stmt_dels.is_empty(), "logging.info() statement_deletion must be suppressed");
+        // Other mutations (binop, return_value, etc.) should still exist
+        assert!(!fm.mutations.is_empty());
+    }
+
+    #[test]
+    fn tree_sitter_skips_logger_statement_deletion() {
+        let source = "def f(x):\n    logger.warning('bad value: %s', x)\n    return x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let stmt_dels: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "statement_deletion" && m.original.contains("logger"))
+            .collect();
+        assert!(stmt_dels.is_empty(), "logger.warning() statement_deletion must be suppressed");
+    }
+
+    #[test]
+    fn tree_sitter_skips_warnings_warn_statement_deletion() {
+        let source = "def f(x):\n    warnings.warn('deprecated')\n    return x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let stmt_dels: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "statement_deletion" && m.original.contains("warnings"))
+            .collect();
+        assert!(stmt_dels.is_empty(), "warnings.warn() statement_deletion must be suppressed");
+    }
+
+    #[test]
+    fn tree_sitter_does_not_skip_non_arid_calls() {
+        let source = "def f(x):\n    process(x)\n    return x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let stmt_dels: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "statement_deletion" && m.original.contains("process"))
+            .collect();
+        assert_eq!(stmt_dels.len(), 1, "non-arid call should get statement_deletion");
+    }
+
+    // --- Equivalent mutant suppression ---
+
+    #[test]
+    fn tree_sitter_suppresses_string_plus_to_minus() {
+        let source = "def f(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        // a + b where neither is a known string → binop_swap IS generated
+        let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert_eq!(binops.len(), 1, "non-string + → - should be generated");
+
+        // Now with a string literal
+        let source2 = "def f(name):\n    return \"hello\" + name\n";
+        let fms2 = collect_file_mutations_tree_sitter(source2);
+        let fm2 = &fms2[0];
+        let binops2: Vec<_> = fm2.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
+        assert!(binops2.is_empty(), "string + → - must be suppressed (always TypeError)");
+    }
+
+    #[test]
+    fn tree_sitter_suppresses_len_gt_zero_to_gte() {
+        // len(x) > 0 → len(x) >= 0 is equivalent (len always >= 0)
+        let source = "def f(items):\n    if len(items) > 0:\n        return True\n    return False\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let compops: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "compop_swap")
+            .collect();
+        // Kaminski sufficient for > is [>=, !=]. But >= is suppressed for len()>0.
+        // So only != should remain.
+        assert_eq!(compops.len(), 1, "len(x) > 0: only != should remain (>= suppressed)");
+        assert_eq!(compops[0].replacement, "!=");
+    }
+
+    #[test]
+    fn tree_sitter_does_not_suppress_non_len_gt_zero() {
+        // x > 0 (not len) → both >= and != should be generated
+        let source = "def f(x):\n    if x > 0:\n        return True\n    return False\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let compops: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "compop_swap")
+            .collect();
+        assert_eq!(compops.len(), 2, "non-len > 0: both >= and != should be generated");
+    }
+
     // --- NEVER_MUTATE_FUNCTION_CALLS ---
 
     #[test]
@@ -1976,7 +2288,8 @@ mod tests {
     // --- condition_replacement tests ---
 
     #[test]
-    fn condition_replacement_if_produces_true_and_false() {
+    fn condition_replacement_if_kaminski_single_bool() {
+        // `>` is a strict operator → Kaminski says only False is sufficient.
         let source = "def f(x):\n    if x > 0:\n        return 1\n    return 0\n";
         let fms = collect_file_mutations_tree_sitter(source);
         let fm = &fms[0];
@@ -1986,17 +2299,31 @@ mod tests {
             .iter()
             .filter(|m| m.operator == "condition_replacement")
             .collect();
-        assert_eq!(cond_muts.len(), 2, "if should produce True and False replacements");
-        assert!(cond_muts.iter().any(|m| m.replacement == "True"));
-        assert!(cond_muts.iter().any(|m| m.replacement == "False"));
-        for m in &cond_muts {
-            let mutated = apply_mutation(&fm.source, m);
-            assert!(parse_module(&mutated, None).is_ok(), "condition_replacement must produce parseable Python:\n{mutated}");
-        }
+        assert_eq!(cond_muts.len(), 1, "> is strict → only False (Kaminski)");
+        assert_eq!(cond_muts[0].replacement, "False");
+        let mutated = apply_mutation(&fm.source, &cond_muts[0]);
+        assert!(parse_module(&mutated, None).is_ok());
     }
 
     #[test]
-    fn condition_replacement_while_produces_true_and_false() {
+    fn condition_replacement_compound_produces_both() {
+        // Compound condition (boolean_operator) → not a simple comparison → both True and False.
+        let source = "def f(x, y):\n    if x > 0 and y < 10:\n        return 1\n    return 0\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        assert_eq!(cond_muts.len(), 2, "compound condition → both True and False");
+        assert!(cond_muts.iter().any(|m| m.replacement == "True"));
+        assert!(cond_muts.iter().any(|m| m.replacement == "False"));
+    }
+
+    #[test]
+    fn condition_replacement_while_kaminski_single_bool() {
+        // `<` is a strict operator → only False.
         let source = "def f(items):\n    i = 0\n    while i < 10:\n        i += 1\n";
         let fms = collect_file_mutations_tree_sitter(source);
         let fm = &fms[0];
@@ -2005,9 +2332,8 @@ mod tests {
             .iter()
             .filter(|m| m.operator == "condition_replacement")
             .collect();
-        assert_eq!(cond_muts.len(), 2);
-        assert!(cond_muts.iter().any(|m| m.replacement == "True"));
-        assert!(cond_muts.iter().any(|m| m.replacement == "False"));
+        assert_eq!(cond_muts.len(), 1, "< is strict → only False (Kaminski)");
+        assert_eq!(cond_muts[0].replacement, "False");
     }
 
     #[test]
@@ -2050,7 +2376,8 @@ mod tests {
             .iter()
             .filter(|m| m.operator == "condition_replacement")
             .collect();
-        assert_eq!(cond_muts.len(), 4, "if + elif = 2 conditions × 2 replacements = 4");
+        // `>` → False only, `<` → False only → 2 total (Kaminski)
+        assert_eq!(cond_muts.len(), 2, "if(>) + elif(<) = 2 conditions × 1 Kaminski bool = 2");
     }
 
     // --- slice_index_removal tests ---
