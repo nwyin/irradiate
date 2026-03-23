@@ -76,13 +76,7 @@ For scheduled or release-branch checks, run against all code:
 
 ## What to gate on
 
-Options, in order of strictness:
-
-1. **Incremental score gate** — `--diff main --fail-under 80` on PRs. Only tests changed code. Low friction.
-2. **Report only** — `--report json` without `--fail-under`. Upload as artifact, review manually.
-3. **Full score gate** — `--fail-under 70` on the whole codebase. Higher friction, catches regressions everywhere.
-
-Start with option 1. Tighten over time.
+Start with `--diff main --fail-under 80` on PRs. This only tests changed code and adds minimal friction. You can also run `--report json` without a threshold to upload as an artifact for manual review. For release branches, consider `--fail-under 70` on the whole codebase. Tighten over time.
 
 ## Other CI systems
 

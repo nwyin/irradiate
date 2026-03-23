@@ -12,7 +12,7 @@ Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](
 
 ## Why
 
-Mutation testing is painfully slow. The bottleneck isn't generating mutants — it's running the test suite once per mutant. A typical mutation testing run looks like:
+Mutation testing is painfully slow. The bottleneck isn't generating mutants; it's running the test suite once per mutant. A typical mutation testing run looks like:
 
 ```
 for each of 1000 mutants:
@@ -26,7 +26,7 @@ pytest startup dominates. The actual test execution is often a fraction of the c
 
 ### Background
 
-mutmut's original author [described](https://kodare.net/2016/12/01/mutmut-a-python-mutation-testing-system.html) wanting to use Python import hooks to mutate code at runtime, enabling parallelism. He abandoned the approach because Python's import system was too unreliable. The fallback — disk-based mutation with fork-per-mutant — was pragmatic but left performance on the table. He also envisioned a shared mutation results database across developers, which was never built.
+mutmut's original author [described](https://kodare.net/2016/12/01/mutmut-a-python-mutation-testing-system.html) wanting to use Python import hooks to mutate code at runtime, enabling parallelism. He abandoned the approach because Python's import system was too unreliable. The fallback (disk-based mutation with fork-per-mutant) was pragmatic but left performance on the table. He also envisioned a shared mutation results database across developers, which was never built.
 
 irradiate picks up these threads: the trampoline architecture (which mutmut eventually adopted) already enables runtime mutation switching without reimporting. We take it to its conclusion with a pre-warmed worker pool, and we implement the content-addressable cache he envisioned.
 
@@ -41,7 +41,7 @@ Instead of paying pytest startup cost per mutant, irradiate maintains a pool of 
 5. Reports exit code and duration back to the orchestrator
 6. Waits for the next mutant
 
-This works because of how mutation dispatch works at runtime: mutated files contain a "trampoline" function that checks which mutant is active on every call. The active mutant is just a Python global variable — switching it between test runs requires zero reimporting.
+This works because of how mutation dispatch works at runtime: mutated files contain a "trampoline" function that checks which mutant is active on every call. The active mutant is a Python global variable. Switching it between test runs requires zero reimporting.
 
 If a worker crashes (segfault, timeout), the orchestrator detects the closed socket, records the result, and spawns a replacement. The pool self-heals.
 
@@ -113,24 +113,24 @@ irradiate (Rust binary)
 
 A small Python package (`irradiate-harness`) ships alongside the binary. It contains:
 
-- `worker.py` — the pytest worker loop (~100 lines)
-- `stats_plugin.py` — pytest plugin for recording which tests cover which functions
-- `import_hook.py` — MutantFinder import hook (intercepts imports, loads trampolined code)
-- `trampoline.py` — holds the `active_mutant` global that the trampoline reads
+- `worker.py`: the pytest worker loop
+- `stats_plugin.py`: pytest plugin for recording which tests cover which functions
+- `import_hook.py`: MutantFinder import hook (intercepts imports, loads trampolined code)
+- `trampoline.py`: holds the `active_mutant` global that the trampoline reads
 
 ## What stays Python
 
 Three things must remain Python because they run inside the test process:
 
-1. **The trampoline** — injected into mutated source files, dispatches function calls based on `active_mutant` global. Uses a module global (fast dict lookup) instead of `os.environ` (syscall per call).
-2. **The worker process** — connects to a unix socket, receives work, forks a child per mutant, reports results.
-3. **The stats plugin** — a pytest plugin that records which tests execute which trampolined functions.
+1. The trampoline, injected into mutated source files. Dispatches function calls based on `active_mutant` global using a module-level dict lookup (no syscall).
+2. The worker process. Connects to a unix socket, receives work, forks a child per mutant, reports results.
+3. The stats plugin. A pytest plugin that records which tests execute which trampolined functions.
 
-Everything else — parsing, mutation, orchestration, caching, I/O, CLI — is Rust.
+Everything else (parsing, mutation, orchestration, caching, I/O, CLI) is Rust.
 
 ## Content-addressable cache
 
-mutmut caches results by file modification time: if the source is newer than the mutant file, regenerate. This is fragile — `touch` a file, lose all results. Rebasing drops results even if code didn't change. Results aren't shareable across developers or CI.
+mutmut caches results by file modification time: if the source is newer than the mutant file, regenerate. This is fragile: `touch` a file, lose all results. Rebasing drops results even if code didn't change. Results aren't shareable across developers or CI.
 
 irradiate uses content-addressable caching. The v1 local cache keys each mutation result by:
 
@@ -146,12 +146,11 @@ cache_key = hash(
 
 If the key matches a previous result, skip the test run entirely. This survives:
 
-- **Rebasing** — if the function didn't change, the result holds
-- **Branch switching** — same code = same results regardless of branch
+If the function didn't change, the result holds across rebases and branch switches.
 
 ### Cache storage
 
-Local cache lives in `.irradiate/cache/` as a directory of small files keyed by hash prefix (similar to git's object store). `irradiate cache clean` removes only this directory. Remote/shared cache is follow-up work, not part of v1.
+Local cache lives in `.irradiate/cache/` as a directory of small files keyed by hash prefix (similar to git's object store). `irradiate cache clean` removes only this directory. Remote/shared cache is follow-up work.
 
 ### Cache invalidation
 
@@ -165,7 +164,7 @@ mutmut's operators are Python functions that take CST nodes and yield mutated va
 
 irradiate splits operators into two categories:
 
-**Table-driven operators** — the majority. Defined as static data:
+Most operators are table-driven, defined as static data:
 
 ```rust
 // Adding a new swap is one line
@@ -205,22 +204,7 @@ static METHOD_SWAPS: &[(&str, &str)] = &[
 
 A generic walker applies all table-driven operators by matching node types against the tables. No per-operator visitor logic needed.
 
-**Procedural operators** — for mutations that require structural analysis:
-
-- `argument_removal` — needs to inspect arg count, generate N variants
-- `string_mutation` — regex-based case swapping, prefix/suffix wrapping
-- `lambda_mutation` — body → `None` or `0` depending on current body
-- `assignment_mutation` — `a = x` → `a = None`, `a = None` → `a = ""`
-- `match_case_removal` — drop each case branch from match statements
-
-These implement a trait:
-
-```rust
-trait MutationOperator {
-    fn id(&self) -> &str;
-    fn mutate(&self, node: &CSTNode, ctx: &MutationContext) -> Vec<CSTNode>;
-}
-```
+Operators that require structural analysis (argument removal, string mutation, lambda mutation, assignment mutation, match case removal) are implemented as individual functions in `tree_sitter_mutation.rs` that walk tree-sitter nodes and call `record_mutation()` for each variant they produce.
 
 ### Operator skip rules
 
@@ -229,7 +213,7 @@ Certain patterns should never be mutated:
 - `# pragma: no mutate` on the same line
 - Lines not in the coverage set (when `--covered-only` is enabled)
 - Dunder methods that affect object identity: `__getattribute__`, `__setattr__`, `__new__`
-- Calls to `len()`, `isinstance()` — mutations here rarely produce useful signal
+- Calls to `len()`, `isinstance()` (mutations here rarely produce useful signal)
 - Type annotations
 - Non-descriptor decorator expressions (@cache, @app.route, etc. — @property/@classmethod/@staticmethod are handled)
 - Enum subclass methods, functions with `nonlocal`
@@ -285,9 +269,9 @@ def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None):
 ```
 
 Key properties:
-- Reads a module global (`_ih.active_mutant`), not `os.environ` — avoids a syscall on every instrumented function call
+- Reads a module global (`_ih.active_mutant`) instead of `os.environ`, avoiding a syscall on every instrumented function call
 - The hot path (no mutation active) is a single falsy check
-- Dispatch is a dict lookup, not a chain of if-statements
+- Dispatch is a dict lookup (single hash probe, no if-chain)
 - Compatible with mutmut's naming convention (`__irradiate_N` suffixes, `ǁ` class separator)
 
 ## Execution phases

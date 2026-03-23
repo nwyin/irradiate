@@ -38,7 +38,7 @@ Closest equivalent in design philosophy. Primary strategy is function body repla
 
 ### Stryker (JS/TS)
 
-The most comprehensive JS/TS mutation tester. JS-specific operators: optional chaining removal, array/object emptying, regex mutation. Runs as a Node.js process.
+The most feature-rich JS/TS mutation tester. JS-specific operators: optional chaining removal, array/object emptying, regex mutation. Runs as a Node.js process.
 
 ### PIT / pitest (Java)
 
@@ -46,4 +46,4 @@ Most widely-used JVM mutation tester. Operates on bytecode, making it language-a
 
 ### Infection (PHP)
 
-Most operator-rich framework overall — 200+ distinct mutation operators. PHP-specific mutations: function unwrapping (strip a call, return its argument), type cast removal, visibility reduction.
+The most operator-dense framework, with 200+ distinct mutation operators. PHP-specific mutations: function unwrapping (strip a call, return its argument), type cast removal, visibility reduction.

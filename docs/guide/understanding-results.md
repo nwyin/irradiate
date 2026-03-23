@@ -14,7 +14,7 @@ Every mutant gets one of these outcomes:
 
 ## Killed mutants
 
-A killed mutant means irradiate changed something (e.g., `+` to `-`, `and` to `or`) and at least one test failed. This is the good outcome. No action needed.
+A killed mutant means irradiate changed something (`+` to `-`, `and` to `or`, etc.) and at least one test failed. No action needed.
 
 ## Survived mutants
 
@@ -33,15 +33,11 @@ irradiate show mylib.x_validate__irradiate_1
          return True
 ```
 
-For each survivor, decide:
-
-1. **Write a test** — if the mutation represents a real bug
-2. **Mark as acceptable** — add `# pragma: no mutate` if the mutation is semantically equivalent
-3. **Ignore** — use judgment; not every survivor needs a test
+For each survivor, decide what to do. If the mutation represents a real bug your tests should catch, write a test. If the mutation is semantically equivalent in your context, add `# pragma: no mutate` to suppress it. Some survivors (e.g., `n` to `n+1` in a non-critical index) may not warrant a test at all.
 
 ## Timeouts
 
-A timeout means the mutation created a non-terminating condition (e.g., `while cond:` mutated to `while True:`). Timeouts count as killed — the mutation broke the program.
+A timeout means the mutation created a non-terminating condition, like `while cond:` mutated to `while True:`. Timeouts count as killed because the mutation broke the program.
 
 ## Mutation score
 

@@ -57,7 +57,7 @@ These three stdlib decorators account for ~80% of all decorated functions in rea
 
 irradiate handles these by keeping the decorator on the wrapper and adjusting the trampoline dispatch:
 
-**`@classmethod`** — The wrapper receives `cls` as its first argument. Variant lookup uses `cls.` prefix to resolve mangled names through the MRO:
+For `@classmethod`, the wrapper receives `cls` as its first argument. Variant lookup uses `cls.` to resolve mangled names through the MRO:
 
 ```python
 class Foo:
@@ -70,7 +70,7 @@ class Foo:
         )
 ```
 
-**`@staticmethod`** — The wrapper receives no implicit argument. Variant lookup uses the class name directly:
+For `@staticmethod`, the wrapper receives no implicit argument. Variant lookup uses the class name directly:
 
 ```python
 class Foo:
@@ -83,7 +83,7 @@ class Foo:
         )
 ```
 
-**`@property`** — The wrapper is a property whose getter dispatches through the trampoline. Only the getter is trampolined; setter/deleter decorators on the same property are preserved as-is:
+For `@property`, the wrapper is a property whose getter dispatches through the trampoline. Only the getter is trampolined; setter/deleter decorators on the same property are preserved as-is:
 
 ```python
 class Foo:
@@ -100,18 +100,13 @@ class Foo:
 
 Some decorators are effectively no-ops at runtime and don't interfere with trampolining:
 
-- `@typing.overload` — type-checker only, no runtime effect. Functions decorated with `@overload` have empty bodies (just `...`), so there's nothing to mutate. irradiate skips them because they produce zero mutations, not because of the decorator.
-- `@abstractmethod` — marker for ABC enforcement. The function body is still real code. Currently skipped but could be handled like a regular instance method.
-- `@functools.wraps` — metadata copier, used inside other decorators. No runtime behavior change.
+- `@typing.overload` has no runtime effect (type-checker only). Functions decorated with `@overload` have empty bodies (`...`), so there's nothing to mutate. irradiate skips them because they produce zero mutations.
+- `@abstractmethod` marks abstract methods for ABC enforcement. The function body is still real code. Currently skipped but could be handled like a regular instance method.
+- `@functools.wraps` copies metadata inside other decorators. No runtime behavior change.
 
 ### Decorators that remain skipped
 
-Decorators with definition-time side effects or complex wrapping behavior are still skipped:
-
-- **Registration**: `@app.route()`, `@click.command()`, `@celery.task`, `@pytest.fixture`
-- **Caching**: `@functools.lru_cache`, `@functools.cache`, `@cached_property`
-- **Wrapping**: `@contextmanager`, `@retry`, `@login_required`
-- **Custom decorators**: any user-defined decorator
+Decorators with definition-time side effects or complex wrapping behavior are still skipped. This includes registration decorators (`@app.route()`, `@click.command()`, `@pytest.fixture`), caching decorators (`@lru_cache`, `@cache`, `@cached_property`), wrapping decorators (`@contextmanager`, `@retry`, `@login_required`), and any user-defined decorators.
 
 These require a different execution model (source-patching) that avoids the trampoline entirely. See [GitHub issue #13](https://github.com/nwyin/irradiate/issues/13) for the design.
 

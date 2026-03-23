@@ -11,7 +11,6 @@ irradiate [OPTIONS] <COMMAND>
 | `--version` | Print version |
 | `--help` | Print help |
 
----
 
 ## `irradiate run`
 
@@ -62,7 +61,6 @@ irradiate run mylib.x_add__irradiate_3           # test one specific mutant
 irradiate run --workers 4 --covered-only         # tuning
 ```
 
----
 
 ## `irradiate results`
 
@@ -74,10 +72,9 @@ irradiate results [OPTIONS]
 
 | Flag | Description |
 |------|-------------|
-| `--all` | Show all mutants, not just survived |
+| `--all` | Show all mutants (default: survived only) |
 | `--json` | Output as JSON |
 
----
 
 ## `irradiate show`
 
@@ -91,7 +88,6 @@ irradiate show <MUTANT_NAME>
 |----------|-------------|
 | `<MUTANT_NAME>` | e.g. `mylib.x_func__irradiate_1` |
 
----
 
 ## `irradiate cache clean`
 
@@ -101,7 +97,6 @@ Remove the local result cache.
 irradiate cache clean
 ```
 
----
 
 ## Configuration
 
