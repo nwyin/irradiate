@@ -23,6 +23,37 @@ use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::path::Path;
 
+/// Self-contained HTML template that loads mutation-testing-elements from unpkg CDN.
+/// `REPORT_JSON_PLACEHOLDER` is replaced with the serialised Stryker JSON at write time.
+const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>irradiate — Mutation Testing Report</title>
+  <script defer src="https://www.unpkg.com/mutation-testing-elements"></script>
+</head>
+<body>
+  <mutation-test-report-app title-postfix="irradiate">
+  </mutation-test-report-app>
+  <script>
+    document.querySelector('mutation-test-report-app').report = REPORT_JSON_PLACEHOLDER;
+  </script>
+</body>
+</html>
+"#;
+
+/// Write a self-contained HTML mutation testing report using the Stryker
+/// mutation-testing-elements web component.
+///
+/// The report JSON is inlined into the page; the only external dependency is
+/// the `mutation-testing-elements` script loaded from the unpkg CDN.
+pub fn write_html_report(report_json: &serde_json::Value, output_path: &Path) -> anyhow::Result<()> {
+    let json_str = serde_json::to_string(report_json)?;
+    let html = HTML_TEMPLATE.replace("REPORT_JSON_PLACEHOLDER", &json_str);
+    std::fs::write(output_path, html)?;
+    Ok(())
+}
+
 /// Maximum number of `::warning` annotations emitted per step.
 /// GitHub Actions truncates annotation lists beyond this point.
 const MAX_ANNOTATIONS: usize = 10;
@@ -741,6 +772,84 @@ mod tests {
         assert_eq!(all_mutants.len(), 1);
         assert_eq!(all_mutants[0]["id"], "unknown.x_h__irradiate_1");
         assert_eq!(all_mutants[0]["status"], "Survived");
+    }
+
+    // -------------------------------------------------------------------------
+    // HTML report tests
+    // -------------------------------------------------------------------------
+
+    /// INV-1: Output file contains `<!DOCTYPE html>`.
+    #[test]
+    fn test_html_report_is_valid_html() {
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("report.html");
+        write_html_report(&report, &out).unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(content.contains("<!DOCTYPE html>"), "INV-1: must contain DOCTYPE");
+    }
+
+    /// INV-2: Output contains the mutation-testing-elements script tag.
+    #[test]
+    fn test_html_report_contains_script_tag() {
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("report.html");
+        write_html_report(&report, &out).unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            content.contains("mutation-testing-elements"),
+            "INV-2: must reference mutation-testing-elements"
+        );
+        assert!(
+            content.contains("unpkg.com"),
+            "INV-2: script loaded from unpkg CDN"
+        );
+    }
+
+    /// INV-3: Output contains the actual JSON data (not the placeholder string).
+    #[test]
+    fn test_html_report_contains_json_not_placeholder() {
+        let results = vec![make_result("mod.x_f__irradiate_1", MutantStatus::Killed, 0.1)];
+        let report = build_stryker_report(&results, &[], None, Path::new("/proj"), Path::new("src"));
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("report.html");
+        write_html_report(&report, &out).unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        // Placeholder must be gone
+        assert!(
+            !content.contains("REPORT_JSON_PLACEHOLDER"),
+            "INV-3: placeholder must be replaced"
+        );
+        // JSON content must be present
+        assert!(
+            content.contains("schemaVersion"),
+            "INV-3: JSON data must be inlined"
+        );
+        assert!(
+            content.contains("mod.x_f__irradiate_1"),
+            "INV-3: mutant id must appear in output"
+        );
+    }
+
+    /// INV-4: Output is self-contained (single file, no local file references).
+    #[test]
+    fn test_html_report_is_self_contained() {
+        let report = build_stryker_report(&[], &[], None, Path::new("/proj"), Path::new("src"));
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("report.html");
+        write_html_report(&report, &out).unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        // Must be a single file — no local <link rel="stylesheet">, no local <script src="./...">
+        assert!(
+            !content.contains("rel=\"stylesheet\""),
+            "INV-4: no local stylesheet references"
+        );
+        // Confirm the web component tag is present (self-contained rendering)
+        assert!(
+            content.contains("<mutation-test-report-app"),
+            "INV-4: web component tag present"
+        );
     }
 
     /// coveredBy is populated from stats when provided.

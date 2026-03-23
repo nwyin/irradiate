@@ -482,8 +482,12 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &project_dir,
             &config.paths_to_mutate,
         );
-        let json_str = serde_json::to_string_pretty(&report)?;
-        std::fs::write(&output_path, json_str)?;
+        if fmt == "html" {
+            crate::report::write_html_report(&report, &output_path)?;
+        } else {
+            let json_str = serde_json::to_string_pretty(&report)?;
+            std::fs::write(&output_path, json_str)?;
+        }
         eprintln!("Report written to {}", output_path.display());
     }
 
@@ -615,8 +619,12 @@ pub fn results(
             &project_dir,
             &paths_to_mutate,
         );
-        let json_str = serde_json::to_string_pretty(&report_val)?;
-        std::fs::write(&output_path, json_str)?;
+        if fmt == "html" {
+            crate::report::write_html_report(&report_val, &output_path)?;
+        } else {
+            let json_str = serde_json::to_string_pretty(&report_val)?;
+            std::fs::write(&output_path, json_str)?;
+        }
         eprintln!("Report written to {}", output_path.display());
         return Ok(());
     }
