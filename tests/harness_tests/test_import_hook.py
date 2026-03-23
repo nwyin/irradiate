@@ -156,18 +156,20 @@ def test_package_spec_submodule_search_locations_is_pkg_dir(tmp_mutants):
 
 
 # ---------------------------------------------------------------------------
-# INV-7: Hook returns namespace spec for dirs without __init__.py
+# INV-7: Hook does NOT intercept dirs without __init__.py (no namespace hijack)
 # ---------------------------------------------------------------------------
 
 
-def test_finds_namespace_package(tmp_mutants):
+def test_does_not_intercept_namespace_directory(tmp_mutants):
+    """Directories without __init__.py should NOT be intercepted.
+    Python loads the original package, and the hook intercepts individual
+    mutated submodules. This prevents breaking packages where only some
+    files are mutated (e.g. --paths-to-mutate httpx/_content.py)."""
     ns_dir = tmp_mutants / "namespace_pkg"
     ns_dir.mkdir(parents=True)
     finder = MutantFinder(tmp_mutants)
     spec = finder.find_spec("namespace_pkg", None)
-    assert spec is not None
-    assert spec.loader is None  # namespace packages have no loader
-    assert spec.submodule_search_locations is not None
+    assert spec is None  # let Python handle it
 
 
 # ---------------------------------------------------------------------------
@@ -198,13 +200,14 @@ def test_resolve_caches_negative_result(tmp_mutants):
     assert finder._resolve("nonexistent") is None
 
 
-def test_namespace_package_is_not_cached(tmp_mutants):
+def test_bare_directory_is_cached_as_negative(tmp_mutants):
+    """Directories without __init__.py are cached as negative results,
+    since the hook no longer intercepts them."""
     ns_dir = tmp_mutants / "nspkg"
     ns_dir.mkdir(parents=True)
     finder = MutantFinder(tmp_mutants)
     finder._resolve("nspkg")
-    # Namespace packages must NOT be cached (they may gain __init__.py later)
-    assert "nspkg" not in finder._cache
+    assert finder._cache.get("nspkg") is False
 
 
 # ---------------------------------------------------------------------------
