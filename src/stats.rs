@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::info;
 
@@ -68,6 +69,116 @@ impl TestStats {
             .filter_map(|id| self.duration_by_test.get(id))
             .sum()
     }
+}
+
+/// Compute a SHA256 fingerprint of all source and test files.
+///
+/// If the fingerprint matches the cached value, stats collection can be skipped.
+/// The fingerprint covers: sorted list of (relative_path, file_content_hash) for
+/// all .py files under `paths_to_mutate` and `tests_dir`.
+fn compute_stats_fingerprint(
+    project_dir: &Path,
+    paths_to_mutate: &[PathBuf],
+    tests_dir: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+
+    // Collect all .py files from source paths and test dir
+    let mut file_entries: Vec<(String, Vec<u8>)> = Vec::new();
+
+    let mut dirs: Vec<PathBuf> = paths_to_mutate.to_vec();
+    let test_path = project_dir.join(tests_dir);
+    if test_path.exists() {
+        dirs.push(test_path);
+    }
+
+    for dir in &dirs {
+        let resolved = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            project_dir.join(dir)
+        };
+        collect_py_files(&resolved, project_dir, &mut file_entries);
+    }
+
+    // Sort for deterministic ordering
+    file_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (rel_path, content) in &file_entries {
+        // Include path so renames invalidate the cache
+        hasher.update((rel_path.len() as u64).to_le_bytes());
+        hasher.update(rel_path.as_bytes());
+        hasher.update((content.len() as u64).to_le_bytes());
+        hasher.update(content);
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+fn collect_py_files(dir: &Path, project_dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip hidden dirs and __pycache__
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with('.') && name_str != "__pycache__" {
+                collect_py_files(&path, project_dir, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "py") {
+            let rel = path
+                .strip_prefix(project_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            if let Ok(content) = std::fs::read(&path) {
+                out.push((rel, content));
+            }
+        }
+    }
+}
+
+/// Try to load cached stats if the fingerprint matches.
+///
+/// Returns `Some(stats)` on cache hit, `None` on miss.
+pub fn load_cached_stats(
+    project_dir: &Path,
+    paths_to_mutate: &[PathBuf],
+    tests_dir: &str,
+) -> Option<TestStats> {
+    let irr_dir = project_dir.join(".irradiate");
+    let stats_path = irr_dir.join("stats.json");
+    let fingerprint_path = irr_dir.join("stats_fingerprint");
+
+    if !stats_path.exists() || !fingerprint_path.exists() {
+        return None;
+    }
+
+    let saved_fingerprint = std::fs::read_to_string(&fingerprint_path).ok()?;
+    let current_fingerprint = compute_stats_fingerprint(project_dir, paths_to_mutate, tests_dir);
+
+    if saved_fingerprint.trim() != current_fingerprint {
+        info!("Stats fingerprint changed — will re-collect");
+        return None;
+    }
+
+    info!("Stats fingerprint matches — using cached stats");
+    TestStats::load(&stats_path).ok()
+}
+
+/// Save the stats fingerprint after a successful collection.
+pub fn save_stats_fingerprint(
+    project_dir: &Path,
+    paths_to_mutate: &[PathBuf],
+    tests_dir: &str,
+) {
+    let fingerprint = compute_stats_fingerprint(project_dir, paths_to_mutate, tests_dir);
+    let path = project_dir.join(".irradiate").join("stats_fingerprint");
+    let _ = std::fs::write(path, fingerprint);
 }
 
 /// Run the test suite with the stats plugin to collect coverage information.

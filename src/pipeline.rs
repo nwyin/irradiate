@@ -198,6 +198,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     let project_dir = std::env::current_dir()?;
     let mutants_dir = project_dir.join("mutants");
+    let mut trace = crate::trace::TraceLog::new();
 
     // Resolve diff filter when --diff is specified.
     let diff_filter = if let Some(ref diff_ref) = config.diff_ref {
@@ -213,6 +214,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     };
 
     // Phase 1: Mutation generation
+    let phase_start = trace.now_us();
     let start = Instant::now();
     let generation = generate_mutants(
         &config.paths_to_mutate,
@@ -221,14 +223,15 @@ pub async fn run(config: RunConfig) -> Result<()> {
         diff_filter.as_ref().map(|(f, r)| (f, r.as_path())),
     )?;
     let gen_time = start.elapsed();
+    let mutant_count: usize = generation.names_by_module.values().map(|v| v.len()).sum();
+    trace.phase("mutation_generation", phase_start, Some(serde_json::json!({
+        "mutants": mutant_count,
+        "files": generation.names_by_module.len(),
+    })));
     eprintln!(
         "  done in {:.0}ms ({} mutants across {} files)",
         gen_time.as_millis(),
-        generation
-            .names_by_module
-            .values()
-            .map(|v| v.len())
-            .sum::<usize>(),
+        mutant_count,
         generation.names_by_module.len(),
     );
 
@@ -305,18 +308,29 @@ pub async fn run(config: RunConfig) -> Result<()> {
         eprintln!("  done");
         None
     } else {
-        eprintln!("Running stats + validation...");
+        // Try cached stats first — skips the 4+ second pytest run when source/tests haven't changed
+        let phase_start = trace.now_us();
         let start = Instant::now();
-        let s = stats::collect_stats(
-            &config.python,
-            &project_dir,
-            &pythonpath,
-            &mutants_dir,
-            &config.tests_dir,
-            &config.pytest_add_cli_args,
-        )
-        .context("Stats collection failed")?;
-        eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
+        let s = if let Some(cached) = stats::load_cached_stats(&project_dir, &config.paths_to_mutate, &config.tests_dir) {
+            eprintln!("Using cached stats (source/tests unchanged)");
+            trace.phase("stats_cache_hit", phase_start, None);
+            cached
+        } else {
+            eprintln!("Running stats + validation...");
+            let s = stats::collect_stats(
+                &config.python,
+                &project_dir,
+                &pythonpath,
+                &mutants_dir,
+                &config.tests_dir,
+                &config.pytest_add_cli_args,
+            )
+            .context("Stats collection failed")?;
+            stats::save_stats_fingerprint(&project_dir, &config.paths_to_mutate, &config.tests_dir);
+            trace.phase("stats_collection", phase_start, None);
+            eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
+            s
+        };
 
         // Validate using fields from the stats run
         if let Some(exit_code) = s.exit_status {
@@ -340,6 +354,9 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
         Some(s)
     };
+
+    // Phase 3: Scheduling (work item building + cache lookup)
+    let phase_start = trace.now_us();
 
     // Phase 4: Mutation testing
     if config.isolate {
@@ -468,11 +485,19 @@ pub async fn run(config: RunConfig) -> Result<()> {
         covered_work.push(item);
     }
 
+    trace.phase("scheduling", phase_start, Some(serde_json::json!({
+        "cache_hits": cache_counts.hits,
+        "cache_misses": cache_counts.misses,
+        "uncovered": results.len(),
+        "to_execute": covered_work.len(),
+    })));
+
     if !covered_work.is_empty() {
         let execution_work: Vec<WorkItem> = covered_work
             .iter()
             .map(|item| item.work_item.clone())
             .collect();
+        let phase_start = trace.now_us();
         let run_results = if config.isolate {
             run_isolated(
                 &config,
@@ -498,15 +523,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 ..Default::default()
             };
             let progress = crate::progress::ProgressBar::new(total_mutants);
-            let (results, trace_log) =
+            let (results, worker_trace) =
                 run_worker_pool(&pool_config, execution_work, Some(progress)).await?;
-            // Write trace file for visualization (e.g. ui.perfetto.dev)
-            let trace_path = project_dir.join(".irradiate").join("trace.json");
-            if let Err(e) = crate::trace::write_trace_file(&trace_path, &trace_log.events) {
-                tracing::warn!("Failed to write trace file: {e}");
-            }
+            trace.merge(worker_trace);
             results
         };
+        trace.phase("worker_pool", phase_start, Some(serde_json::json!({
+            "executed": run_results.len(),
+        })));
 
         let cache_keys_by_mutant: HashMap<String, String> = covered_work
             .iter()
@@ -607,6 +631,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let test_time = start.elapsed();
 
     // Phase 5: Results
+    let phase_start = trace.now_us();
     // Write .meta files
     write_meta_files(&mutants_dir, &generation.names_by_module, &results)?;
 
@@ -640,6 +665,16 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Emit GitHub Actions annotations (no-op outside GitHub Actions).
     let all_descriptors: Vec<_> = generation.descriptors_by_name.values().cloned().collect();
     crate::report::emit_github_annotations(&results, &all_descriptors, killed, survived);
+
+    trace.phase("results_output", phase_start, None);
+
+    // Write combined trace file (pipeline phases + worker events)
+    let trace_path = project_dir.join(".irradiate").join("trace.json");
+    if let Err(e) = crate::trace::write_trace_file(&trace_path, &trace.events) {
+        tracing::warn!("Failed to write trace file: {e}");
+    } else {
+        eprintln!("Trace written to {}", trace_path.display());
+    }
 
     // INV-1: When fail_under is None, always return Ok(()).
     // INV-4: When no mutants were tested (killed + survived == 0), never fail.

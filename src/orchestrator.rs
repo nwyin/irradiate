@@ -168,6 +168,8 @@ fn spawn_worker(
         .env("IRRADIATE_TESTS_DIR", &config.tests_dir)
         .env("PYTHONPATH", &config.pythonpath)
         .env("IRRADIATE_PYTEST_ARGS", &pytest_args_json)
+        // Avoid .pyc writes — workers are short-lived, disk I/O wastes startup time
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -291,14 +293,83 @@ fn spawn_worker_task(
 }
 
 /// Sample the RSS (resident set size) of a process in kilobytes.
-/// Uses `ps -o rss= -p <pid>` which works on both macOS and Linux.
+///
+/// Uses platform-native APIs to avoid spawning a subprocess.
+/// macOS uses `proc_pidinfo(PROC_PIDTASKINFO)`, Linux reads `/proc/{pid}/statm`.
+/// Falls back to `ps -o rss=` if native methods fail.
 async fn check_rss(pid: u32) -> Result<usize> {
+    if let Some(rss_kb) = check_rss_native(pid) {
+        return Ok(rss_kb);
+    }
+    // Fallback: spawn ps
     let output = tokio::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .await?;
     let text = String::from_utf8_lossy(&output.stdout);
     text.trim().parse::<usize>().map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Try to read RSS using platform-native API (no subprocess spawn).
+#[cfg(target_os = "macos")]
+fn check_rss_native(pid: u32) -> Option<usize> {
+    // proc_pidinfo with PROC_PIDTASKINFO returns proc_taskinfo containing
+    // pti_resident_size (in bytes). Available since macOS 10.5.
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct proc_taskinfo {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    }
+
+    const PROC_PIDTASKINFO: i32 = 4;
+
+    unsafe {
+        let mut info: proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<proc_taskinfo>() as i32;
+        let ret = libc::proc_pidinfo(
+            pid as i32,
+            PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if ret <= 0 {
+            return None;
+        }
+        // Convert bytes to kilobytes
+        Some((info.pti_resident_size / 1024) as usize)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_rss_native(pid: u32) -> Option<usize> {
+    // /proc/{pid}/statm fields: size resident shared text lib data dt (in pages)
+    let content = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let resident_pages: usize = content.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    Some(resident_pages * page_size / 1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn check_rss_native(_pid: u32) -> Option<usize> {
+    None
 }
 
 /// Determine the effective recycling interval given user configuration and fixture detection.
@@ -610,12 +681,20 @@ async fn dispatch_work(
                         let memory_recycle = workers_pending_memory_recycle.remove(&worker_id);
                         let count_recycle = recycle_after > 0 && *count >= recycle_after;
 
-                        if (count_recycle || memory_recycle) && !work_queue.is_empty() {
+                        // Skip count-based recycling when the queue is nearly drained:
+                        // spawning a replacement takes ~500ms and won't pay for itself
+                        // if there are only a few mutants left. Memory-based recycling
+                        // is always honored (OOM is a correctness concern).
+                        let active_count = active_mutants.len();
+                        let worth_recycling = memory_recycle
+                            || (count_recycle && work_queue.len() > active_count + pending_accepts);
+
+                        if worth_recycling && !work_queue.is_empty() {
                             // Recycle: send shutdown, spawn a fresh replacement
                             if memory_recycle {
                                 info!("Worker {worker_id}: recycling due to memory limit exceeded");
                             } else {
-                                info!("Worker {worker_id}: recycling after {count} mutants");
+                                info!("Worker {worker_id}: recycling after {count} mutants (queue: {})", work_queue.len());
                             }
                             if let Some(sender) = worker_senders.remove(&worker_id) {
                                 let _ = sender.send(OrchestratorMessage::Shutdown).await;

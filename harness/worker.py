@@ -7,16 +7,12 @@ plugins are fully initialized when the worker executes selected items via
 pytest's hook machinery.
 """
 
-import gc
 import json
 import os
-import resource
 import signal
 import socket
 import sys
-import threading
 import time
-import traceback
 
 
 def send_message(sock, msg):
@@ -172,9 +168,10 @@ class MutationWorkerPlugin:
                 # Set CPU time limit as orphan safety net
                 if timeout_secs is not None:
                     try:
+                        import resource
                         limit = int(timeout_secs) + 5
                         resource.setrlimit(resource.RLIMIT_CPU, (limit, limit + 1))
-                    except (ValueError, resource.error):
+                    except (ValueError, OSError):
                         pass
 
                 self._reset_run_state()
@@ -184,6 +181,7 @@ class MutationWorkerPlugin:
             except SystemExit as exc:
                 exit_code = int(exc.code) if isinstance(exc.code, int) else 1
             except BaseException:
+                import traceback
                 traceback.print_exc()
                 exit_code = 99
             finally:
@@ -245,7 +243,9 @@ class MutationWorkerPlugin:
             },
         )
 
+        import gc
         gc.freeze()  # prevent COW faults from GC refcount updates in children
+        import threading
         thread_count = threading.active_count()
         if thread_count > 1:
             print(
