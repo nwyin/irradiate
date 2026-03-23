@@ -21,7 +21,11 @@ pub struct ToolConfig {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct IrradiateConfig {
+    /// Accepts a string (`"src"`) or array of strings (`["src/a.py", "src/b.py"]`).
+    /// When an array is given, the first element is used (multi-path support is TODO).
+    #[serde(default, deserialize_with = "deserialize_string_or_first_of_vec")]
     pub paths_to_mutate: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_first_of_vec")]
     pub tests_dir: Option<String>,
     pub do_not_mutate: Option<Vec<String>>,
     pub also_copy: Option<Vec<String>>,
@@ -31,6 +35,50 @@ pub struct IrradiateConfig {
     /// A plain string is accepted for backward compatibility and split on whitespace.
     #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
     pub pytest_add_cli_args: Option<Vec<String>>,
+}
+
+/// Deserialize `paths_to_mutate` from either a TOML string or an array of strings.
+/// When given an array, takes the first element (multi-path is TODO).
+fn deserialize_string_or_first_of_vec<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct StringOrFirstOfVec;
+
+    impl<'de> Visitor<'de> for StringOrFirstOfVec {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a string or array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            // Take first element; ignore the rest (multi-path support is TODO).
+            if let Some(first) = seq.next_element::<String>()? {
+                // Drain remaining elements.
+                while seq.next_element::<String>()?.is_some() {}
+                Ok(Some(first))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrFirstOfVec)
 }
 
 /// Deserialize `pytest_add_cli_args` from either a TOML string (split on whitespace,
