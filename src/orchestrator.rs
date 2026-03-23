@@ -398,6 +398,9 @@ async fn dispatch_work(
                 active_mutants.insert(worker_id, item.mutant_name.clone());
                 dispatch_times.insert(worker_id, (trace.now_us(), item.mutant_name.clone()));
                 if let Some(sender) = worker_senders.get(&worker_id) {
+                    if let Some(ref mut pb) = progress {
+                        pb.worker_start(worker_id, &item.mutant_name);
+                    }
                     let msg = OrchestratorMessage::Run {
                         mutant: item.mutant_name,
                         tests: item.test_ids,
@@ -408,6 +411,7 @@ async fn dispatch_work(
                         // Put the work item back
                         if let Some(mutant_name) = active_mutants.remove(&worker_id) {
                             if let Some(ref mut pb) = progress {
+                                pb.worker_done(worker_id);
                                 pb.record(MutantStatus::Error);
                             }
                             results.push(MutantResult {
@@ -595,6 +599,7 @@ async fn dispatch_work(
                         }
                         active_mutants.remove(&worker_id);
                         if let Some(ref mut pb) = progress {
+                            pb.worker_done(worker_id);
                             pb.record(result.status);
                         }
                         results.push(result);
@@ -645,6 +650,7 @@ async fn dispatch_work(
                         error!("Worker {worker_id} error: {message}");
                         if let Some(mutant_name) = mutant.or_else(|| active_mutants.remove(&worker_id)) {
                             if let Some(ref mut pb) = progress {
+                                pb.worker_done(worker_id);
                                 pb.record(MutantStatus::Error);
                             }
                             results.push(MutantResult {
@@ -668,6 +674,7 @@ async fn dispatch_work(
                             // Record any active mutant as error
                             if let Some(mutant_name) = active_mutants.remove(&worker_id) {
                                 if let Some(ref mut pb) = progress {
+                                    pb.worker_done(worker_id);
                                     pb.record(MutantStatus::Error);
                                 }
                                 results.push(MutantResult {
@@ -728,6 +735,7 @@ async fn dispatch_work(
                         warn!("Worker {worker_id} (pid {pid}) died — marking active mutant as error");
                         if let Some(mutant_name) = active_mutants.remove(&worker_id) {
                             if let Some(ref mut pb) = progress {
+                                pb.worker_done(worker_id);
                                 pb.record(MutantStatus::Error);
                             }
                             results.push(MutantResult {
@@ -811,10 +819,9 @@ async fn dispatch_work(
 }
 
 fn prioritize_work_items(mut work_items: Vec<WorkItem>) -> Vec<WorkItem> {
-    work_items.sort_by(|a, b| {
+    work_items.sort_unstable_by(|a, b| {
         b.estimated_duration_secs
             .total_cmp(&a.estimated_duration_secs)
-            .then_with(|| a.mutant_name.cmp(&b.mutant_name))
     });
     work_items
 }
@@ -850,16 +857,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prioritize_work_items_tiebreaks_by_name() {
+    fn test_prioritize_work_items_equal_duration_no_panic() {
+        // Equal durations should not panic (no tiebreaker needed for scheduling).
         let items = vec![work_item("m_b", 1.0), work_item("m_a", 1.0)];
-
         let ordered = prioritize_work_items(items);
-        let names: Vec<&str> = ordered
-            .iter()
-            .map(|item| item.mutant_name.as_str())
-            .collect();
-
-        assert_eq!(names, vec!["m_a", "m_b"]);
+        assert_eq!(ordered.len(), 2);
     }
 
     // --- determine_recycle_after tests (INV-1, INV-2, INV-4) ---
