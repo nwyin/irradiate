@@ -1,48 +1,40 @@
 # Quick Start
 
-This guide walks through running irradiate on a Python project with an existing pytest test suite.
+Run irradiate on a Python project with an existing pytest test suite.
 
-## Step 1: Pick a project
-
-You need a Python project with:
-- Source code in a `src/` or similar directory
-- Tests in a `tests/` directory
-- `pytest` installed in the project's Python environment
-
-For the examples below, we'll use a project with source at `src/` and tests at `tests/`.
-
-## Step 2: Run mutation testing
+## Step 1: Run mutation testing
 
 From the project root:
 
 ```bash
-irradiate run --paths-to-mutate src/
+irradiate run
 ```
 
 irradiate will:
 
 1. Parse all `.py` files under `src/` and generate mutants
-2. Run one "stats" pytest session to map which tests cover which functions
-3. Dispatch mutants to a worker pool, running only the relevant tests per mutant
-4. Write results to `.irradiate/` and print a summary
+2. Run one pytest session to map which tests cover which functions
+3. Fork a child process per mutant inside pre-warmed workers
+4. Print a summary
 
 Example output:
 
 ```
-Collecting stats...  [done in 2.3s]
-Running 847 mutants across 4 workers...
-████████████████████████████████████████ 847/847
+Generating mutants...
+  done in 3ms (142 mutants across 8 files)
+Running stats + validation...
+  done in 1.2s
+Running mutation testing (142 mutants, 8 workers)...
 
-Results:
-  Killed:    731  (86.3%)
-  Survived:   98  (11.6%)
-  No cover:   18   (2.1%)
-  Total:      847
-
-Elapsed: 94s
+Mutation testing complete (142 mutants in 4.2s, 34 mutants/sec)
+  Killed:    128
+  Survived:  9
+  No tests:  3
+  Timeout:   2
+  Score:     93.4%
 ```
 
-## Step 3: View results
+## Step 2: View results
 
 ```bash
 irradiate results
@@ -52,55 +44,66 @@ Shows survived mutants — the ones your tests missed:
 
 ```
 Survived mutants:
-  mylib.x_compute__mutmut_3
-  mylib.x_validate__mutmut_1
-  mylib.x_validate__mutmut_7
-  ...
+  mylib.x_compute__irradiate_3
+  mylib.x_validate__irradiate_1
 ```
 
-To see all mutants including killed ones:
+## Step 3: Inspect a specific mutant
 
 ```bash
-irradiate results --all
+irradiate show mylib.x_compute__irradiate_3
 ```
 
-## Step 4: Inspect a specific mutant
-
-```bash
-irradiate show mylib.x_compute__mutmut_3
-```
-
-Output shows the diff — what changed:
+Shows the diff:
 
 ```diff
 --- original
 +++ mutant
-@@ -4,7 +4,7 @@
  def compute(x, y):
 -    return x + y
 +    return x - y
 ```
 
-A survived mutant here means no test caught the `+` → `-` change. That's either a missing test or dead code.
+A survived mutant here means no test caught the `+` to `-` change.
 
-## Step 5: Cache behavior
+## Step 4: Incremental mode
 
-Results are cached by content hash. If you run irradiate again without changing source or tests, it skips cached mutants:
+On a feature branch, test only functions you changed:
 
 ```bash
-irradiate run --paths-to-mutate src/
-# Skipped: 731 cached results
-# Running: 116 new/changed mutants
+irradiate run --diff main
 ```
 
-To clear the cache:
+## Step 5: Reports
 
 ```bash
-irradiate cache clean
+# JSON report (Stryker mutation-testing-report-schema v2)
+irradiate run --report json
+
+# Self-contained HTML report
+irradiate run --report html
+```
+
+In GitHub Actions, irradiate auto-detects CI and adds inline annotations on survived mutants.
+
+## Step 6: CI gating
+
+Fail the build if mutation score drops below a threshold:
+
+```bash
+irradiate run --fail-under 80
+```
+
+## Cache behavior
+
+Results are cached by content hash. Unchanged functions with unchanged tests skip on re-runs:
+
+```bash
+irradiate cache clean   # clear if needed
 ```
 
 ## Next steps
 
-- Configure paths and options in [pyproject.toml](configuration.md)
-- Use `--isolate` for strict subprocess isolation (slower, no state leakage)
-- Use `--verify-survivors` to re-test survived mutants in isolation mode to catch false negatives
+- [Configuration](configuration.md) — pyproject.toml settings
+- [CI Integration](../guide/ci-integration.md) — GitHub Actions setup
+- [Understanding Results](../guide/understanding-results.md) — what survived/killed/timeout mean

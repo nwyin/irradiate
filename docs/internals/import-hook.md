@@ -323,7 +323,7 @@ Import time (once per worker startup):
 Test time (many times per mutant):
   add(1, 2)
     → trampoline checks active_mutant
-    → dispatches to x_add__mutmut_orig or x_add__mutmut_1
+    → dispatches to x_add__irradiate_orig or x_add__irradiate_1
     → no import system involvement at all
 ```
 

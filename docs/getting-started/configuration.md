@@ -1,105 +1,84 @@
 # Configuration
 
-irradiate reads configuration from `pyproject.toml` under `[tool.mutmut]` (the `mutmut` section — intentional, for backward compatibility with mutmut projects).
+irradiate reads configuration from `pyproject.toml` under `[tool.irradiate]`. All settings are optional — CLI flags override config values.
 
 ## pyproject.toml
 
 ```toml
-[tool.mutmut]
+[tool.irradiate]
 paths_to_mutate = "src/"
 tests_dir = "tests/"
+do_not_mutate = ["**/generated/*", "**/vendor/*"]
+also_copy = ["data/"]
+pytest_add_cli_args = ["-x", "--tb=short"]
 ```
 
-All settings are optional. CLI flags override config file values.
-
-### Available settings
+### Settings
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `paths_to_mutate` | string | `"src"` | Directory containing source code to mutate |
-| `tests_dir` | string | `"tests"` | Directory containing the test suite |
-| `do_not_mutate` | list of strings | `[]` | Patterns of code to skip (e.g., `["# pragma: no mutate"]`) |
+| `paths_to_mutate` | string | `"src"` | Source directory to mutate |
+| `tests_dir` | string | `"tests"` | Test directory |
+| `do_not_mutate` | list of strings | `[]` | Glob patterns for files to skip |
+| `also_copy` | list of strings | `[]` | Extra directories to copy into the mutants tree |
+| `pytest_add_cli_args` | list of strings | `[]` | Extra arguments passed to every pytest invocation |
+
+### Backward compatibility
+
+`[tool.mutmut]` is accepted with a deprecation warning. Rename to `[tool.irradiate]`.
 
 ## CLI flags
 
 All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 
-### Core options
+### Source and tests
 
 ```
---paths-to-mutate <PATH>
-    Path(s) to source code to mutate
-    Overrides pyproject.toml paths_to_mutate
-
---tests-dir <DIR>
-    Path to test directory
-    Overrides pyproject.toml tests_dir
-
---python <PATH>
-    Python interpreter to use (default: python3)
-    Use this to point at a virtualenv: --python .venv/bin/python
+--paths-to-mutate <PATH>    Source directory to mutate (overrides config)
+--tests-dir <DIR>           Test directory (overrides config)
+--python <PATH>             Python interpreter [default: python3]
+--pytest-args <ARGS>        Extra pytest arguments (appends to config)
 ```
 
-### Worker pool
+### Incremental and filtering
 
 ```
---workers <N>
-    Number of worker processes (default: number of CPUs)
-
---worker-recycle-after <N>
-    Respawn workers after N mutants to prevent pytest state accumulation
-    Default: auto-tune (100 normally, 20 when session-scoped fixtures detected)
-    Set 0 to disable recycling
-
---max-worker-memory <MB>
-    Recycle workers whose RSS exceeds this threshold in megabytes
-    Default: 0 (disabled)
+--diff <REF>          Only mutate functions changed since this git ref
+--covered-only        Skip mutants with no test coverage
+--no-stats            Skip coverage collection; test all mutants against all tests
+--fail-under <SCORE>  Exit 1 if mutation score is below this threshold (0-100)
 ```
 
-### Timing and timeouts
+### Execution
 
 ```
---timeout-multiplier <FLOAT>
-    Timeout per mutant as a multiple of the baseline test duration (default: 10.0)
-    A baseline of 0.5s means each mutant gets 5s before being killed
+--workers <N>                   Number of worker processes [default: CPU count]
+--timeout-multiplier <FLOAT>    Per-mutant timeout multiplier [default: 10.0]
+--worker-recycle-after <N>      Respawn workers after N mutants [default: auto]
+--max-worker-memory <MB>        Recycle workers exceeding this RSS [default: 0 = off]
+--isolate                       Fresh subprocess per mutant (slower, fully isolated)
+--verify-survivors              Re-test survivors in isolate mode after the main run
 ```
 
-### Test selection
+### Reporting
 
 ```
---no-stats
-    Skip the stats collection run; test all mutants against all tests
-    Slower but avoids the stats run overhead for small projects
-
---covered-only
-    Skip mutants with no test coverage (no stats data)
+--report <FORMAT>    Generate report: json or html
+-o, --output <PATH>  Output path [default: irradiate-report.<format>]
 ```
 
-### Isolation and correctness
+GitHub Actions annotations and step summary are auto-detected when `GITHUB_ACTIONS=true`.
 
-```
---isolate
-    Run each mutant in a fresh subprocess
-    Slower — eliminates warm-session state entirely
-    Use when you suspect state leakage between mutants
-
---verify-survivors
-    After the main run, re-test survived mutants in isolate mode
-    Catches false negatives from warm-session state leakage
-    No-op when --isolate is already set
-```
-
-## Example: full pyproject.toml config
+## Example
 
 ```toml
-[tool.mutmut]
+[tool.irradiate]
 paths_to_mutate = "src/mylib"
 tests_dir = "tests/unit"
-do_not_mutate = ["# pragma: no mutate"]
+do_not_mutate = ["**/migrations/*"]
+pytest_add_cli_args = ["-x", "--timeout=30"]
 ```
 
-Then run with extra CLI options:
-
 ```bash
-irradiate run --workers 8 --verify-survivors
+irradiate run --workers 4 --diff main --fail-under 80 --report json
 ```

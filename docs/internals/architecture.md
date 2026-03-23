@@ -69,7 +69,7 @@ Newline-delimited JSON over unix domain sockets:
 ```
 Orchestrator → Worker:
   {"type":"warmup"}
-  {"type":"run","mutant":"my_lib.x_hello__mutmut_1","tests":["tests/test.py::test_hello"]}
+  {"type":"run","mutant":"my_lib.x_hello__irradiate_1","tests":["tests/test.py::test_hello"]}
   {"type":"shutdown"}
 
 Worker → Orchestrator:
@@ -78,41 +78,44 @@ Worker → Orchestrator:
   {"type":"error","message":"..."}
 ```
 
-### Fallback: generic test command mode
-
-For non-pytest test runners, irradiate supports `--test-command "make test"`. In this mode, each mutant spawns a fresh subprocess with `MUTANT_UNDER_TEST` set in the environment. No worker pool, no IPC — just fork/exec per mutant. Slower, but works with any test runner that returns exit code 0 for success. This preserves mutmut's original "any test runner" philosophy while allowing deep pytest optimization.
-
 ## Architecture
 
 ```
 irradiate (Rust binary)
 ├── CLI (clap)
 ├── Mutation Engine
-│   ├── Python parser (libcst Rust crate — same parser as Python's LibCST)
-│   ├── Mutation operators (declarative tables + procedural operators)
-│   ├── Trampoline code generation
+│   ├── Python parser (tree-sitter + tree-sitter-python)
+│   ├── 27 mutation operator categories (~160+ distinct mutations)
+│   ├── Trampoline code generation (descriptor-aware for @property/@classmethod/@staticmethod)
 │   └── Parallel file processing (rayon)
 ├── Worker Pool Orchestrator
-│   ├── Spawn/manage N pytest worker processes
+│   ├── Fork-per-mutant inside pre-warmed workers
 │   ├── Unix domain socket IPC (tokio)
-│   ├── Timeout management (tokio timers, not sleep-polling)
-│   ├── Signal handling (SIGXCPU, SIGKILL, SIGINT)
+│   ├── Timeout management (tokio timers)
 │   └── Work queue sorted by estimated execution time
+├── Incremental Mode
+│   ├── Git diff parsing (--diff <ref>)
+│   ├── Merge-base resolution for branch comparisons
+│   └── Function-level filtering (only mutate touched functions)
 ├── Cache
-│   ├── Content-addressable result store
-│   ├── Incremental mutation detection
-│   └── Optional shared/remote cache
+│   ├── Content-addressable result store (SHA-256)
+│   └── Incremental mutation detection
+├── Reporting
+│   ├── JSON (Stryker mutation-testing-report-schema v2)
+│   ├── HTML (mutation-testing-elements web component)
+│   ├── GitHub Actions annotations + step summary
+│   └── Terminal summary
 ├── Result Store
-│   ├── .meta JSON files (backward-compatible with mutmut)
+│   ├── .meta JSON files
 │   ├── Stats JSON (test-to-mutant mapping, durations)
-│   └── Batched writes (not per-mutant like mutmut)
-└── TUI Browser (ratatui)
+│   └── Batched writes
 ```
 
 A small Python package (`irradiate-harness`) ships alongside the binary. It contains:
 
 - `worker.py` — the pytest worker loop (~100 lines)
 - `stats_plugin.py` — pytest plugin for recording which tests cover which functions
+- `import_hook.py` — MutantFinder import hook (intercepts imports, loads trampolined code)
 - `trampoline.py` — holds the `active_mutant` global that the trampoline reads
 
 ## What stays Python
@@ -120,10 +123,10 @@ A small Python package (`irradiate-harness`) ships alongside the binary. It cont
 Three things must remain Python because they run inside the test process:
 
 1. **The trampoline** — injected into mutated source files, dispatches function calls based on `active_mutant` global. Uses a module global (fast dict lookup) instead of `os.environ` (syscall per call).
-2. **The worker process** — ~100 lines that connects to a unix socket, receives work, calls pytest item execution directly, reports results.
+2. **The worker process** — connects to a unix socket, receives work, forks a child per mutant, reports results.
 3. **The stats plugin** — a pytest plugin that records which tests execute which trampolined functions.
 
-Everything else — parsing, mutation, orchestration, caching, I/O, CLI, TUI — is Rust.
+Everything else — parsing, mutation, orchestration, caching, I/O, CLI — is Rust.
 
 ## Content-addressable cache
 
@@ -158,7 +161,7 @@ The cache is naturally self-invalidating: if any input to the hash changes (func
 
 ### Design: declarative tables over procedural code
 
-mutmut's operators are Python functions that take CST nodes and yield mutated variants. They work, but adding a new operator requires understanding the libcst node API, writing match logic, and handling edge cases.
+mutmut's operators are Python functions that take CST nodes and yield mutated variants. They work, but adding a new operator requires understanding the tree-sitter node API, writing match logic, and handling edge cases.
 
 irradiate splits operators into two categories:
 
@@ -228,7 +231,8 @@ Certain patterns should never be mutated:
 - Dunder methods that affect object identity: `__getattribute__`, `__setattr__`, `__new__`
 - Calls to `len()`, `isinstance()` — mutations here rarely produce useful signal
 - Type annotations
-- Decorator expressions
+- Non-descriptor decorator expressions (@cache, @app.route, etc. — @property/@classmethod/@staticmethod are handled)
+- Enum subclass methods, functions with `nonlocal`
 - Docstrings (triple-quoted strings)
 
 ### Operator catalog
@@ -254,8 +258,8 @@ Certain patterns should never be mutated:
 
 The trampoline is Python code injected into every mutated source file. For each function with mutations, irradiate generates:
 
-1. The **original function**, renamed to `x_func__mutmut_orig`
-2. **N mutated variants**, named `x_func__mutmut_1` through `x_func__mutmut_N`
+1. The **original function**, renamed to `x_func__irradiate_orig`
+2. **N mutated variants**, named `x_func__irradiate_1` through `x_func__irradiate_N`
 3. A **mutant lookup dict** mapping variant names to function references
 4. A **trampoline wrapper** with the original function name that dispatches at runtime
 
@@ -271,7 +275,7 @@ def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None):
     if active == 'stats':
         _ih.record_hit(orig.__module__ + '.' + orig.__name__)
         return orig(*call_args, **call_kwargs)
-    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_'
+    prefix = orig.__module__ + '.' + orig.__name__ + '__irradiate_'
     if not active.startswith(prefix):    # not our function
         return orig(*call_args, **call_kwargs)
     variant = active.rpartition('.')[-1]
@@ -284,7 +288,7 @@ Key properties:
 - Reads a module global (`_ih.active_mutant`), not `os.environ` — avoids a syscall on every instrumented function call
 - The hot path (no mutation active) is a single falsy check
 - Dispatch is a dict lookup, not a chain of if-statements
-- Compatible with mutmut's naming convention (`__mutmut_N` suffixes, `ǁ` class separator)
+- Compatible with mutmut's naming convention (`__irradiate_N` suffixes, `ǁ` class separator)
 
 ## Execution phases
 
@@ -292,7 +296,7 @@ Key properties:
 
 ```
 for each .py file in paths_to_mutate (parallel via rayon):
-    parse with libcst Rust crate
+    parse with tree-sitter Rust crate
     walk CST, apply operators, collect mutations grouped by function
     for each function with mutations:
         emit original (renamed), variants, lookup dict, trampoline wrapper
@@ -354,7 +358,7 @@ Aggregate results from all `.meta` files. Classify each mutant:
 
 irradiate produces the same output format as mutmut:
 
-- Same mutant naming convention (`module.xǁClassǁmethod__mutmut_N`)
+- Same mutant naming convention (`module.xǁClassǁmethod__irradiate_N`)
 - Same `.meta` JSON files in `mutants/`
 - Same `mutmut-stats.json` format
 - Same trampoline architecture (function renaming + dispatch)
@@ -393,18 +397,18 @@ Three layers of defense against state leakage:
 
 Residual risk: deep mutations to mutable module-level objects (dict/list contents) are not caught by shallow snapshot/restore. Selective `importlib.reload()` is tracked as future work (GitHub #7).
 
-### Future option: fork-snapshot backend
+### Fork-per-mutant (default)
 
-A Unix-only alternative: `fork()` a child per mutant from a warm collected parent. The parent never accumulates post-run state. Not implemented — warm-session + recycling + verify-survivors has been sufficient. Would revisit if real-world suites show too much leakage.
+The default execution model: each worker forks a child process for each mutant. The parent holds the collected pytest session and never accumulates post-run state. The child sets `active_mutant`, runs the selected tests, and calls `os._exit()`. This gives subprocess-level isolation without paying pytest startup on each mutant.
 
 ## Risks and mitigations
 
 **Test state leakage in worker pool**: Mitigated by module snapshot/restore, auto-tuned recycling, and `--verify-survivors`. See "State isolation in warm sessions" above.
 
-**libcst Rust crate gaps**: The Rust crate may not cover all Python syntax that the Python LibCST handles. Mitigations:
+**tree-sitter Rust crate gaps**: The Rust crate may not cover all Python syntax that the Python tree-sitter handles. Mitigations:
 - Fall back to copying files unchanged when parsing fails (same as mutmut)
 - Track which syntax constructs cause parse failures, file issues upstream
-- The libcst Rust crate is the same parser that powers the Python LibCST — it's actively maintained and handles Python 3.0-3.14
+- The tree-sitter Rust crate is the same parser that powers the Python tree-sitter — it's actively maintained and handles Python 3.0-3.14
 
 **Plugin compatibility**: Some pytest plugins assume one session = one logical run, or accumulate mutable state. Mitigations:
 - Worker recycling bounds accumulation

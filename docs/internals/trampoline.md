@@ -35,31 +35,31 @@ def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None, 
     if active == 'stats':
         _ih.record_hit(orig.__module__ + '.' + orig.__name__)
         return orig(*call_args, **call_kwargs)       # stats collection mode
-    prefix = orig.__module__ + '.' + orig.__name__ + '__mutmut_'
+    prefix = orig.__module__ + '.' + orig.__name__ + '__irradiate_'
     if not active.startswith(prefix):
         return orig(*call_args, **call_kwargs)       # not our mutant
     variant_key = active.rpartition('.')[-1]
     return mutants[variant_key](*call_args, **call_kwargs)  # run the mutated variant
 
 # --- Original function, renamed ---
-def x_add__mutmut_orig(a, b):
+def x_add__irradiate_orig(a, b):
     return a + b
 
 # --- Mutated variant: + swapped to - ---
-def x_add__mutmut_1(a, b):
+def x_add__irradiate_1(a, b):
     return a - b
 
 # --- Lookup table ---
-x_add__mutmut_mutants = {
-    'x_add__mutmut_1': x_add__mutmut_1,
+x_add__irradiate_mutants = {
+    'x_add__irradiate_1': x_add__irradiate_1,
 }
-x_add__mutmut_orig.__name__ = 'x_add'
+x_add__irradiate_orig.__name__ = 'x_add'
 
 # --- Wrapper (takes the original function name) ---
 def add(a, b):
     return _irradiate_trampoline(
-        x_add__mutmut_orig,
-        x_add__mutmut_mutants,
+        x_add__irradiate_orig,
+        x_add__irradiate_mutants,
         (a, b), {},
         None,
     )
@@ -69,11 +69,11 @@ When your test calls `add(1, 2)`, it hits the wrapper, which calls `_irradiate_t
 
 | `active_mutant` value | What runs | Why |
 |---|---|---|
-| `None` | `x_add__mutmut_orig(1, 2)` → `3` | Normal execution, no mutation |
+| `None` | `x_add__irradiate_orig(1, 2)` → `3` | Normal execution, no mutation |
 | `"fail"` | Raises `ProgrammaticFailException` | Forced-fail validation — confirms trampoline is wired |
-| `"stats"` | Records hit, then `x_add__mutmut_orig(1, 2)` → `3` | Collects which functions each test touches |
-| `"my_module.x_add__mutmut_1"` | `x_add__mutmut_1(1, 2)` → `-1` | Runs the mutated variant |
-| `"my_module.x_greet__mutmut_1"` | `x_add__mutmut_orig(1, 2)` → `3` | Different function's mutant, not ours — run original |
+| `"stats"` | Records hit, then `x_add__irradiate_orig(1, 2)` → `3` | Collects which functions each test touches |
+| `"my_module.x_add__irradiate_1"` | `x_add__irradiate_1(1, 2)` → `-1` | Runs the mutated variant |
+| `"my_module.x_greet__irradiate_1"` | `x_add__irradiate_orig(1, 2)` → `3` | Different function's mutant, not ours — run original |
 
 ## Why a global variable, not an environment variable
 
@@ -82,7 +82,7 @@ The trampoline reads `_ih.active_mutant` — a Python module attribute. This is 
 The worker process sets this global directly:
 
 ```python
-irradiate_harness.active_mutant = "my_module.x_add__mutmut_1"
+irradiate_harness.active_mutant = "my_module.x_add__irradiate_1"
 # ... run tests ...
 irradiate_harness.active_mutant = None  # reset
 ```
@@ -96,7 +96,7 @@ No process restart. No reimport. Just flip a global and run tests again.
                       ─────────────────                     ──────────────────
 
   add(a, b):          mutation.rs                           Worker startup
-  return a + b   ──►  parse with libcst                     ───────────────
+  return a + b   ──►  parse with tree-sitter                     ───────────────
                       find mutations:                       1. pytest starts
   Source file         + can become -                        2. imports mutants/my_module
                            │                                3. collects test items
@@ -104,8 +104,8 @@ No process restart. No reimport. Just flip a global and run tests again.
                       codegen.rs                            5. sends "ready"
                       assemble mutated file:
                       - trampoline dispatcher               Mutant loop
-                      - x_add__mutmut_orig (renamed)        ──────────
-                      - x_add__mutmut_1 (variant)           for each mutant:
+                      - x_add__irradiate_orig (renamed)        ──────────
+                      - x_add__irradiate_1 (variant)           for each mutant:
                       - lookup dict                           active_mutant = "...mutmut_1"
                       - wrapper: def add(...)                 run tests
                            │                                  test calls add(1,2)
@@ -127,33 +127,28 @@ irradiate follows mutmut's naming to keep compatibility:
 |---|---|---|
 | `def foo()` (top-level) | `x_foo` | `x_` prefix avoids collisions |
 | `class Bar` method `baz()` | `xǁBarǁbaz` | Unicode separator `ǁ` (U+01C1) encodes class membership |
-| Original function | `x_foo__mutmut_orig` | Preserved for non-mutant execution |
-| Mutant variant N | `x_foo__mutmut_N` | N is 1-indexed |
-| Fully qualified key | `my_module.x_foo__mutmut_1` | Module prefix for cross-file dispatch |
+| Original function | `x_foo__irradiate_orig` | Preserved for non-mutant execution |
+| Mutant variant N | `x_foo__irradiate_N` | N is 1-indexed |
+| Fully qualified key | `my_module.x_foo__irradiate_1` | Module prefix for cross-file dispatch |
 
-## How PYTHONPATH makes it work
+## How imports work
 
-When irradiate runs tests, PYTHONPATH is set to:
+irradiate uses a custom import hook (`MutantFinder`) installed at `sys.meta_path[0]`. When Python encounters `import mylib`, the hook checks if a trampolined version exists in `mutants/mylib/` and loads it. If not, it returns `None` and Python resolves normally.
 
-```
-.irradiate/harness/ : mutants/ : src/
-```
-
-1. `.irradiate/harness/` — so `import irradiate_harness` finds the trampoline runtime
-2. `mutants/` — so `import my_module` finds the trampolined copy (shadows the original)
-3. `src/` (source parent) — so unmutated sibling packages still resolve
-
-The mutants directory shadows the original source. When Python does `import my_module`, it finds the trampolined version in `mutants/` first.
+This replaced the earlier PYTHONPATH-shadowing approach, which was fragile (path ordering, pytest config interference, flat-layout projects). See [Import Hook Design](import-hook.md) for details.
 
 ## What gets mutated, what doesn't
 
 The trampoline wraps **functions and methods only**. Module-level code (imports, constants, class definitions) is copied verbatim — it runs once at import time and is not subject to runtime switching.
 
 Currently skipped:
-- Decorated functions (the decorator may change the function's identity)
-- Dunder methods like `__init__`, `__getattribute__` (mutations cause cascading failures)
-- Functions marked with `# pragma: no mutate`
-- Files that fail to parse with libcst
+- Functions with non-descriptor decorators (@cache, @app.route, etc.)
+- `__getattribute__`, `__setattr__`, `__new__`
+- Enum subclass methods, functions with `nonlocal`
+- `# pragma: no mutate` lines
+
+Handled by descriptor-aware trampoline:
+- `@property`, `@classmethod`, `@staticmethod` (see [Decorator Handling](decorators.md))
 
 ## The three special modes
 

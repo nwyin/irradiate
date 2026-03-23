@@ -1,14 +1,21 @@
 # Installation
 
-irradiate is a Rust binary that runs against your Python project. You need Rust to build it and Python with pytest to run tests.
+## From PyPI (recommended)
+
+```bash
+pip install irradiate
+```
+
+This installs a pre-built binary wheel. No Rust toolchain needed.
 
 ## Prerequisites
 
-- **Rust** 1.70+
-- **Python** 3.10+
-- **pytest** installed in your project's virtual environment
+- **Python 3.10+** with `pytest` installed in your project's environment
+- **macOS** (arm64, x86_64) or **Linux** (x86_64, aarch64)
 
 ## Build from source
+
+If you need a development build or an unsupported platform:
 
 ```bash
 git clone https://github.com/nwyin/irradiate
@@ -16,7 +23,22 @@ cd irradiate
 cargo build --release
 ```
 
-The binary lands at `target/release/irradiate`. Add it to your `PATH` or invoke it directly.
+Requires Rust 1.70+. The binary is at `target/release/irradiate`.
+
+## Python environment
+
+irradiate embeds its own test harness at runtime — you don't install anything into your project. Your project just needs `pytest`:
+
+```bash
+uv pip install pytest
+# or: pip install pytest
+```
+
+irradiate uses `python3` by default. Override with `--python`:
+
+```bash
+irradiate run --python .venv/bin/python
+```
 
 ## Verify
 
@@ -24,18 +46,9 @@ The binary lands at `target/release/irradiate`. Add it to your `PATH` or invoke 
 irradiate --version
 ```
 
-## Python dependencies
+## What irradiate does NOT require
 
-irradiate ships a small Python harness (`irradiate_harness`) that it extracts automatically at runtime. You don't need to install it separately — just make sure pytest is available in the Python environment irradiate will use.
-
-```bash
-# With uv:
-uv venv && uv pip install pytest
-
-# With pip:
-python -m venv .venv && .venv/bin/pip install pytest
-```
-
-## Next step
-
-See [Quickstart](quickstart.md) to run your first mutation test.
+- No changes to your `pyproject.toml` (though you can add config there)
+- No pytest plugins in your project
+- No `conftest.py` modifications
+- No coverage configuration
