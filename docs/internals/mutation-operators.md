@@ -4,7 +4,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ## irradiate (current)
 
-25 operator categories, ~150+ distinct mutations. Python-specific, operates on CST via libcst.
+27 operator categories, ~160+ distinct mutations. Python-specific, operates on tree-sitter CST.
 
 ### Operators implemented
 
@@ -24,29 +24,31 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 | Lambdas | `lambda_mutation` | body→`None` (or `None`→`0`) |
 | Assignments | `assignment_mutation` | value→`None` (or `None`→`""`) |
 | Aug-to-plain | `augassign_to_assign` | `x += 5`→`x = 5` |
-| Arg removal | `arg_removal` | Replace each arg with `None` + remove each arg (skip starred) |
+| Arg removal | `arg_removal` | Remove each arg individually (skip `len()`, `isinstance()`, generators) |
 | Dict kwargs | `dict_kwarg` | `dict(foo=1)`→`dict(fooXX=1)` |
 | Default args | `default_arg` | Mutate default parameter values (`None`→`""`, `True`↔`False`, `n`→`n+1`, etc.) |
-| Decorator removal | `decorator_removal` | Remove each `@decorator` individually (skip `@abstractmethod`, `@override`) |
 | Return values | `return_value` | `return x`→`return None` (or `None`→`""`) |
 | Exception types | `exception_type` | `except ValueError:`→`except Exception:` (broaden handler) |
 | Match cases | `match_case_removal` | Remove each `case` branch (when >1 case) |
 | Condition negation | `condition_negation` | `if cond:`→`if not (cond):`, `while cond:`→`while not (cond):`, `assert cond`→`assert not (cond)`, ternary conditions |
+| Condition replacement | `condition_replacement` | `if cond:`→`if True:` / `if False:`, `while cond:`→`while True:` / `while False:`, `elif` (skip if already literal) |
 | Statement deletion | `statement_deletion` | `x = expr`→`pass`, `return x`→`return None`, `foo()`→`pass`, `raise E`→`pass` |
 | Keyword swap | `keyword_swap` | `break`↔`continue` |
 | Loop mutation | `loop_mutation` | `for x in items:`→`for x in []:`, `while cond:`→`while False:` |
 | Ternary swap | `ternary_swap` | `a if cond else b`→`b if cond else a` (skip identical branches) |
+| Slice index removal | `slice_index_removal` | Remove start/stop/step: `x[1:3]`→`x[:3]`/`x[1:]`, `x[1:5:2]`→`x[:5:2]`/`x[1::2]`/`x[1:5:]` |
 
 ### Skip rules
 
-- Decorated functions (any decorator) — except for `decorator_removal` itself
+- Decorated functions (any decorator) — skipped entirely (trampoline incompatibility)
+- Enum subclass methods (`Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`) — `EnumMeta` metaclass conflicts
+- Functions containing `nonlocal` — trampoline extraction breaks scope chains
 - `__getattribute__`, `__setattr__`, `__new__`
-- `len()`, `isinstance()` calls (and their arguments)
-- Type annotations (parameter, return, standalone)
-- Triple-quoted strings (docstrings)
+- `len()`, `isinstance()` calls (arg_removal skipped — trivially killed, noisy)
+- Generator expression / comprehension arguments (arg_removal skipped — invalid syntax)
+- Triple-quoted strings (docstrings) — string_mutation and string_emptying skipped
+- Strings containing their own delimiter character
 - `# pragma: no mutate` lines
-- Starred arguments (`*args`, `**kwargs`)
-- `@abstractmethod`, `@override` decorators (not removed by `decorator_removal`)
 
 ---
 
@@ -291,12 +293,12 @@ Operators that exist in 3+ ecosystems are considered "universal". Operators uniq
 | Return value replacement | Yes | -- | Yes | -- | -- | Yes | Yes | Yes |
 | Function body→default | -- | -- | PIT Extreme | Yes (block) | Yes (block) | Yes (primary) | -- | -- |
 | Statement deletion | Yes | mutpy | Yes (Major) | -- | Yes | -- | -- | -- |
-| Decorator removal | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | -- |
+| Decorator removal | -- | cosmic-ray, mutpy | -- | -- | -- | -- | -- | -- |
 | Exception handler mutation | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
-| Condition→`true`/`false` | -- | cosmic-ray | Yes | Yes | Yes | -- | -- | -- |
+| Condition→`true`/`false` | Yes | cosmic-ray | Yes | Yes | Yes | -- | -- | -- |
 | Condition negation (insert `not`) | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
 | Loop zero iteration | Yes | cosmic-ray, mutpy | -- | -- | -- | -- | -- | Yes |
-| Slice index removal | -- | mutpy | -- | -- | -- | -- | -- | -- |
+| Slice index removal | Yes | mutpy | -- | -- | -- | -- | -- | -- |
 | `self.x`→`x` | -- | mutpy | -- | -- | -- | -- | -- | -- |
 | `super()` manipulation | -- | mutpy | -- | -- | -- | -- | -- | -- |
 | Regex mutation | -- | -- | -- | Yes (26) | Yes (37) | -- | -- | Yes (5) |
@@ -325,27 +327,27 @@ Operators implemented by multiple frameworks that irradiate does not yet have, r
 
 ### Implemented (March 2026)
 
-The following gaps have been closed:
+The following gaps from the original audit have been closed:
 
 - ~~**Condition negation**~~ — `condition_negation` operator: `if cond:`→`if not (cond):`, `while`, `assert`, ternary
+- ~~**Condition→`true`/`false`**~~ — `condition_replacement` operator: `if cond:`→`if True:`/`if False:`, `while`, `elif`
 - ~~**Statement deletion**~~ — `statement_deletion` operator: assign→`pass`, return→`return None`, expr→`pass`, raise→`pass`
 - ~~**`break`↔`continue`**~~ — `keyword_swap` operator
-- ~~**Decorator removal**~~ — `decorator_removal` operator (skip `@abstractmethod`, `@override`)
 - ~~**Exception handler mutation**~~ — `exception_type` operator: broaden to `except Exception:`
 - ~~**Zero-iteration loop**~~ — `loop_mutation` operator: `for x in items:`→`for x in []:`, `while cond:`→`while False:`
 - ~~**Return value replacement**~~ — `return_value` operator: `return x`→`return None`
 - ~~**Ternary branch swap**~~ — `ternary_swap` operator: `a if cond else b`→`b if cond else a`
 - ~~**String emptying**~~ — `string_emptying` operator: `"foo"`→`""`
 - ~~**Unary `+`↔`-`**~~ — `unary_swap` operator
+- ~~**Slice index removal**~~ — `slice_index_removal` operator: `x[1:3]`→`x[:3]`/`x[1:]`, three-part slices
 
 ### Remaining opportunities
 
-1. **Slice index removal** — `x[1:2:3]`→`x[:2:3]` (mutpy only, but Python-specific and high signal).
-2. **Condition→`true`/`false`** — `if cond:`→`if True:` / `if False:` (cosmic-ray, PIT, Stryker). Different from condition negation.
-3. **Constant replacement** (`42`→`0`, `0`→`1`, `c`→`-c`) — More aggressive than current `n+1`. May produce many equivalent mutants.
-4. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
-5. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
-6. **Regex mutation** — Applicable but complex. Would need a regex parser.
+1. **Decorator removal** — Remove `@decorator` individually (cosmic-ray, mutpy). Blocked: trampoline architecture skips decorated functions entirely. Requires architectural changes to support.
+2. **Constant replacement** (`42`→`0`, `0`→`1`, `c`→`-c`) — More aggressive than current `n+1`. May produce many equivalent mutants.
+3. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
+4. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
+5. **Regex mutation** — Applicable but complex. Would need a regex parser.
 
 ### Not applicable to Python
 
