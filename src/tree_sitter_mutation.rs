@@ -293,6 +293,7 @@ fn collect_node_mutations(
         "augmented_assignment" => add_augmented_assignment_mutations(node, source, fn_start, mutations),
         "if_statement" | "elif_clause" | "while_statement" => {
             add_condition_negation_statement(node, source, fn_start, mutations);
+            add_condition_replacement(node, source, fn_start, mutations);
             add_loop_mutation(node, source, fn_start, mutations);
         }
         "assert_statement" => add_condition_negation_assert(node, source, fn_start, mutations),
@@ -312,6 +313,7 @@ fn collect_node_mutations(
             add_ternary_swap_mutation(node, source, fn_start, mutations);
             add_condition_negation_ternary(node, source, fn_start, mutations);
         }
+        "subscript" => add_slice_index_removal(node, source, fn_start, mutations),
         _ => {}
     }
 
@@ -974,6 +976,131 @@ fn add_condition_negation_ternary(
     let condition_text = node_text(source, condition);
     let replacement = format!("not ({condition_text})");
     record_mutation(condition_text, &replacement, "condition_negation", condition.start_byte() - fn_start, mutations);
+}
+
+/// Replace condition with `True` and `False` (distinct from condition_negation).
+///
+/// Applied to `if`, `elif`, `while` (via field_name "condition").
+/// Skip if the condition is already a literal `True` or `False`.
+fn add_condition_replacement(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let Some(condition) = node.child_by_field_name("condition") else {
+        return;
+    };
+    let condition_text = node_text(source, condition);
+    let trimmed = condition_text.trim();
+    if trimmed != "True" {
+        record_mutation(
+            condition_text,
+            "True",
+            "condition_replacement",
+            condition.start_byte() - fn_start,
+            mutations,
+        );
+    }
+    if trimmed != "False" {
+        record_mutation(
+            condition_text,
+            "False",
+            "condition_replacement",
+            condition.start_byte() - fn_start,
+            mutations,
+        );
+    }
+}
+
+/// Remove individual indices from slice expressions.
+///
+/// `x[1:2:3]` → `x[:2:3]`, `x[1::3]`, `x[1:2:]`, etc.
+/// Only targets `slice` child nodes inside `subscript` nodes.
+fn add_slice_index_removal(
+    node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    // `subscript` has named children: the object and the subscript argument(s).
+    // For `x[1:2:3]`, the subscript's named children include a `slice` node.
+    // We need to find the slice child among the subscript's children.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "slice" {
+            add_slice_mutations(child, source, fn_start, mutations);
+        }
+    }
+}
+
+/// Mutate a `slice` node by removing its start, stop, or step individually.
+///
+/// tree-sitter-python slice node children:
+/// - The node text is like `1:2:3` (without the brackets)
+/// - Children are a mix of named expressions and `:` anonymous tokens
+///
+/// We reconstruct the slice by parsing out the colon-separated parts.
+fn add_slice_mutations(
+    slice_node: Node<'_>,
+    source: &str,
+    fn_start: usize,
+    mutations: &mut Vec<Mutation>,
+) {
+    let slice_text = node_text(source, slice_node);
+    // Split on colons, preserving structure: [start, stop] or [start, stop, step]
+    let parts: Vec<&str> = slice_text.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return; // not a real slice
+    }
+
+    let start = parts[0].trim();
+    let stop = parts[1].trim();
+    let step = parts.get(2).map(|s| s.trim()).unwrap_or("");
+    let has_step = parts.len() == 3;
+
+    // Remove start (if present): `1:2:3` → `:2:3`
+    if !start.is_empty() {
+        let replacement = if has_step {
+            format!(":{stop}:{step}")
+        } else {
+            format!(":{stop}")
+        };
+        record_mutation(
+            slice_text,
+            &replacement,
+            "slice_index_removal",
+            slice_node.start_byte() - fn_start,
+            mutations,
+        );
+    }
+
+    // Remove stop (if present): `1:2:3` → `1::3`
+    if !stop.is_empty() {
+        let replacement = if has_step {
+            format!("{start}::{step}")
+        } else {
+            format!("{start}:")
+        };
+        record_mutation(
+            slice_text,
+            &replacement,
+            "slice_index_removal",
+            slice_node.start_byte() - fn_start,
+            mutations,
+        );
+    }
+
+    // Remove step (if present): `1:2:3` → `1:2:`
+    if has_step && !step.is_empty() {
+        record_mutation(
+            slice_text,
+            &format!("{start}:{stop}:"),
+            "slice_index_removal",
+            slice_node.start_byte() - fn_start,
+            mutations,
+        );
+    }
 }
 
 fn add_arg_removal_mutations(
@@ -1771,6 +1898,174 @@ mod tests {
                     m.replacement
                 );
             }
+        }
+    }
+
+    // --- condition_replacement tests ---
+
+    #[test]
+    fn condition_replacement_if_produces_true_and_false() {
+        let source = "def f(x):\n    if x > 0:\n        return 1\n    return 0\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        assert_eq!(cond_muts.len(), 2, "if should produce True and False replacements");
+        assert!(cond_muts.iter().any(|m| m.replacement == "True"));
+        assert!(cond_muts.iter().any(|m| m.replacement == "False"));
+        for m in &cond_muts {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "condition_replacement must produce parseable Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn condition_replacement_while_produces_true_and_false() {
+        let source = "def f(items):\n    i = 0\n    while i < 10:\n        i += 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        assert_eq!(cond_muts.len(), 2);
+        assert!(cond_muts.iter().any(|m| m.replacement == "True"));
+        assert!(cond_muts.iter().any(|m| m.replacement == "False"));
+    }
+
+    #[test]
+    fn condition_replacement_skips_literal_true() {
+        let source = "def f():\n    if True:\n        return 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        // True is already the condition, so only False should be generated
+        assert_eq!(cond_muts.len(), 1);
+        assert_eq!(cond_muts[0].replacement, "False");
+    }
+
+    #[test]
+    fn condition_replacement_skips_literal_false() {
+        let source = "def f():\n    if False:\n        return 1\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        assert_eq!(cond_muts.len(), 1);
+        assert_eq!(cond_muts[0].replacement, "True");
+    }
+
+    #[test]
+    fn condition_replacement_elif() {
+        let source = "def f(x):\n    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n    return 0\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        // Both if and elif should get condition_replacement
+        let cond_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "condition_replacement")
+            .collect();
+        assert_eq!(cond_muts.len(), 4, "if + elif = 2 conditions × 2 replacements = 4");
+    }
+
+    // --- slice_index_removal tests ---
+
+    #[test]
+    fn slice_removal_basic_two_part() {
+        let source = "def f(items):\n    return items[1:3]\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        assert_eq!(slice_muts.len(), 2, "1:3 should produce [:3] and [1:]");
+        assert!(slice_muts.iter().any(|m| m.replacement == ":3"), "should have [:3]");
+        assert!(slice_muts.iter().any(|m| m.replacement == "1:"), "should have [1:]");
+        for m in &slice_muts {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn slice_removal_three_part() {
+        let source = "def f(items):\n    return items[1:5:2]\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        assert_eq!(slice_muts.len(), 3, "1:5:2 should produce [:5:2], [1::2], [1:5:]");
+        assert!(slice_muts.iter().any(|m| m.replacement == ":5:2"));
+        assert!(slice_muts.iter().any(|m| m.replacement == "1::2"));
+        assert!(slice_muts.iter().any(|m| m.replacement == "1:5:"));
+        for m in &slice_muts {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn slice_removal_skips_already_empty_parts() {
+        // x[:3] — start is already empty, only stop can be removed
+        let source = "def f(items):\n    return items[:3]\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        assert_eq!(slice_muts.len(), 1, "[:3] should only produce [:]");
+    }
+
+    #[test]
+    fn slice_removal_no_mutations_for_empty_slice() {
+        // x[:] — both parts already empty, nothing to remove
+        let source = "def f(items):\n    return items[:]\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        assert_eq!(slice_muts.len(), 0, "[:] has nothing to remove");
+    }
+
+    #[test]
+    fn slice_removal_negative_index() {
+        let source = "def f(items):\n    return items[-1:]\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        // -1: → only start can be removed (stop is already empty)
+        assert_eq!(slice_muts.len(), 1);
+        for m in &slice_muts {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_module(&mutated, None).is_ok(), "slice_index_removal must produce parseable Python:\n{mutated}");
         }
     }
 
