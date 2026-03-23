@@ -895,6 +895,15 @@ fn glob_match_bytes(s: &[u8], p: &[u8]) -> bool {
     }
 }
 
+/// Write `content` to `path`, creating parent directories as needed.
+fn write_file_with_parents(path: &Path, content: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 fn generate_mutants(
     paths_to_mutate: &Path,
     mutants_dir: &Path,
@@ -955,10 +964,7 @@ fn generate_mutants(
                 {
                     // Copy original for package integrity but skip mutation generation.
                     let dest = mutants_dir.join(rel_path);
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&dest, &source)?;
+                    write_file_with_parents(&dest, &source)?;
                     return Ok(None);
                 }
             }
@@ -970,10 +976,7 @@ fn generate_mutants(
                 if !filter.file_is_touched(repo_rel) {
                     // File unchanged: copy verbatim for package integrity, generate no mutants.
                     let dest = mutants_dir.join(rel_path);
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&dest, &source)?;
+                    write_file_with_parents(&dest, &source)?;
                     return Ok(None);
                 }
                 Some((filter, repo_rel.to_path_buf()))
@@ -992,10 +995,7 @@ fn generate_mutants(
 
                 // Write mutated file
                 let dest = mutants_dir.join(rel_path);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&dest, &mutated.source)?;
+                write_file_with_parents(&dest, &mutated.source)?;
 
                 // Write .meta stub
                 let meta_path = PathBuf::from(format!("{}.meta", dest.display()));
@@ -1014,10 +1014,7 @@ fn generate_mutants(
                 // in mutants/ (first on PYTHONPATH) but missing modules aren't
                 // there.
                 let dest = mutants_dir.join(rel_path);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&dest, &source)?;
+                write_file_with_parents(&dest, &source)?;
                 Ok(None)
             }
         })
@@ -1084,28 +1081,38 @@ fn path_to_module(rel_path: &Path) -> String {
     s.strip_suffix(".__init__").unwrap_or(&s).to_string()
 }
 
-async fn validate_clean_run(
+/// Output captured from a subprocess run by [`run_subprocess`].
+struct SubprocessOutput {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Spawn a Python subprocess, collect its stdout/stderr in background tasks,
+/// apply a timeout, and return the captured output.
+///
+/// `description` is used in error messages (e.g. "clean test validation").
+async fn run_subprocess(
     python: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
     project_dir: &Path,
-    pythonpath: &str,
-    mutants_dir: &Path,
-    tests_dir: &str,
-) -> Result<()> {
-    let mut child = tokio::process::Command::new(python)
-        .arg("-m")
-        .arg("pytest")
-        .arg("-x")
-        .arg("-q")
-        .arg("-p")
-        .arg("irradiate_harness")
-        .arg(tests_dir)
-        .env("PYTHONPATH", pythonpath)
-        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
+    timeout_secs: u64,
+    description: &str,
+) -> Result<SubprocessOutput> {
+    let mut cmd = tokio::process::Command::new(python);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    for (key, val) in envs {
+        cmd.env(key, val);
+    }
+    let mut child = cmd
         .current_dir(project_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("Failed to run clean test")?;
+        .with_context(|| format!("Failed to spawn {description} subprocess"))?;
 
     // Collect I/O in background tasks so we can still kill child on timeout.
     // (wait_with_output() moves child, making kill() impossible after timeout.)
@@ -1128,19 +1135,39 @@ async fn validate_clean_run(
         })
     };
 
-    let status = match tokio::time::timeout(
-        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
-        child.wait(),
-    )
-    .await
-    {
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(e)) => bail!("Clean test validation subprocess error: {e}"),
+        Ok(Err(e)) => bail!("{description} subprocess error: {e}"),
         Err(_) => {
             let _ = child.kill().await;
-            bail!("Clean test validation timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
+            bail!("{description} timed out after {timeout_secs}s — pytest may be hung");
         }
     };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
+
+    Ok(SubprocessOutput { exit_code, stdout, stderr })
+}
+
+async fn validate_clean_run(
+    python: &Path,
+    project_dir: &Path,
+    pythonpath: &str,
+    mutants_dir: &Path,
+    tests_dir: &str,
+) -> Result<()> {
+    let mutants_dir_str = mutants_dir.to_string_lossy();
+    let output = run_subprocess(
+        python,
+        &["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir],
+        &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
+        project_dir,
+        VALIDATION_TIMEOUT_SECS,
+        "clean test validation",
+    )
+    .await?;
 
     // Pytest exit codes:
     //   0 = all tests passed
@@ -1149,17 +1176,13 @@ async fn validate_clean_run(
     // Exit code 1 is expected for projects with pre-existing test failures.
     // The clean test validates that trampolining doesn't completely break
     // the project — pre-existing failures are OK.
-    let exit_code = status.code().unwrap_or(-1);
-    if exit_code > 1 {
-        let stdout_bytes = stdout_task.await.unwrap_or_default();
-        let stderr_bytes = stderr_task.await.unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
+    if output.exit_code > 1 {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("Clean test run failed:\n{stdout}\n{stderr}");
     }
-    if exit_code == 1 {
-        let stdout_bytes = stdout_task.await.unwrap_or_default();
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
+    if output.exit_code == 1 {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         eprintln!("Warning: some tests failed during clean test run (pre-existing failures)\n{stdout}");
     }
 
@@ -1173,63 +1196,24 @@ async fn validate_fail_run(
     mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<()> {
-    let mut child = tokio::process::Command::new(python)
-        .arg("-m")
-        .arg("pytest")
-        .arg("-x")
-        .arg("-q")
-        .arg("-p")
-        .arg("irradiate_harness")
-        .arg(tests_dir)
-        .env("PYTHONPATH", pythonpath)
-        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
-        .env("IRRADIATE_ACTIVE_MUTANT", "fail")
-        .current_dir(project_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to run forced-fail validation")?;
-
-    // Collect I/O in background tasks so we can still kill child on timeout.
-    let stdout_task = {
-        use tokio::io::AsyncReadExt;
-        let mut stream = child.stdout.take().unwrap();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    };
-    let stderr_task = {
-        use tokio::io::AsyncReadExt;
-        let mut stream = child.stderr.take().unwrap();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    };
-
-    let status = match tokio::time::timeout(
-        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
-        child.wait(),
+    let mutants_dir_str = mutants_dir.to_string_lossy();
+    let output = run_subprocess(
+        python,
+        &["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir],
+        &[
+            ("PYTHONPATH", pythonpath),
+            ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str),
+            ("IRRADIATE_ACTIVE_MUTANT", "fail"),
+        ],
+        project_dir,
+        VALIDATION_TIMEOUT_SECS,
+        "forced-fail validation",
     )
-    .await
-    {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => bail!("Forced-fail validation subprocess error: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("Forced-fail validation timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
-        }
-    };
+    .await?;
 
-    let stdout_bytes = stdout_task.await.unwrap_or_default();
-    let stderr_bytes = stderr_task.await.unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
-    let exit_code = status.code().unwrap_or(-1);
-    match exit_code {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.exit_code {
         0 => bail!(
             "Forced-fail validation failed: tests passed when they should have failed.\n\
              The trampoline may not be wired correctly.\n\n\
@@ -1251,58 +1235,18 @@ async fn discover_tests(
     mutants_dir: &Path,
     tests_dir: &str,
 ) -> Result<Vec<String>> {
-    let mut child = tokio::process::Command::new(python)
-        .arg("-m")
-        .arg("pytest")
-        .arg("--collect-only")
-        .arg("-q")
-        .arg("-p")
-        .arg("irradiate_harness")
-        .arg(tests_dir)
-        .env("PYTHONPATH", pythonpath)
-        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
-        .current_dir(project_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to collect tests")?;
-
-    // Collect stdout in background task so we can still kill child on timeout.
-    let stdout_task = {
-        use tokio::io::AsyncReadExt;
-        let mut stream = child.stdout.take().unwrap();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    };
-    // Drain stderr to avoid blocking the subprocess on a full pipe buffer.
-    let _stderr_task = {
-        use tokio::io::AsyncReadExt;
-        let mut stream = child.stderr.take().unwrap();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.ok();
-        })
-    };
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(VALIDATION_TIMEOUT_SECS),
-        child.wait(),
+    let mutants_dir_str = mutants_dir.to_string_lossy();
+    let output = run_subprocess(
+        python,
+        &["-m", "pytest", "--collect-only", "-q", "-p", "irradiate_harness", tests_dir],
+        &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
+        project_dir,
+        VALIDATION_TIMEOUT_SECS,
+        "test discovery",
     )
-    .await
-    {
-        Ok(Ok(_status)) => {}
-        Ok(Err(e)) => bail!("Test discovery subprocess error: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("Test discovery timed out after {VALIDATION_TIMEOUT_SECS}s — pytest may be hung");
-        }
-    }
+    .await?;
 
-    let stdout_bytes = stdout_task.await.unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let tests: Vec<String> = stdout
         .lines()
         .filter(|line| line.contains("::"))
