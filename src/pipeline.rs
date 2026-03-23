@@ -985,15 +985,53 @@ fn generate_mutants(
     //   e.g. paths_to_mutate="src/click", file="src/click/types.py"
     //        strip "src/" → rel_path="click/types.py" → mutants/click/types.py  ✓
     //
+    // When paths_to_mutate is a single file, strip its parent directory.
+    //   e.g. paths_to_mutate="src/hive/config.py"
+    //        strip "src/hive/" → rel_path="config.py" → mutants/config.py
+    //
     // When paths_to_mutate is a source root (no __init__.py), we strip it
     // directly — current behaviour preserved.
     //   e.g. paths_to_mutate="src", file="src/simple_lib/__init__.py"
     //        strip "src/" → rel_path="simple_lib/__init__.py"  ✓
-    let strip_base = if paths_to_mutate.join("__init__.py").exists() {
+    let strip_base = if paths_to_mutate.is_file() {
+        // For single files, find the outermost package boundary by walking up
+        // from the file's directory while __init__.py exists.
+        let mut base = paths_to_mutate.parent().unwrap_or(paths_to_mutate);
+        while base.join("__init__.py").exists() {
+            base = match base.parent() {
+                Some(p) => p,
+                None => break,
+            };
+        }
+        base
+    } else if paths_to_mutate.join("__init__.py").exists() {
         paths_to_mutate.parent().unwrap_or(paths_to_mutate)
     } else {
         paths_to_mutate
     };
+
+    // When mutating a single file, copy all sibling package files to mutants/
+    // for import integrity. Without this, the import hook intercepts the package
+    // but can't find sibling modules (e.g., hive.db when only hive.config is mutated).
+    if paths_to_mutate.is_file() {
+        let package_root = if paths_to_mutate.parent().unwrap_or(paths_to_mutate) != strip_base {
+            // strip_base is above the file's directory — walk from strip_base
+            strip_base
+        } else {
+            paths_to_mutate.parent().unwrap_or(paths_to_mutate)
+        };
+        let siblings = find_python_files(package_root)?;
+        for sibling in &siblings {
+            if sibling == paths_to_mutate {
+                continue; // skip the target file — it'll be mutated below
+            }
+            if let Ok(rel) = sibling.strip_prefix(strip_base) {
+                let dest = mutants_dir.join(rel);
+                let content = std::fs::read_to_string(sibling)?;
+                write_file_with_parents(&dest, &content)?;
+            }
+        }
+    }
 
     // Compute project root for do_not_mutate path matching (relative to cwd).
     let cwd = std::env::current_dir()?;
