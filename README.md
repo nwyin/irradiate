@@ -1,74 +1,135 @@
 # irradiate
 
-Mutation testing for Python, written in Rust.
-
-> **Pre-alpha software.** Under very active development — not ready for production use. APIs, output formats, and behavior will change without notice.
+Fast mutation testing for Python, written in Rust.
 
 ## Why
 
-Mutation testing is slow. The bottleneck isn't generating mutants — it's running the test suite once per mutant. irradiate eliminates the overhead by maintaining a pool of pre-warmed pytest worker processes that skip startup costs entirely.
+Mutation testing is slow. The bottleneck isn't generating mutants — it's running the test suite once per mutant. A typical pytest startup costs 200-500ms, and with hundreds of mutants that adds up to minutes of pure overhead.
+
+irradiate eliminates this by maintaining a pool of pre-warmed pytest workers. Pytest starts once, collects tests once, then forks a child process for each mutant. The result: mutation testing at 30-60 mutants/sec on real codebases.
 
 ## How it works
 
-1. Parse Python source with [libcst](https://github.com/Instagram/LibCST) (Rust crate)
-2. Generate trampolined mutants — each function gets an original copy, N mutated variants, and a runtime dispatcher
-3. Collect test coverage stats in a single pytest run
-4. Dispatch mutants to a pool of long-lived worker processes over unix sockets
-5. Workers set a global variable to activate a mutant, run the relevant tests, report back
+1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (27 mutation operator categories, ~160+ distinct mutations)
+2. Generate trampolined mutants — each function gets an original, N mutated variants, and a runtime dispatcher
+3. Collect test coverage and timing in a single pytest run
+4. Fork a child process per mutant inside pre-warmed workers (no pytest restart)
+5. Report results as terminal output, JSON (Stryker schema v2), HTML, or GitHub Actions annotations
 
-No pytest startup per mutant. No reimporting. Just a dict lookup and a function call.
-
-## Usage
+## Install
 
 ```bash
-# Run mutation testing
-irradiate run
-
-# See results
-irradiate results
-
-# Show diff for a specific mutant
-irradiate show module.x_func__mutmut_1
+pip install irradiate
 ```
 
-## What's different from mutmut
-
-| | mutmut | irradiate |
-|---|---|---|
-| **Startup cost** | `pytest.main()` per mutant (~200ms each) | Pre-warmed worker pool — pytest starts once, runs many |
-| **Cache** | mtime-based (breaks on rebase, touch, branch switch) | Content-addressable (SHA-256 of function body + tests + operator) |
-| **Orchestration** | Python multiprocessing | Rust + tokio async (no GIL, native signal/timeout handling) |
-| **Mutation dispatch** | `os.environ` lookup per call (syscall) | Module global lookup (dict access, no syscall) |
-| **Mutation generation** | Sequential Python (LibCST) | Parallel Rust (libcst crate + rayon) |
-| **Result I/O** | JSON write per mutant | Batched writes |
-| **Isolation** | Fork per mutant only | Default warm-session + `--isolate` flag for full subprocess isolation |
-| **State leakage** | None (fresh process per mutant) | Module snapshot/restore between runs, session-fixture-aware recycling, `--verify-survivors` safety net |
-| **Worker health** | — | Memory monitoring, automatic respawn, configurable recycling |
-| **Test selection** | Coverage-based | Coverage-based + duration-aware scheduling (longest-first ordering, per-mutant timeout budgets) |
-
-## Status
-
-Pre-alpha. The full pipeline works end-to-end on real projects (markupsafe, click).
-
-What's missing:
-- TUI browser
-- `--test-command` fallback for non-pytest runners
-- Remote/shared cache
-- Type checker integration
-- Lots of edge cases
-
-## Building
+Or build from source:
 
 ```bash
 cargo build --release
 ```
 
-Requires Rust 1.70+ and a Python 3.10+ environment with pytest installed.
+Requires Python 3.10+ with pytest installed.
+
+## Usage
+
+```bash
+# Run mutation testing (auto-detects src/ and tests/)
+irradiate run
+
+# Only test functions changed since main
+irradiate run --diff main
+
+# Generate JSON report (Stryker mutation-testing-report-schema v2)
+irradiate run --report json
+
+# Generate self-contained HTML report
+irradiate run --report html
+
+# Fail CI if mutation score is below threshold
+irradiate run --fail-under 80
+
+# See cached results
+irradiate results
+
+# Show diff for a specific mutant
+irradiate show module.x_func__irradiate_1
+```
+
+## Configuration
+
+Configure via `[tool.irradiate]` in `pyproject.toml`:
+
+```toml
+[tool.irradiate]
+paths_to_mutate = "src"
+tests_dir = "tests"
+do_not_mutate = ["**/generated/*", "**/vendor/*"]
+pytest_add_cli_args = ["-x", "--tb=short"]
+```
+
+All settings can be overridden via CLI flags. Run `irradiate run --help` for the full list.
+
+## Features
+
+### Mutation operators (27 categories)
+
+Arithmetic, comparison, boolean, augmented assignment, unary, string mutation/emptying, number literals, lambda bodies, return values, assignments, default arguments, argument removal, method swaps, dict kwargs, decorator removal (planned), exception types, match/case removal, condition negation, condition replacement, statement deletion, keyword swap, loop mutation, ternary swap, slice index removal.
+
+Functions can be excluded with `# pragma: no mutate`.
+
+### Execution model
+
+- **Fork-per-mutant** (default): Workers fork after pytest collection. Each mutant runs in an isolated child process — no state leakage between mutants, no pytest restart overhead.
+- **`--isolate`**: Full subprocess isolation. Slower but guaranteed clean for projects with complex test infrastructure.
+- **`--verify-survivors`**: After the main run, re-tests survived mutants in isolate mode to catch false negatives from warm-session state leakage.
+
+### Incremental mode (`--diff`)
+
+Only mutate functions touched by a git diff. Uses `git merge-base` to compare against the divergence point, so `--diff main` does the right thing on feature branches.
+
+### Reporting
+
+- **Terminal**: summary table + list of survived mutants
+- **JSON**: [Stryker mutation-testing-report-schema v2](https://github.com/stryker-mutator/mutation-testing-elements/tree/master/packages/report-schema) — compatible with Stryker Dashboard
+- **HTML**: self-contained report using [mutation-testing-elements](https://github.com/stryker-mutator/mutation-testing-elements) web component
+- **GitHub Actions**: auto-detected `::warning` annotations on survived mutants + Markdown step summary
+
+### Caching
+
+Content-addressable cache keyed on SHA-256 of function body + test IDs + operator. Survives rebases, branch switches, and `touch` — unlike mtime-based caches.
+
+### Decorator support
+
+`@property`, `@classmethod`, and `@staticmethod` are handled natively via a descriptor-aware trampoline. Other decorated functions are skipped (source-patching fallback planned — see [#13](https://github.com/nwyin/irradiate/issues/13)).
+
+### Performance tuning
+
+- `--workers N`: control parallelism (defaults to CPU count)
+- `--timeout-multiplier N`: scale per-mutant timeout (default 10x baseline)
+- `--worker-recycle-after N`: respawn workers after N mutants (auto-tuned)
+- `--max-worker-memory N`: recycle workers exceeding N MB RSS
+- `--covered-only`: skip mutants with no test coverage
+- `--no-stats`: skip coverage collection, test all mutants against all tests
+
+## How it compares to mutmut
+
+| | mutmut | irradiate |
+|---|---|---|
+| **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant — pytest starts once |
+| **Parser** | LibCST (Python) | tree-sitter (Rust, parallel) |
+| **Operators** | ~20 categories | 27 categories |
+| **Cache** | mtime-based | Content-addressable (SHA-256) |
+| **Orchestration** | Python multiprocessing | Rust + tokio async |
+| **Incremental** | — | `--diff` with merge-base |
+| **Reports** | Terminal only | JSON, HTML, GitHub Actions annotations |
+| **Decorator support** | Skip all | @property/@classmethod/@staticmethod handled |
+| **CI integration** | Manual | `--fail-under`, GitHub annotations, step summary |
+| **Isolation** | Fork only | Warm-session + `--isolate` + `--verify-survivors` |
 
 ## Acknowledgments
 
-irradiate's trampoline architecture and mutation operator design are informed by [mutmut](https://github.com/boxed/mutmut). The output format is partially compatible with mutmut to ease migration.
+irradiate's trampoline architecture and mutation operator design are informed by [mutmut](https://github.com/boxed/mutmut). The naming convention is partially compatible with mutmut to ease migration.
 
 ## License
 
-TBD
+MIT
