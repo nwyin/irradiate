@@ -121,6 +121,12 @@ pub fn mutate_file(
     // so the final append loop can skip them.
     let mut emitted_inline: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // Buffer for decorator lines. When we encounter @decorator lines, we buffer them
+    // instead of emitting immediately. If the following `def` is trampolined, we discard
+    // the buffered decorators (the trampoline provides its own decorator_prefix).
+    // If the `def` is not trampolined, we flush the buffer to output.
+    let mut decorator_buffer: Vec<String> = Vec::new();
+
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
@@ -133,8 +139,19 @@ pub fn mutate_file(
             }
         }
 
+        // Buffer decorator lines — they might belong to a trampolined function.
+        if trimmed.starts_with('@') {
+            decorator_buffer.push(format!("{line}\n"));
+            i += 1;
+            continue;
+        }
+
         // Detect class definitions.
         if trimmed.starts_with("class ") && trimmed.contains(':') {
+            // Flush any buffered decorators (class decorators are passthrough).
+            for dec_line in decorator_buffer.drain(..) {
+                output.push_str(&dec_line);
+            }
             if let Some(class_name) = extract_class_name(trimmed) {
                 current_class = Some((class_name.to_string(), indent));
             }
@@ -150,6 +167,9 @@ pub fn mutate_file(
 
         if !func_name.is_empty() {
             if let Some(idx) = find_trampoline_idx(&function_mutations, class_key, func_name) {
+                // Discard buffered decorator lines — the trampoline provides its own.
+                decorator_buffer.clear();
+
                 // Strip the entire function signature + body.
                 let func_indent = indent;
 
@@ -189,10 +209,15 @@ pub fn mutate_file(
                     i += 1;
                 }
 
-                // For class methods: emit the wrapper inline, indented to the method's level,
-                // then also emit module_code (orig, variants, dict) inside the class body.
+                // For class methods: emit the decorator prefix (e.g. @property) + wrapper
+                // inline, indented to the method's level, then module_code (orig, variants, dict).
                 // This keeps the __class__ cell intact so super() works correctly.
                 if class_key.is_some() {
+                    let dec_prefix = &trampolines[idx].decorator_prefix;
+                    if !dec_prefix.is_empty() {
+                        output.push_str(&indent_code(dec_prefix.trim_end(), func_indent));
+                        output.push('\n');
+                    }
                     let wrapper = &trampolines[idx].wrapper_code;
                     let indented = indent_code(wrapper, func_indent);
                     output.push_str(&indented);
@@ -202,20 +227,25 @@ pub fn mutate_file(
                     output.push('\n');
                 } else {
                     // For top-level functions: emit module_code (orig, variants, dict) FIRST,
-                    // then wrapper_code, both inline at the original def position.
-                    //
-                    // This is necessary because module-level statements that call the wrapper
-                    // execute at import time. When the wrapper body runs it immediately
-                    // dereferences x_func__irradiate_orig (from module_code). If module_code
-                    // were deferred to EOF those names would be undefined → NameError.
+                    // then decorator_prefix + wrapper_code, both inline at the original def position.
                     output.push_str(&trampolines[idx].module_code);
                     output.push('\n');
+                    let dec_prefix = &trampolines[idx].decorator_prefix;
+                    if !dec_prefix.is_empty() {
+                        output.push_str(dec_prefix);
+                    }
                     output.push_str(&trampolines[idx].wrapper_code);
                     output.push('\n');
                     emitted_inline.insert(idx);
                 }
                 continue;
             }
+        }
+
+        // Non-decorator, non-def line: flush any buffered decorators first.
+        // This handles cases like `@decorator` followed by non-function code.
+        for dec_line in decorator_buffer.drain(..) {
+            output.push_str(&dec_line);
         }
 
         output.push_str(line);
@@ -1380,6 +1410,89 @@ CACHED = make_cached_stream_func(42)
         assert!(
             wrapper_pos < call_pos,
             "wrapper (line {wrapper_pos}) must appear before module-level call (line {call_pos})\n{}",
+            result.source
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Descriptor decorator tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_classmethod_wrapper_has_decorator() {
+        let source = concat!(
+            "class Foo:\n",
+            "    @classmethod\n",
+            "    def make(cls, n):\n",
+            "        return n + 1\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should produce mutations");
+        assert!(
+            result.source.contains("@classmethod"),
+            "output must contain @classmethod decorator on wrapper;\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("cls."),
+            "output must use cls. prefix for dispatch;\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_staticmethod_wrapper_has_decorator() {
+        let source = concat!(
+            "class Foo:\n",
+            "    @staticmethod\n",
+            "    def helper(x):\n",
+            "        return x + 1\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should produce mutations");
+        assert!(
+            result.source.contains("@staticmethod"),
+            "output must contain @staticmethod decorator on wrapper;\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_property_wrapper_has_decorator() {
+        let source = concat!(
+            "class Foo:\n",
+            "    @property\n",
+            "    def name(self):\n",
+            "        return self._name\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should produce mutations");
+        assert!(
+            result.source.contains("@property"),
+            "output must contain @property decorator on wrapper;\n{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn test_non_descriptor_decorator_still_skipped() {
+        let source = concat!(
+            "class Foo:\n",
+            "    @cache\n",
+            "    def compute(self):\n",
+            "        return 1 + 2\n",
+            "\n",
+            "    def plain(self, v):\n",
+            "        return v + 1\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should produce mutations from plain");
+        // @cache method should not be trampolined.
+        assert!(
+            !result.source.contains("compute__irradiate"),
+            "non-descriptor decorated method must not be trampolined;\n{}",
+            result.source
+        );
+        // plain method should be trampolined.
+        assert!(
+            result.source.contains("plain__irradiate"),
+            "undecorated method must be trampolined;\n{}",
             result.source
         );
     }

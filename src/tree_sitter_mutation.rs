@@ -8,7 +8,7 @@
 //! - Functions with `nonlocal` anywhere in their subtree are skipped (scope chain breaks on extract).
 //! - `len` and `isinstance` calls are not arg_removal-mutated (they're trivially killed / noisy).
 
-use crate::mutation::{FunctionMutations, Mutation};
+use crate::mutation::{DescriptorDecorator, FunctionMutations, Mutation};
 use tree_sitter::{Node, Parser, Tree};
 
 const NEVER_MUTATE_FUNCTIONS: &[&str] = &["__getattribute__", "__setattr__", "__new__"];
@@ -109,7 +109,7 @@ pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations
     for child in root.named_children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                if let Some(fm) = collect_function_mutations(child, None, source, &ignored_lines) {
+                if let Some(fm) = collect_function_mutations(child, None, source, &ignored_lines, None) {
                     results.push(fm);
                 }
             }
@@ -117,7 +117,7 @@ pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations
                 collect_class_methods(child, source, &ignored_lines, &mut results);
             }
             "decorated_definition" => {
-                // Match the libcst collector: skip decorated definitions entirely.
+                collect_decorated_definition(child, None, source, &ignored_lines, &mut results);
             }
             _ => {}
         }
@@ -160,12 +160,18 @@ fn collect_class_methods(
 
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
-        if child.kind() == "function_definition" {
-            if let Some(fm) =
-                collect_function_mutations(child, Some(class_name.as_str()), source, ignored_lines)
-            {
-                results.push(fm);
+        match child.kind() {
+            "function_definition" => {
+                if let Some(fm) =
+                    collect_function_mutations(child, Some(class_name.as_str()), source, ignored_lines, None)
+                {
+                    results.push(fm);
+                }
             }
+            "decorated_definition" => {
+                collect_decorated_definition(child, Some(class_name.as_str()), source, ignored_lines, results);
+            }
+            _ => {}
         }
     }
 }
@@ -187,11 +193,76 @@ fn is_enum_subclass(class_node: Node<'_>, source: &str) -> bool {
     false
 }
 
+/// Descriptor decorator names that the trampoline can handle.
+const DESCRIPTOR_DECORATORS: &[(&str, DescriptorDecorator)] = &[
+    ("property", DescriptorDecorator::Property),
+    ("classmethod", DescriptorDecorator::ClassMethod),
+    ("staticmethod", DescriptorDecorator::StaticMethod),
+];
+
+/// Handle a `decorated_definition` node.
+///
+/// If the decorators are exclusively descriptor decorators (@property, @classmethod,
+/// @staticmethod), collect mutations from the inner function definition. Otherwise
+/// skip the entire decorated definition (registration/caching decorators can't be
+/// trampolined safely).
+fn collect_decorated_definition(
+    decorated_node: Node<'_>,
+    class_name: Option<&str>,
+    source: &str,
+    ignored_lines: &std::collections::HashSet<usize>,
+    results: &mut Vec<FunctionMutations>,
+) {
+    // Find the inner definition (function_definition or class_definition).
+    let Some(definition) = decorated_node.child_by_field_name("definition") else {
+        return;
+    };
+    // Only handle decorated functions, not decorated classes.
+    if definition.kind() != "function_definition" {
+        return;
+    }
+
+    // Collect all decorator names. If any is not a known descriptor decorator, skip.
+    let mut descriptor_kind: Option<DescriptorDecorator> = None;
+    let mut cursor = decorated_node.walk();
+    for child in decorated_node.children(&mut cursor) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+        // The decorator node's text is `@name` or `@name(args)`.
+        // Get the first named child which is the decorator expression.
+        let Some(expr) = child.named_children(&mut child.walk()).next() else {
+            return; // can't parse decorator, skip
+        };
+        let dec_text = node_text(source, expr);
+        // Only bare names — `@property`, not `@property.setter` or `@functools.cache`.
+        if let Some((_, kind)) = DESCRIPTOR_DECORATORS.iter().find(|(name, _)| *name == dec_text) {
+            // If we see multiple descriptor decorators (e.g., @property + @classmethod),
+            // that's invalid Python but we take the first one.
+            if descriptor_kind.is_none() {
+                descriptor_kind = Some(*kind);
+            }
+        } else {
+            // Non-descriptor decorator found — skip this function entirely.
+            return;
+        }
+    }
+
+    let Some(kind) = descriptor_kind else {
+        return; // no decorators found (shouldn't happen for decorated_definition)
+    };
+
+    if let Some(fm) = collect_function_mutations(definition, class_name, source, ignored_lines, Some(kind)) {
+        results.push(fm);
+    }
+}
+
 fn collect_function_mutations(
     function_node: Node<'_>,
     class_name: Option<&str>,
     source: &str,
     ignored_lines: &std::collections::HashSet<usize>,
+    descriptor_decorator: Option<DescriptorDecorator>,
 ) -> Option<FunctionMutations> {
     let name_node = function_node.child_by_field_name("name")?;
     let name = node_text(source, name_node).to_string();
@@ -262,6 +333,7 @@ fn collect_function_mutations(
         start_line,
         end_line,
         byte_offset: fn_start,
+        descriptor_decorator,
     })
 }
 

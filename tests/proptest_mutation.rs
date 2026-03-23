@@ -1497,10 +1497,12 @@ proptest! {
     }
 }
 
+const DESCRIPTOR_DECORATOR_NAMES: &[&str] = &["property", "classmethod", "staticmethod"];
+
 /// Generate Python functions with 0–3 decorators from a fixed set.
 ///
-/// Decorated functions are entirely skipped (matching mutmut behavior).
-/// This strategy generates functions with 0..3 decorators to verify the skip.
+/// Descriptor decorators (@property, @classmethod, @staticmethod) are handled
+/// by the descriptor-aware trampoline. Other decorators cause functions to be skipped.
 fn decorator_strategy() -> impl Strategy<Value = String> {
     let n_decorators = 0usize..=3usize;
     let decorator_names = prop::sample::select(vec![
@@ -1515,22 +1517,32 @@ fn decorator_strategy() -> impl Strategy<Value = String> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
-    /// Decorated functions produce zero mutations (blanket skip).
-    /// Undecorated functions still produce mutations.
+    /// Descriptor-decorated functions produce mutations. Non-descriptor decorated
+    /// functions are skipped. Undecorated functions always produce mutations.
     #[test]
-    fn decorated_functions_skipped_entirely(source in decorator_strategy()) {
+    fn decorated_functions_handled_correctly(source in decorator_strategy()) {
         let fms = collect_file_mutations(&source);
-        let has_decorator = source.lines().any(|l| l.trim().starts_with('@'));
-        if has_decorator {
+        let decorators: Vec<&str> = source.lines()
+            .filter(|l| l.trim().starts_with('@'))
+            .map(|l| l.trim().trim_start_matches('@'))
+            .collect();
+
+        if decorators.is_empty() {
             prop_assert!(
-                fms.is_empty(),
-                "decorated function must produce no mutations; source:\n{}",
+                !fms.is_empty(),
+                "undecorated function must produce mutations; source:\n{}",
+                source
+            );
+        } else if decorators.iter().all(|d| DESCRIPTOR_DECORATOR_NAMES.contains(d)) {
+            prop_assert!(
+                !fms.is_empty(),
+                "descriptor-decorated function must produce mutations; source:\n{}",
                 source
             );
         } else {
             prop_assert!(
-                !fms.is_empty(),
-                "undecorated function must produce mutations; source:\n{}",
+                fms.is_empty(),
+                "non-descriptor decorated function must produce no mutations; source:\n{}",
                 source
             );
         }

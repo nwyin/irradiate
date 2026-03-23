@@ -1,7 +1,7 @@
 //! Trampoline code generation: takes function mutations and produces
 //! the trampolined output (orig + variants + lookup dict + wrapper).
 
-use crate::mutation::{apply_mutation, FunctionMutations};
+use crate::mutation::{apply_mutation, DescriptorDecorator, FunctionMutations};
 
 /// Unicode separator for class method name mangling (same as mutmut).
 const CLASS_SEPARATOR: &str = "\u{01C1}"; // ǁ
@@ -26,6 +26,9 @@ pub struct TrampolineOutput {
     pub wrapper_code: String,
     /// Mutant keys like "module.x_func__irradiate_1".
     pub mutant_keys: Vec<String>,
+    /// If the original function had a descriptor decorator, this is the decorator
+    /// line (e.g. "@property\n") that must be emitted before the wrapper.
+    pub decorator_prefix: String,
 }
 
 /// Generate the full trampolined output for a single function.
@@ -63,13 +66,17 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     module_lines.push(format!("{orig_name}.__name__ = '{mangled}'"));
 
     // Trampoline wrapper with original name and signature.
-    // Since all decorated functions are skipped, only two cases remain:
-    //   - Regular instance method: pass self; look up via _type(self). for MRO-correct access.
-    //   - Top-level function: bare names are in module scope, no implicit first arg.
-    let (self_arg, has_self, lookup_prefix) = if fm.class_name.is_some() {
-        ("self", true, "_type(self).".to_string())
-    } else {
-        ("None", false, String::new())
+    // The calling convention depends on the descriptor decorator:
+    //   - Regular instance method:  pass self; look up via _type(self). for MRO-correct access.
+    //   - @classmethod:             pass cls; look up via cls.
+    //   - @staticmethod:            pass None; look up via ClassName.
+    //   - @property:                pass self; look up via _type(self). (same as instance method)
+    //   - Top-level function:       pass None; bare names in module scope.
+    let (self_arg, has_self, lookup_prefix) = match (fm.class_name.as_deref(), fm.descriptor_decorator) {
+        (Some(_), Some(DescriptorDecorator::ClassMethod)) => ("cls", true, "cls.".to_string()),
+        (Some(cls), Some(DescriptorDecorator::StaticMethod)) => ("None", false, format!("{cls}.")),
+        (Some(_), _) => ("self", true, "_type(self).".to_string()), // instance method or @property
+        (None, _) => ("None", false, String::new()), // top-level function
     };
     let params_text = &fm.params_source;
     let wrapper_code = generate_wrapper_function(
@@ -84,10 +91,18 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
         &fm.return_annotation,
     );
 
+    let decorator_prefix = match fm.descriptor_decorator {
+        Some(DescriptorDecorator::Property) => "@property\n".to_string(),
+        Some(DescriptorDecorator::ClassMethod) => "@classmethod\n".to_string(),
+        Some(DescriptorDecorator::StaticMethod) => "@staticmethod\n".to_string(),
+        None => String::new(),
+    };
+
     TrampolineOutput {
         module_code: module_lines.join("\n"),
         wrapper_code,
         mutant_keys,
+        decorator_prefix,
     }
 }
 
@@ -802,11 +817,8 @@ mod tests {
 
     // INV-1: Any function with one or more decorators produces NO mutations.
     #[test]
-    fn test_any_decorator_skips_function() {
+    fn test_non_descriptor_decorator_skips_function() {
         let cases = [
-            "@property\ndef x(self):\n    return self._x\n",
-            "@classmethod\ndef make(cls):\n    return 1 + 2\n",
-            "@staticmethod\ndef helper():\n    return 1 + 2\n",
             "@contextmanager\ndef ctx():\n    yield 1 + 2\n",
             "@custom_decorator\ndef qux(a, b):\n    return a + b\n",
         ];
@@ -814,7 +826,24 @@ mod tests {
             let fms = collect_file_mutations(source);
             assert!(
                 fms.is_empty(),
-                "decorated function must produce no mutations; source:\n{source}\ngot: {fms:?}"
+                "non-descriptor decorated function must produce no mutations; source:\n{source}\ngot: {fms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_descriptor_decorator_collected() {
+        // Descriptor decorators on class methods should produce mutations.
+        let cases = [
+            "class C:\n    @property\n    def x(self):\n        return self._x\n",
+            "class C:\n    @classmethod\n    def make(cls):\n        return 1 + 2\n",
+            "class C:\n    @staticmethod\n    def helper():\n        return 1 + 2\n",
+        ];
+        for source in &cases {
+            let fms = collect_file_mutations(source);
+            assert!(
+                !fms.is_empty(),
+                "descriptor-decorated function must produce mutations; source:\n{source}"
             );
         }
     }
@@ -848,9 +877,63 @@ mod tests {
             "        return v + 1\n",
         );
         let fms = collect_file_mutations(source);
-        // Only `plain` should be collected — `make` has @classmethod
-        assert!(fms.iter().all(|fm| fm.name == "plain"), "only undecorated method must be collected; got: {fms:?}");
-        assert!(!fms.is_empty(), "plain method must produce mutations");
+        // Both should be collected — @classmethod is a descriptor decorator.
+        assert_eq!(fms.len(), 2, "both classmethod and plain method should produce mutations; got: {fms:?}");
+    }
+
+    // INV-3a: @classmethod wrapper uses cls. prefix and passes cls.
+    #[test]
+    fn test_classmethod_wrapper_uses_cls_prefix() {
+        let source = "class Foo:\n    @classmethod\n    def make(cls, n):\n        return n + 1\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "make").expect("should find make");
+        let output = generate_trampoline(fm, "mod");
+        assert!(
+            output.wrapper_code.contains("cls."),
+            "@classmethod wrapper must use cls. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains(", cls)"),
+            "@classmethod wrapper must pass cls to trampoline; got:\n{}",
+            output.wrapper_code
+        );
+        assert_eq!(output.decorator_prefix, "@classmethod\n");
+    }
+
+    // INV-3b: @staticmethod wrapper uses ClassName. prefix and passes None.
+    #[test]
+    fn test_staticmethod_wrapper_uses_classname_prefix() {
+        let source = "class Foo:\n    @staticmethod\n    def helper(x):\n        return x + 1\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "helper").expect("should find helper");
+        let output = generate_trampoline(fm, "mod");
+        assert!(
+            output.wrapper_code.contains("Foo."),
+            "@staticmethod wrapper must use ClassName. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains(", None)"),
+            "@staticmethod wrapper must pass None (no self/cls); got:\n{}",
+            output.wrapper_code
+        );
+        assert_eq!(output.decorator_prefix, "@staticmethod\n");
+    }
+
+    // INV-3c: @property wrapper uses _type(self). prefix (same as instance method).
+    #[test]
+    fn test_property_wrapper_uses_type_self_prefix() {
+        let source = "class Foo:\n    @property\n    def name(self):\n        return self._name\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "name").expect("should find name");
+        let output = generate_trampoline(fm, "mod");
+        assert!(
+            output.wrapper_code.contains("_type(self)."),
+            "@property wrapper must use _type(self). prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert_eq!(output.decorator_prefix, "@property\n");
     }
 
     // INV-3: Instance method without decorator uses _type(self). prefix (regression check).
@@ -875,6 +958,11 @@ mod tests {
     // Failure mode: file with only decorated functions produces empty mutation list (no crash).
     #[test]
     fn test_all_decorated_file_no_crash() {
+        // Top-level @property/@classmethod without a class context — these are unusual
+        // but shouldn't crash. They won't be collected as descriptor decorators because
+        // they're top-level (no class_name), and our descriptor handling only applies
+        // within class bodies. At top level, decorated_definition is checked and the
+        // function is collected if it has only descriptor decorators.
         let source = concat!(
             "@property\n",
             "def foo(self):\n",
@@ -884,8 +972,9 @@ mod tests {
             "def bar(cls):\n",
             "    return 1\n",
         );
+        // Top-level descriptor-decorated functions are collected (unusual but valid).
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty(), "file with only decorated functions must produce empty list");
+        assert!(!fms.is_empty(), "top-level descriptor-decorated functions should be collected");
     }
 
     // ─────────────────────────────────────────────────────────────────

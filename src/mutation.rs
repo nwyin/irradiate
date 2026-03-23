@@ -19,6 +19,17 @@ pub struct Mutation {
     pub operator: &'static str,
 }
 
+/// Descriptor decorators that irradiate can trampoline through.
+///
+/// These three stdlib decorators only change the calling convention — they have
+/// no definition-time side effects and their semantics are completely predictable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorDecorator {
+    Property,
+    ClassMethod,
+    StaticMethod,
+}
+
 /// Information about a function and its mutations.
 #[derive(Debug, Clone)]
 pub struct FunctionMutations {
@@ -47,6 +58,9 @@ pub struct FunctionMutations {
     /// Combined with `Mutation.start` (byte offset within the function source),
     /// gives the absolute byte position in the file: `byte_offset + mutation.start`.
     pub byte_offset: usize,
+    /// If this function has a descriptor decorator (@property, @classmethod, @staticmethod),
+    /// store which kind so the trampoline can generate the correct wrapper.
+    pub descriptor_decorator: Option<DescriptorDecorator>,
 }
 
 /// Collect all function mutations from a Python source file.
@@ -3095,12 +3109,11 @@ mod return_value_tests {
     // =====================================================================
     // INV-1: Any decorated function produces NO mutations (blanket skip).
     #[test]
-    fn test_any_decorated_function_skipped() {
+    fn test_non_descriptor_decorated_function_skipped() {
         let cases = [
             "@cache\ndef f():\n    return 1\n",
             "@a\n@b\ndef f():\n    return 1\n",
             "@app.route(\"/path\")\ndef f():\n    return 1\n",
-            "@staticmethod\ndef f():\n    return 1\n",
             "@abstractmethod\ndef f():\n    return 1\n",
             "@override\ndef f():\n    return 1\n",
         ];
@@ -3108,7 +3121,24 @@ mod return_value_tests {
             let fms = collect_file_mutations(source);
             assert!(
                 fms.is_empty(),
-                "decorated function must be skipped entirely; source:\n{source}"
+                "non-descriptor decorated function must be skipped; source:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_descriptor_decorated_functions_collected() {
+        // @property, @classmethod, @staticmethod should produce mutations.
+        let cases = [
+            ("class C:\n    @property\n    def x(self):\n        return 1\n", "property"),
+            ("class C:\n    @classmethod\n    def make(cls):\n        return 1\n", "classmethod"),
+            ("class C:\n    @staticmethod\n    def helper():\n        return 1\n", "staticmethod"),
+        ];
+        for (source, kind) in &cases {
+            let fms = collect_file_mutations(source);
+            assert!(
+                !fms.is_empty(),
+                "@{kind} function must produce mutations; source:\n{source}"
             );
         }
     }
@@ -4508,10 +4538,10 @@ mod statement_deletion_tests {
     // --- Property descriptor skip tests ---
     // INV-1: @property-decorated method produces NO mutations.
     #[test]
-    fn test_property_skipped() {
+    fn test_property_collected() {
         let source = "class C:\n    @property\n    def x(self):\n        return self._x\n";
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty(), "@property method must not produce mutations");
+        assert!(!fms.is_empty(), "@property method must produce mutations (descriptor-aware trampoline)");
     }
 
     // INV-2: @x.setter-decorated method produces NO mutations.
@@ -4548,21 +4578,29 @@ mod statement_deletion_tests {
 
     // INV-5: ALL decorated methods are skipped (blanket skip, not just property/setter/deleter).
     #[test]
-    fn test_all_decorated_methods_skipped() {
+    fn test_non_descriptor_decorated_methods_skipped() {
+        // @override is not a descriptor decorator — still skipped.
+        let source = "class C:\n    @override\n    def x(self):\n        return 1 + 2\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "@override method must be skipped");
+    }
+
+    #[test]
+    fn test_descriptor_decorated_methods_collected() {
+        // @classmethod and @staticmethod are descriptor decorators — now collected.
         let cases = [
-            ("class C:\n    @override\n    def x(self):\n        return 1 + 2\n", "@override"),
             ("class C:\n    @classmethod\n    def make(cls):\n        return 1 + 2\n", "@classmethod"),
             ("class C:\n    @staticmethod\n    def helper():\n        return 1 + 2\n", "@staticmethod"),
         ];
         for (source, dec) in &cases {
             let fms = collect_file_mutations(source);
-            assert!(fms.is_empty(), "{dec} method must be skipped (blanket decorator skip)");
+            assert!(!fms.is_empty(), "{dec} method must produce mutations (descriptor-aware trampoline)");
         }
     }
 
     // Critical path: class with getter + setter + deleter — all three are skipped.
     #[test]
-    fn test_full_property_trio_all_skipped() {
+    fn test_property_trio_getter_collected_setter_deleter_skipped() {
         let source = concat!(
             "class HTTPError(Exception):\n",
             "    @property\n",
@@ -4578,7 +4616,10 @@ mod statement_deletion_tests {
             "        del self._request\n",
         );
         let fms = collect_file_mutations(source);
-        assert!(fms.is_empty(), "all three property methods must be skipped");
+        // @property getter is collected (descriptor-aware trampoline).
+        // @request.setter and @request.deleter are still skipped (not bare descriptor decorators).
+        assert_eq!(fms.len(), 1, "only the @property getter should produce mutations");
+        assert_eq!(fms[0].name, "request");
     }
 
     // Multiple decorators where one is @property — must still skip.
