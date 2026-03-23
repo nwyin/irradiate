@@ -86,6 +86,7 @@ pub fn collect_stats(
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
+    extra_pytest_args: &[String],
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
     let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
@@ -103,6 +104,7 @@ pub fn collect_stats(
         .arg("irradiate_harness.stats_plugin")
         .arg("-q")
         .arg(tests_dir)
+        .args(extra_pytest_args)
         .env("PYTHONPATH", pythonpath)
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)

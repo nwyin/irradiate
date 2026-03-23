@@ -419,7 +419,7 @@ def test_mark_once():
     let pythonpath = pipeline::build_pythonpath(&harness_dir, &project.path().join("src"));
     let mutants_dir = _tmp.path().to_path_buf();
     let test_stats =
-        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests", &[])
             .expect("Temp project stats collection should succeed");
     let test_id = test_stats
         .duration_by_test
@@ -517,7 +517,7 @@ async fn test_module_global_restore_between_runs() {
 
     // Use stats collection to discover the actual test ID format (pytest nodeids vary).
     let test_stats =
-        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests", &[])
             .expect("leaky project stats collection should succeed");
     let test_id = test_stats
         .duration_by_test
@@ -696,7 +696,7 @@ async fn build_session_fixture_project(
     // Collect the real test ID via stats
     let python = fixture_python();
     let test_stats =
-        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests")
+        stats::collect_stats(&python, project.path(), &pythonpath, &mutants_dir, "tests", &[])
             .expect("Stats collection should succeed");
     let test_id = test_stats
         .duration_by_test
@@ -828,6 +828,7 @@ async fn test_worker_crash_produces_error_not_hang() {
         &pythonpath,
         &mutants_dir,
         "tests",
+        &[],
     )
     .expect("Stats collection should succeed (test passes in stats mode)");
 
@@ -969,7 +970,7 @@ async fn test_stats_collection() {
 
     let mutants_dir = _tmp.path().to_path_buf();
     let pythonpath = pipeline::build_pythonpath(&harness_dir, &fixture.join("src"));
-    let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, &mutants_dir, "tests")
+    let test_stats = stats::collect_stats(&python, &fixture, &pythonpath, &mutants_dir, "tests", &[])
         .expect("Stats collection should succeed");
 
     println!("tests_by_function: {:?}", test_stats.tests_by_function);
@@ -1014,6 +1015,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         diff_ref: None,
         report: None,
         report_output: None,
+        pytest_add_cli_args: vec![],
     }
 }
 

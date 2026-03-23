@@ -50,6 +50,9 @@ pub struct RunConfig {
     pub report: Option<String>,
     /// Output path for the report. Defaults to `irradiate-report.<format>`.
     pub report_output: Option<std::path::PathBuf>,
+    /// Extra arguments appended to every pytest invocation.
+    /// Sourced from `pytest_add_cli_args` in pyproject.toml and/or `--pytest-args` CLI flag.
+    pub pytest_add_cli_args: Vec<String>,
 }
 
 /// Per-file metadata, mutmut-compatible.
@@ -202,6 +205,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &pythonpath,
             &mutants_dir,
             &config.tests_dir,
+            &config.pytest_add_cli_args,
         )
         .await?;
         eprintln!("  done");
@@ -213,6 +217,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &pythonpath,
             &mutants_dir,
             &config.tests_dir,
+            &config.pytest_add_cli_args,
         )
         .await?;
         eprintln!("  done");
@@ -226,6 +231,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &pythonpath,
             &mutants_dir,
             &config.tests_dir,
+            &config.pytest_add_cli_args,
         )
         .context("Stats collection failed")?;
         eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
@@ -320,6 +326,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
             &pythonpath,
             &mutants_dir,
             &config.tests_dir,
+            &config.pytest_add_cli_args,
         )
         .await?;
         work_items
@@ -403,6 +410,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 pythonpath: pythonpath.clone(),
                 worker_recycle_after: config.worker_recycle_after,
                 max_worker_memory_mb: config.max_worker_memory_mb,
+                pytest_add_cli_args: config.pytest_add_cli_args.clone(),
                 ..Default::default()
             };
             let progress = crate::progress::ProgressBar::new(total_mutants);
@@ -831,6 +839,7 @@ pub async fn run_isolated(
             .arg("--no-header")
             .arg("-p")
             .arg("irradiate_harness")
+            .args(&config.pytest_add_cli_args)
             .args(&item.test_ids)
             .env("PYTHONPATH", &pythonpath)
             .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
@@ -1209,11 +1218,14 @@ async fn validate_clean_run(
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
+    extra_pytest_args: &[String],
 ) -> Result<()> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
+    let mut args: Vec<&str> = vec!["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir];
+    args.extend(extra_pytest_args.iter().map(String::as_str));
     let output = run_subprocess(
         python,
-        &["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir],
+        &args,
         &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
         project_dir,
         VALIDATION_TIMEOUT_SECS,
@@ -1247,11 +1259,14 @@ async fn validate_fail_run(
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
+    extra_pytest_args: &[String],
 ) -> Result<()> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
+    let mut args: Vec<&str> = vec!["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir];
+    args.extend(extra_pytest_args.iter().map(String::as_str));
     let output = run_subprocess(
         python,
-        &["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir],
+        &args,
         &[
             ("PYTHONPATH", pythonpath),
             ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str),
@@ -1286,11 +1301,14 @@ async fn discover_tests(
     pythonpath: &str,
     mutants_dir: &Path,
     tests_dir: &str,
+    extra_pytest_args: &[String],
 ) -> Result<Vec<String>> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
+    let mut args: Vec<&str> = vec!["-m", "pytest", "--collect-only", "-q", "-p", "irradiate_harness", tests_dir];
+    args.extend(extra_pytest_args.iter().map(String::as_str));
     let output = run_subprocess(
         python,
-        &["-m", "pytest", "--collect-only", "-q", "-p", "irradiate_harness", tests_dir],
+        &args,
         &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
         project_dir,
         VALIDATION_TIMEOUT_SECS,
@@ -2442,7 +2460,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_ok(),
             "Clean project should pass validate_clean_run: {result:?}"
@@ -2467,7 +2485,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_ok(),
             "Pre-existing test failures (exit code 1) should be tolerated: {result:?}"
@@ -2490,7 +2508,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_err(),
             "Collection errors (exit code 2+) should cause validate_clean_run to return Err"
@@ -2516,7 +2534,7 @@ mod tests {
         generate_mutants(&fixture.join("src"), tmp_mutants.path(), &[], None)
             .expect("mutant generation should succeed for fixture");
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_ok(),
             "validate_fail_run should succeed (harness must cause failure under active_mutant='fail'): {result:?}"
@@ -2536,7 +2554,7 @@ mod tests {
         // Empty mutants dir — no trampoline code, so tests will pass under active_mutant=fail
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_err(),
             "Empty mutants dir means tests pass → should Err (exit code 0 detected)"
@@ -2562,7 +2580,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(
             result.is_err(),
             "No tests collected (exit 5) should Err, not silently succeed"
@@ -2587,7 +2605,7 @@ mod tests {
         // Empty mutants dir — tests pass, exit 0
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         // The error must include the stdout/stderr sections so users can diagnose the issue
@@ -2617,7 +2635,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, project.path());
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests").await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
         assert!(result.is_err(), "Collection error should cause validate_clean_run to return Err");
 
         let err_msg = format!("{:?}", result.unwrap_err());
@@ -2637,7 +2655,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &fixture.join("src"));
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests")
+        let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[])
             .await
             .expect("discover_tests should not fail for a valid project");
 
@@ -2673,6 +2691,7 @@ mod tests {
             &pythonpath,
             tmp_mutants.path(),
             "empty_tests",
+            &[],
         )
         .await
         .expect("discover_tests should not fail for empty test dir");

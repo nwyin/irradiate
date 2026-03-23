@@ -320,11 +320,14 @@ def main():  # pragma: no mutate
 
     plugin = MutationWorkerPlugin(sock)
 
+    # Extra pytest args from the orchestrator (sourced from pytest_add_cli_args config).
+    extra_pytest_args = json.loads(os.environ.get("IRRADIATE_PYTEST_ARGS", "[]"))
+
     # Run pytest: collection happens, then our plugin intercepts the run loop
     # to process mutant assignments via IPC.
     # The import hook (installed via irradiate_harness.__init__) handles mutant
     # module resolution — no sys.path manipulation needed.
-    pytest.main([tests_dir], plugins=[plugin])
+    pytest.main(extra_pytest_args + [tests_dir], plugins=[plugin])
 
     sock.close()
 

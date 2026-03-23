@@ -20,6 +20,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run mutation testing
     Run {
@@ -89,6 +90,11 @@ enum Commands {
         /// Output path for the generated report (default: irradiate-report.<format>)
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
+
+        /// Extra arguments to pass to every pytest invocation (appended after config file values).
+        /// Example: --pytest-args=-v --pytest-args=--tb=short
+        #[arg(long = "pytest-args")]
+        pytest_args: Vec<String>,
     },
 
     /// Display mutation testing results
@@ -156,9 +162,14 @@ async fn main() -> Result<()> {
             diff,
             report,
             output,
+            pytest_args,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
+
+            // pytest_add_cli_args: start from config, then append CLI --pytest-args
+            let mut pytest_add_cli_args = file_config.pytest_add_cli_args.unwrap_or_default();
+            pytest_add_cli_args.extend(pytest_args);
 
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
                 paths_to_mutate: PathBuf::from(
@@ -188,6 +199,7 @@ async fn main() -> Result<()> {
                 diff_ref: diff,
                 report,
                 report_output: output,
+                pytest_add_cli_args,
             })
             .await
         }

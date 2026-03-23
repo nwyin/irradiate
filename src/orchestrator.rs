@@ -48,6 +48,9 @@ pub struct PoolConfig {
     pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
+    /// Extra arguments appended to every pytest invocation within the worker pool.
+    /// Passed to worker processes via the `IRRADIATE_PYTEST_ARGS` env var (JSON array).
+    pub pytest_add_cli_args: Vec<String>,
 }
 
 impl Default for PoolConfig {
@@ -63,6 +66,7 @@ impl Default for PoolConfig {
             pythonpath: String::new(),
             worker_recycle_after: None,
             max_worker_memory_mb: 0,
+            pytest_add_cli_args: Vec::new(),
         }
     }
 }
@@ -154,12 +158,16 @@ fn spawn_worker(
 ) -> Result<Child> {
     let worker_script = harness::worker_script(harness_dir);
 
+    let pytest_args_json =
+        serde_json::to_string(&config.pytest_add_cli_args).unwrap_or_else(|_| "[]".to_string());
+
     let child = Command::new(&config.python)
         .arg(&worker_script)
         .env("IRRADIATE_SOCKET", socket_path)
         .env("IRRADIATE_MUTANTS_DIR", &config.mutants_dir)
         .env("IRRADIATE_TESTS_DIR", &config.tests_dir)
         .env("PYTHONPATH", &config.pythonpath)
+        .env("IRRADIATE_PYTEST_ARGS", &pytest_args_json)
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
