@@ -88,7 +88,8 @@ pub fn collect_stats(
     tests_dir: &str,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
-    std::fs::create_dir_all(stats_output.parent().unwrap())?;
+    let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
 
     info!("Collecting stats with PYTHONPATH={pythonpath}");
 

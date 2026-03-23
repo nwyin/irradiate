@@ -1102,7 +1102,8 @@ fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            // Skip __pycache__ and hidden dirs
+            // Skip __pycache__ and hidden dirs.
+            // unwrap_or_default is safe: `path` came from read_dir, so it always has a filename component.
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             if name.starts_with('.') || name == "__pycache__" {
                 continue;

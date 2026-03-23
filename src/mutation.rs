@@ -2494,9 +2494,12 @@ mod yield_detection_tests {
     use super::*;
 
     // Helper: collect mutations from the first function and return its is_generator flag.
-    fn check_yield_in_source(source: &str) -> bool {
+    // Returns Err if the source contains no function definitions.
+    fn check_yield_in_source(source: &str) -> anyhow::Result<bool> {
         let fms = collect_file_mutations(source);
-        fms.first().map(|fm| fm.is_generator).unwrap_or_else(|| panic!("no function def found in source"))
+        fms.first()
+            .map(|fm| fm.is_generator)
+            .ok_or_else(|| anyhow::anyhow!("no function def found in source"))
     }
 
     // INV-1: `yield` inside an `if` block → detected.
@@ -2505,35 +2508,35 @@ mod yield_detection_tests {
         // Note: we need a mutable expr to ensure collect_file_mutations works if called,
         // but here we directly test suite_contains_yield.
         let source = "def gen():\n    if True:\n        yield 1\n";
-        assert!(check_yield_in_source(source), "yield inside if must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside if must be detected");
     }
 
     // INV-2: `yield` inside a `while` loop → detected.
     #[test]
     fn test_yield_inside_while_detected() {
         let source = "def gen():\n    while True:\n        yield 1\n";
-        assert!(check_yield_in_source(source), "yield inside while must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside while must be detected");
     }
 
     // INV-3: `yield` inside a `for` loop → detected.
     #[test]
     fn test_yield_inside_for_detected() {
         let source = "def gen(items):\n    for x in items:\n        yield x\n";
-        assert!(check_yield_in_source(source), "yield inside for must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside for must be detected");
     }
 
     // INV-4: `yield` inside a `with` block → detected.
     #[test]
     fn test_yield_inside_with_detected() {
         let source = "def gen(f):\n    with open(f) as h:\n        yield h.read()\n";
-        assert!(check_yield_in_source(source), "yield inside with must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside with must be detected");
     }
 
     // INV-5: `yield` inside `try/except` → detected.
     #[test]
     fn test_yield_inside_try_detected() {
         let source = "def gen():\n    try:\n        yield 1\n    except Exception:\n        pass\n";
-        assert!(check_yield_in_source(source), "yield inside try must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside try must be detected");
     }
 
     // INV-6: `yield` inside a nested `def` → NOT detected (must not recurse past FunctionDef).
@@ -2541,7 +2544,7 @@ mod yield_detection_tests {
     fn test_yield_inside_nested_def_not_detected() {
         let source = "def outer():\n    def inner():\n        yield 1\n    return 0\n";
         assert!(
-            !check_yield_in_source(source),
+            !check_yield_in_source(source).unwrap(),
             "yield inside nested def must NOT make outer a generator"
         );
     }
@@ -2550,28 +2553,35 @@ mod yield_detection_tests {
     #[test]
     fn test_no_yield_not_detected() {
         let source = "def foo():\n    return 1 + 2\n";
-        assert!(!check_yield_in_source(source), "function without yield must not be detected");
+        assert!(!check_yield_in_source(source).unwrap(), "function without yield must not be detected");
     }
 
     // INV-8: `yield from` → detected.
     #[test]
     fn test_yield_from_detected() {
         let source = "def gen(items):\n    yield from items\n";
-        assert!(check_yield_in_source(source), "yield from must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield from must be detected");
     }
 
     // INV-9: Top-level `yield` (simple return body style) → detected.
     #[test]
     fn test_top_level_yield_detected() {
         let source = "def gen():\n    yield 1\n";
-        assert!(check_yield_in_source(source), "top-level yield must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "top-level yield must be detected");
     }
 
     // INV-10: `yield` inside `except` handler (not in body) → detected.
     #[test]
     fn test_yield_inside_except_handler_detected() {
         let source = "def gen():\n    try:\n        pass\n    except Exception:\n        yield 0\n";
-        assert!(check_yield_in_source(source), "yield inside except handler must be detected");
+        assert!(check_yield_in_source(source).unwrap(), "yield inside except handler must be detected");
+    }
+
+    // INV-0: source with no function definitions returns Err instead of panicking.
+    #[test]
+    fn test_no_function_def_returns_err() {
+        assert!(check_yield_in_source("").is_err(), "empty source must return Err, not panic");
+        assert!(check_yield_in_source("x = 1\n").is_err(), "source with no function def must return Err");
     }
 
     // INV-11: `yield` only inside nested def — outer is_generator flag is correctly False.

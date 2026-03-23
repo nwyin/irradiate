@@ -210,7 +210,7 @@ fn spawn_worker_task(
                             if let OrchestratorMessage::Run { timeout_secs: Some(secs), .. } = &msg {
                                 current_timeout = Duration::from_secs_f64(*secs);
                             }
-                            let json = serde_json::to_string(&msg).unwrap() + "\n";
+                            let json = serde_json::to_string(&msg).context("failed to serialize IPC message")? + "\n";
                             if write_tx.send(json).await.is_err() {
                                 let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
                                 break;
@@ -276,6 +276,7 @@ fn spawn_worker_task(
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     msg_tx
