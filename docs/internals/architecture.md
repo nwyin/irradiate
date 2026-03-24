@@ -80,27 +80,41 @@ Worker → Orchestrator:
 
 ## Module dependency graph
 
-Generated from `cargo modules dependencies`. Solid arrows are ownership (parent module), dashed arrows are `use` dependencies.
+Generated from `cargo modules dependencies`. Arrows point from importer to dependency. The graph is a clean DAG — no cycles.
 
 ```mermaid
-graph LR
-    main["main.rs<br/><small>CLI + clap</small>"]
-    pipeline["pipeline<br/><small>orchestration</small>"]
-    codegen["codegen<br/><small>file mutation</small>"]
-    orchestrator["orchestrator<br/><small>worker pool</small>"]
-    mutation["mutation<br/><small>shared types</small>"]
-    tree_sitter["tree_sitter_mutation<br/><small>mutation engine</small>"]
-    regex_mut["regex_mutation<br/><small>regex operators</small>"]
-    trampoline["trampoline<br/><small>code generation</small>"]
-    cache["cache<br/><small>content-addressed</small>"]
-    stats["stats<br/><small>coverage + timing</small>"]
-    report["report<br/><small>output + reports</small>"]
-    protocol["protocol<br/><small>IPC types</small>"]
-    harness["harness<br/><small>Python extraction</small>"]
-    config["config<br/><small>pyproject.toml</small>"]
-    git_diff["git_diff<br/><small>incremental mode</small>"]
-    progress["progress<br/><small>terminal UI</small>"]
-    trace["trace<br/><small>chrome tracing</small>"]
+graph TD
+    subgraph "Layer 4: Entrypoint"
+        main["main.rs<br/><small>CLI + clap</small>"]
+    end
+
+    subgraph "Layer 3: Conductor"
+        pipeline["pipeline<br/><small>orchestration</small>"]
+    end
+
+    subgraph "Layer 2: Subsystems"
+        codegen["codegen<br/><small>file mutation</small>"]
+        orchestrator["orchestrator<br/><small>worker pool</small>"]
+        report["report<br/><small>output + reports</small>"]
+        progress["progress<br/><small>terminal UI</small>"]
+        trace["trace<br/><small>chrome tracing</small>"]
+    end
+
+    subgraph "Layer 1: Engines"
+        tree_sitter["tree_sitter_mutation<br/><small>mutation engine</small>"]
+        regex_mut["regex_mutation<br/><small>regex operators</small>"]
+        trampoline["trampoline<br/><small>code generation</small>"]
+        cache["cache<br/><small>content-addressed</small>"]
+        stats["stats<br/><small>coverage + timing</small>"]
+        git_diff["git_diff<br/><small>incremental mode</small>"]
+        harness["harness<br/><small>Python extraction</small>"]
+    end
+
+    subgraph "Layer 0: Types"
+        mutation["mutation<br/><small>shared types</small>"]
+        protocol["protocol<br/><small>IPC types</small>"]
+        config["config<br/><small>pyproject.toml</small>"]
+    end
 
     main --> pipeline
     main --> report
@@ -119,6 +133,7 @@ graph LR
     codegen --> trampoline
     codegen --> cache
     codegen --> git_diff
+    codegen --> tree_sitter
 
     orchestrator --> harness
     orchestrator --> protocol
@@ -126,11 +141,13 @@ graph LR
     orchestrator --> trace
 
     tree_sitter --> mutation
+    tree_sitter --> regex_mut
     regex_mut --> mutation
     trampoline --> mutation
 
     cache --> protocol
     report --> cache
+    report --> mutation
     report --> protocol
     report --> stats
     report --> config
