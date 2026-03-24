@@ -45,6 +45,13 @@ bash tests/e2e.sh
 
 # Full verification
 cargo check && cargo clippy -- -D warnings && cargo test && bash tests/e2e.sh
+
+# Module dependency graph (requires: cargo install cargo-modules)
+cargo modules dependencies --lib --no-fns --no-traits --no-types  # dot format
+cargo modules structure --lib                                      # tree format
+
+# Render docs locally (requires: pip install mkdocs-material mkdocs-minify-plugin)
+uvx --with mkdocs-material --with mkdocs-minify-plugin mkdocs serve
 ```
 
 ## Python environment
