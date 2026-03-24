@@ -63,7 +63,7 @@ plugins:
 nav:
   - Home: index.md
   - Getting Started:
-    - Installation: getting-started/install.md
+    - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
   - Guide:
@@ -75,7 +75,8 @@ nav:
     - The Trampoline: internals/trampoline.md
     - Mutation Operators: internals/mutation-operators.md
     - Import Hook: internals/import-hook.md
-
+    - Decorators: internals/decorators.md
+  - Mutation Pruning: mutation-pruning.md
   - Reference:
     - CLI: reference/cli.md
   - Blog: blog/index.md

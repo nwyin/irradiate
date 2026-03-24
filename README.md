@@ -1,5 +1,8 @@
 # irradiate
 
+[![PyPI](https://img.shields.io/pypi/v/irradiate)](https://pypi.org/project/irradiate/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Fast mutation testing for Python, written in Rust.
 
 ## Why
@@ -10,7 +13,7 @@ irradiate eliminates this by maintaining a pool of pre-warmed pytest workers. Py
 
 ## How it works
 
-1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (27 mutation operator categories, ~160+ distinct mutations)
+1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (28+ mutation operator categories including regex pattern mutations)
 2. Generate trampolined mutants — each function gets an original, N mutated variants, and a runtime dispatcher
 3. Collect test coverage and timing in a single pytest run
 4. Fork a child process per mutant inside pre-warmed workers (no pytest restart)
@@ -58,6 +61,28 @@ irradiate results
 irradiate show module.x_func__irradiate_1
 ```
 
+### Example output
+
+```
+$ irradiate run
+Generating mutants...
+  done in 3ms (14 mutants across 1 files)
+Running stats + validation...
+  done in 195ms
+Running mutation testing (14 mutants, 10 workers)...
+
+Mutation testing complete (14 mutants in 0.1s, 175 mutants/sec)
+  Cache hits: 0
+  Cache misses: 12
+  Killed:    11
+  Survived:  1
+  No tests:  2
+  Score:     91.7%
+
+Survived mutants:
+  simple_lib/__init__.py:6  replaced `0` with `1` (number_mutation)
+```
+
 ## Configuration
 
 Configure via `[tool.irradiate]` in `pyproject.toml`:
@@ -74,9 +99,9 @@ All settings can be overridden via CLI flags. Run `irradiate run --help` for the
 
 ## Features
 
-### Mutation operators (27 categories)
+### Mutation operators (28+ categories)
 
-Arithmetic, comparison, boolean, augmented assignment, unary, string mutation/emptying, number literals, lambda bodies, return values, assignments, default arguments, argument removal, method swaps, dict kwargs, decorator removal (planned), exception types, match/case removal, condition negation, condition replacement, statement deletion, keyword swap, loop mutation, ternary swap, slice index removal.
+Arithmetic, comparison, boolean, augmented assignment, unary, string mutation/emptying, number literals, constant replacement, lambda bodies, return values, assignments, default arguments, argument removal, method swaps, dict kwargs, exception types, match/case removal, condition negation, condition replacement, statement deletion, keyword swap, loop mutation, ternary swap, slice index removal, regex pattern mutations (11 operators: anchor removal, charclass negation, shorthand negation, quantifier removal/change, lookaround negation, alternation removal, and more).
 
 Functions can be excluded with `# pragma: no mutate`.
 
@@ -143,7 +168,7 @@ Auto-detects GitHub Actions and emits inline `::warning` annotations on survived
 |---|---|---|
 | **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant — pytest starts once |
 | **Parser** | LibCST (Python) | tree-sitter (Rust, parallel) |
-| **Operators** | ~20 categories | 27 categories |
+| **Operators** | ~20 categories | 28+ categories (incl. regex) |
 | **Cache** | mtime-based | Content-addressable (SHA-256) |
 | **Orchestration** | Python multiprocessing | Rust + tokio async |
 | **Incremental** | — | `--diff` with merge-base |

@@ -115,7 +115,7 @@ The result: same mutations, same classification accuracy, a fraction of the time
 If you want to see mutation testing in practice on your own codebase:
 
 ```bash
-cargo install irradiate
+pip install irradiate
 cd your-project
 irradiate run
 ```
