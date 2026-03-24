@@ -15,10 +15,11 @@
 //!
 //! Schema reference: <https://github.com/stryker-mutator/mutation-testing-elements>
 
-use anyhow::Context;
-use crate::cache::MutantCacheDescriptor;
+use anyhow::{bail, Context, Result};
+use crate::cache::{CacheCounts, MutantCacheDescriptor};
 use crate::protocol::{MutantResult, MutantStatus};
 use crate::stats::TestStats;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
@@ -449,6 +450,476 @@ fn derive_file_key_from_name(name: &str, project_root: &Path, paths_to_mutate: &
         .unwrap_or(&fallback)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Per-file metadata, mutmut-compatible.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct FileMeta {
+    exit_code_by_key: HashMap<String, i32>,
+    #[serde(default)]
+    durations_by_key: HashMap<String, f64>,
+}
+
+/// Entry in the JSON results `mutants` array.
+#[derive(Serialize)]
+struct JsonMutantEntry {
+    name: String,
+    status: MutantStatus,
+}
+
+/// Top-level JSON output for `irradiate results --json`.
+#[derive(Serialize)]
+struct JsonResults {
+    mutation_score_pct: f64,
+    total: usize,
+    killed: usize,
+    survived: usize,
+    no_tests: usize,
+    timeout: usize,
+    errors: usize,
+    mutants: Vec<JsonMutantEntry>,
+}
+
+/// Build a `JsonResults` from raw (name, exit_code) pairs.
+///
+/// Pure function — no I/O. Extracted for testability.
+/// When `show_all` is false, `mutants` contains only survived entries.
+fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResults {
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut no_tests = 0usize;
+    let mut timeout = 0usize;
+    let mut errors = 0usize;
+    let mut mutants = Vec::new();
+
+    for (name, exit_code) in all_results {
+        let status = MutantStatus::from_exit_code(*exit_code, false);
+        match status {
+            MutantStatus::Killed => killed += 1,
+            MutantStatus::Survived => survived += 1,
+            MutantStatus::NoTests => no_tests += 1,
+            MutantStatus::Timeout => timeout += 1,
+            _ => errors += 1,
+        }
+        if show_all || status == MutantStatus::Survived {
+            mutants.push(JsonMutantEntry { name: name.clone(), status });
+        }
+    }
+
+    let total = all_results.len();
+    let denominator = (killed + survived) as f64;
+    let mutation_score_pct = if denominator > 0.0 {
+        ((killed as f64 / denominator * 100.0) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    JsonResults { mutation_score_pct, total, killed, survived, no_tests, timeout, errors, mutants }
+}
+
+/// Display results from previous run.
+pub fn results(
+    show_all: bool,
+    json_output: bool,
+    report: Option<String>,
+    report_output: Option<PathBuf>,
+) -> Result<()> {
+    let project_dir = std::env::current_dir()?;
+    let mutants_dir = project_dir.join("mutants");
+    let all_results = load_all_meta(&mutants_dir)?;
+
+    if all_results.is_empty() && !json_output && report.is_none() {
+        eprintln!("No results found. Run `irradiate run` first.");
+        return Ok(());
+    }
+
+    if json_output {
+        let json_out = build_json_results(&all_results, show_all);
+        println!("{}", serde_json::to_string_pretty(&json_out)?);
+        return Ok(());
+    }
+
+    // Generate Stryker-format report from meta files (no descriptor/location info).
+    if let Some(ref fmt) = report {
+        let output_path = report_output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("irradiate-report.{fmt}")));
+        let file_config = crate::config::load_config(&project_dir)?;
+        let paths_to_mutate: Vec<PathBuf> = file_config
+            .paths_to_mutate
+            .unwrap_or_else(|| vec!["src".to_string()])
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        // Load stats for coveredBy if available
+        let stats_path = project_dir.join(".irradiate").join("stats.json");
+        let stats = if stats_path.exists() {
+            crate::stats::TestStats::load(&stats_path).ok()
+        } else {
+            None
+        };
+        // Build MutantResult list from meta files
+        let mutant_results = load_all_meta_as_results(&mutants_dir)?;
+        let report_val = build_stryker_report(
+            &mutant_results,
+            &[], // no descriptors available from meta files alone
+            stats.as_ref(),
+            &project_dir,
+            &paths_to_mutate,
+        );
+        if fmt == "html" {
+            write_html_report(&report_val, &output_path)?;
+        } else {
+            let json_str = serde_json::to_string_pretty(&report_val)?;
+            std::fs::write(&output_path, &json_str)
+                .with_context(|| format!("Failed to write report to {}", output_path.display()))?;
+        }
+        eprintln!("Report written to {}", output_path.display());
+        return Ok(());
+    }
+
+    let mut survived = Vec::new();
+    let mut killed = 0;
+    let mut no_tests = 0;
+    let mut timeout = 0;
+    let mut errors = 0;
+
+    for (name, exit_code) in &all_results {
+        let status = MutantStatus::from_exit_code(*exit_code, false);
+        match status {
+            MutantStatus::Survived => survived.push(name.as_str()),
+            MutantStatus::Killed => killed += 1,
+            MutantStatus::NoTests => no_tests += 1,
+            MutantStatus::Timeout => timeout += 1,
+            _ => errors += 1,
+        }
+        if show_all {
+            let emoji = status_emoji(status);
+            println!("{emoji} {name}");
+        }
+    }
+
+    if !show_all && !survived.is_empty() {
+        eprintln!("Survived mutants:");
+        for name in &survived {
+            println!("  {name}");
+        }
+    }
+
+    let total = all_results.len();
+    eprintln!(
+        "\nTotal: {total}  Killed: {killed}  Survived: {}  No tests: {no_tests}  Timeout: {timeout}  Errors: {errors}",
+        survived.len()
+    );
+
+    Ok(())
+}
+
+/// Show diff for a specific mutant.
+pub fn show(mutant_name: &str) -> Result<()> {
+    let mutants_dir = std::env::current_dir()?.join("mutants");
+    let all_meta = load_all_meta(&mutants_dir)?;
+
+    if !all_meta.iter().any(|(name, _)| name == mutant_name) {
+        bail!(
+            "Mutant '{mutant_name}' not found. Run `irradiate results --all` to see all mutants."
+        );
+    }
+
+    // mutant_name = "module.x_func__irradiate_N"
+    // We need the module (for file lookup) and the local variant name (for function lookup)
+    let (module, local_variant) = mutant_name.split_once('.').unwrap_or(("", mutant_name));
+    let (local_func_mangled, _) = local_variant
+        .rsplit_once("__irradiate_")
+        .unwrap_or((local_variant, ""));
+    let orig_name = format!("{local_func_mangled}__irradiate_orig");
+
+    // Find the mutated source file
+    let candidates = [
+        mutants_dir.join(format!("{}/{}.py", module.replace('.', "/"), "__init__")),
+        mutants_dir.join(format!("{}.py", module.replace('.', "/"))),
+    ];
+    let source_file = candidates
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!("Cannot find source file for module '{module}'"))?;
+
+    let content = std::fs::read_to_string(source_file)?;
+
+    let orig_marker = format!("def {orig_name}(");
+    let mutant_marker = format!("def {local_variant}(");
+
+    match (
+        extract_function(&content, &orig_marker),
+        extract_function(&content, &mutant_marker),
+    ) {
+        (Some(orig), Some(mutant)) => {
+            println!("# {mutant_name}");
+            for line in diff_lines(&orig, &mutant) {
+                println!("{line}");
+            }
+        }
+        _ => {
+            bail!(
+                "Could not extract functions for '{mutant_name}' from {}",
+                source_file.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn write_meta_files(
+    mutants_dir: &Path,
+    all_names: &HashMap<String, Vec<String>>,
+    results: &[MutantResult],
+) -> Result<()> {
+    // Build result lookup
+    let result_map: HashMap<&str, &MutantResult> = results
+        .iter()
+        .map(|r| (r.mutant_name.as_str(), r))
+        .collect();
+
+    for (module, names) in all_names {
+        let mut meta = FileMeta::default();
+        for name in names {
+            if let Some(result) = result_map.get(name.as_str()) {
+                meta.exit_code_by_key.insert(name.clone(), result.exit_code);
+                meta.durations_by_key.insert(name.clone(), result.duration);
+            }
+        }
+
+        // Find the .meta file for this module
+        let module_path = format!("{}/{}.py.meta", module.replace('.', "/"), "__init__");
+        let module_path_alt = format!("{}.py.meta", module.replace('.', "/"));
+        let meta_file = if mutants_dir.join(&module_path).exists() {
+            mutants_dir.join(module_path)
+        } else {
+            mutants_dir.join(module_path_alt)
+        };
+
+        if let Some(parent) = meta_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&meta_file, serde_json::to_string_pretty(&meta)?)?;
+    }
+
+    Ok(())
+}
+
+pub fn load_all_meta(mutants_dir: &Path) -> Result<Vec<(String, i32)>> {
+    let mut all = Vec::new();
+    if !mutants_dir.exists() {
+        return Ok(all);
+    }
+
+    for entry in walkdir(mutants_dir)? {
+        if entry.extension().is_some_and(|e| e == "meta") {
+            let content = std::fs::read_to_string(&entry)?;
+            if let Ok(meta) = serde_json::from_str::<FileMeta>(&content) {
+                for (name, exit_code) in meta.exit_code_by_key {
+                    all.push((name, exit_code));
+                }
+            }
+        }
+    }
+
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(all)
+}
+
+/// Load all results from .meta files, including durations, as `MutantResult` values.
+/// Used by `results --report` which needs the full result struct.
+pub fn load_all_meta_as_results(mutants_dir: &Path) -> Result<Vec<MutantResult>> {
+    let mut all = Vec::new();
+    if !mutants_dir.exists() {
+        return Ok(all);
+    }
+
+    for entry in walkdir(mutants_dir)? {
+        if entry.extension().is_some_and(|e| e == "meta") {
+            let content = std::fs::read_to_string(&entry)?;
+            if let Ok(meta) = serde_json::from_str::<FileMeta>(&content) {
+                for (name, exit_code) in &meta.exit_code_by_key {
+                    let duration = meta.durations_by_key.get(name).copied().unwrap_or(0.0);
+                    let status = MutantStatus::from_exit_code(*exit_code, false);
+                    all.push(MutantResult {
+                        mutant_name: name.clone(),
+                        exit_code: *exit_code,
+                        duration,
+                        status,
+                    });
+                }
+            }
+        }
+    }
+
+    all.sort_by(|a, b| a.mutant_name.cmp(&b.mutant_name));
+    Ok(all)
+}
+
+fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walkdir(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Print the run summary. Returns (killed, survived) counts for threshold checking.
+pub fn print_summary(
+    results: &[MutantResult],
+    elapsed_secs: f64,
+    cache_counts: CacheCounts,
+    descriptors: &HashMap<String, MutantCacheDescriptor>,
+    sampled_from: Option<usize>,
+) -> (usize, usize) {
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut no_tests = 0usize;
+    let mut timeout = 0usize;
+    let mut errors = 0usize;
+
+    for r in results {
+        match r.status {
+            MutantStatus::Killed => killed += 1,
+            MutantStatus::Survived => survived += 1,
+            MutantStatus::NoTests => no_tests += 1,
+            MutantStatus::Timeout => timeout += 1,
+            _ => errors += 1,
+        }
+    }
+
+    let total = results.len();
+    let rate = if elapsed_secs > 0.0 {
+        total as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+
+    // INV-5: Mutation score is always printed in summary output.
+    let tested = killed + survived;
+    let score_str = if tested > 0 {
+        format!("{:.1}%", killed as f64 / tested as f64 * 100.0)
+    } else {
+        "N/A".to_string()
+    };
+
+    eprintln!();
+    if let Some(population) = sampled_from {
+        eprintln!(
+            "Mutation testing complete ({total} of {population} mutants sampled in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
+        );
+    } else {
+        eprintln!(
+            "Mutation testing complete ({total} mutants in {elapsed_secs:.1}s, {rate:.0} mutants/sec)"
+        );
+    }
+    eprintln!("  Cache hits: {0}", cache_counts.hits);
+    eprintln!("  Cache misses: {0}", cache_counts.misses);
+    eprintln!("  Killed:    {killed}");
+    eprintln!("  Survived:  {survived}");
+    if no_tests > 0 {
+        eprintln!("  No tests:  {no_tests}");
+    }
+    if timeout > 0 {
+        eprintln!("  Timeout:   {timeout}");
+    }
+    if errors > 0 {
+        eprintln!("  Errors:    {errors}");
+    }
+    eprintln!("  Score:     {score_str}");
+    if sampled_from.is_some() {
+        eprintln!("  (sampled — score is an estimate)");
+    }
+
+    if survived > 0 {
+        eprintln!();
+        eprintln!("Survived mutants:");
+        for r in results {
+            if r.status == MutantStatus::Survived {
+                if let Some(desc) = descriptors.get(&r.mutant_name) {
+                    let (rel_line, _col) =
+                        crate::codegen::byte_offset_to_location(&desc.function_source, desc.start);
+                    let abs_line = desc.fn_start_line + rel_line - 1;
+                    let file = if desc.source_file.is_empty() {
+                        &r.mutant_name
+                    } else {
+                        &desc.source_file
+                    };
+                    eprintln!(
+                        "  {file}:{abs_line}  replaced `{}` with `{}` ({})  [{}]",
+                        desc.original, desc.replacement, desc.operator, r.mutant_name,
+                    );
+                } else {
+                    eprintln!("  {}", r.mutant_name);
+                }
+            }
+        }
+    }
+
+    (killed, survived)
+}
+
+fn status_emoji(status: MutantStatus) -> &'static str {
+    match status {
+        MutantStatus::Killed => "\u{1f389}",
+        MutantStatus::Survived => "\u{1f641}",
+        MutantStatus::NoTests => "\u{1fae5}",
+        MutantStatus::Timeout => "\u{23f0}",
+        MutantStatus::TypeCheck => "\u{1f9d9}",
+        MutantStatus::Error => "\u{1f4a5}",
+    }
+}
+
+fn extract_function(source: &str, marker: &str) -> Option<String> {
+    let start = source.find(marker)?;
+    let rest = &source[start..];
+    let mut lines = Vec::new();
+    for (i, line) in rest.lines().enumerate() {
+        if i > 0 {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if !trimmed.is_empty() && indent == 0 {
+                break;
+            }
+        }
+        lines.push(line);
+    }
+    Some(lines.join("\n"))
+}
+
+fn diff_lines(original: &str, mutant: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let mut_lines: Vec<&str> = mutant.lines().collect();
+
+    let max_len = orig_lines.len().max(mut_lines.len());
+    for i in 0..max_len {
+        let orig = orig_lines.get(i).unwrap_or(&"");
+        let muta = mut_lines.get(i).unwrap_or(&"");
+        if orig == muta {
+            result.push(format!(" {orig}"));
+        } else {
+            if !orig.is_empty() {
+                result.push(format!("-{orig}"));
+            }
+            if !muta.is_empty() {
+                result.push(format!("+{muta}"));
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -893,5 +1364,345 @@ mod tests {
         let covered_by = mutants[0]["coveredBy"].as_array().unwrap();
         assert_eq!(covered_by.len(), 1);
         assert_eq!(covered_by[0], "tests/test_mod.py::test_it");
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests moved from pipeline.rs
+    // -------------------------------------------------------------------------
+
+    // --- write_meta_files + load_all_meta round-trip ---
+
+    #[test]
+    fn test_meta_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        // Set up: module "mymod" with two mutant names
+        let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+        all_names.insert(
+            "mymod".to_string(),
+            vec![
+                "mymod.x_foo__irradiate_1".to_string(),
+                "mymod.x_foo__irradiate_2".to_string(),
+            ],
+        );
+
+        let results = vec![
+            MutantResult {
+                mutant_name: "mymod.x_foo__irradiate_1".to_string(),
+                exit_code: 1,
+                duration: 0.5,
+                status: MutantStatus::Killed,
+            },
+            MutantResult {
+                mutant_name: "mymod.x_foo__irradiate_2".to_string(),
+                exit_code: 0,
+                duration: 0.3,
+                status: MutantStatus::Survived,
+            },
+        ];
+
+        write_meta_files(mutants_dir, &all_names, &results).unwrap();
+
+        let loaded = load_all_meta(mutants_dir).unwrap();
+        // load_all_meta returns (name, exit_code) sorted by name
+        assert_eq!(loaded.len(), 2);
+        let map: HashMap<&str, i32> = loaded.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+        assert_eq!(map["mymod.x_foo__irradiate_1"], 1);
+        assert_eq!(map["mymod.x_foo__irradiate_2"], 0);
+    }
+
+    #[test]
+    fn test_meta_round_trip_package() {
+        // Test the __init__ path: create the stub so write_meta_files uses the init variant
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
+        all_names.insert(
+            "mypkg".to_string(),
+            vec!["mypkg.x_bar__irradiate_1".to_string()],
+        );
+
+        // Create the __init__.py.meta stub so write_meta_files takes the init branch
+        let init_meta_dir = mutants_dir.join("mypkg");
+        std::fs::create_dir_all(&init_meta_dir).unwrap();
+        std::fs::write(init_meta_dir.join("__init__.py.meta"), "{}").unwrap();
+
+        let results = vec![MutantResult {
+            mutant_name: "mypkg.x_bar__irradiate_1".to_string(),
+            exit_code: 1,
+            duration: 0.1,
+            status: MutantStatus::Killed,
+        }];
+
+        write_meta_files(mutants_dir, &all_names, &results).unwrap();
+
+        let loaded = load_all_meta(mutants_dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "mypkg.x_bar__irradiate_1");
+        assert_eq!(loaded[0].1, 1);
+    }
+
+    // --- print_summary tests ---
+
+    use crate::cache::CacheCounts;
+
+    fn make_results_for_summary(killed: usize, survived: usize) -> Vec<MutantResult> {
+        let mut v = Vec::new();
+        for i in 0..killed {
+            v.push(MutantResult {
+                mutant_name: format!("mod.x_k_{i}"),
+                exit_code: 1,
+                duration: 0.1,
+                status: MutantStatus::Killed,
+            });
+        }
+        for i in 0..survived {
+            v.push(MutantResult {
+                mutant_name: format!("mod.x_s_{i}"),
+                exit_code: 0,
+                duration: 0.1,
+                status: MutantStatus::Survived,
+            });
+        }
+        v
+    }
+
+    fn zero_cache() -> CacheCounts {
+        CacheCounts { hits: 0, misses: 0 }
+    }
+
+    /// INV-5: Score is always printed — verify the function doesn't panic and returns counts.
+    #[test]
+    fn test_print_summary_returns_killed_survived() {
+        let results = make_results_for_summary(3, 1);
+        let (killed, survived) = print_summary(&results, 1.0, zero_cache(), &HashMap::new(), None);
+        assert_eq!(killed, 3);
+        assert_eq!(survived, 1);
+    }
+
+    /// INV-5: With zero tested mutants, score is N/A and no panic.
+    #[test]
+    fn test_print_summary_no_tested_mutants() {
+        let results: Vec<MutantResult> = vec![];
+        let (killed, survived) = print_summary(&results, 0.0, zero_cache(), &HashMap::new(), None);
+        assert_eq!(killed, 0);
+        assert_eq!(survived, 0);
+    }
+
+    // --- build_json_results ---
+
+    fn raw(name: &str, exit_code: i32) -> (String, i32) {
+        (name.to_string(), exit_code)
+    }
+
+    /// INV-1: JSON output is valid JSON; INV-5: total == sum of all status counts.
+    #[test]
+    fn test_json_results_valid_json_and_inv5_total() {
+        let results = vec![
+            raw("mod.x_a__irradiate_1", 1),  // killed
+            raw("mod.x_b__irradiate_1", 0),  // survived
+            raw("mod.x_c__irradiate_1", 33), // no_tests
+            raw("mod.x_d__irradiate_1", 2),  // error
+        ];
+        let json_out = build_json_results(&results, true);
+        // INV-1: serializes to valid JSON
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["total"], 4);
+        assert_eq!(parsed["killed"], 1);
+        assert_eq!(parsed["survived"], 1);
+        assert_eq!(parsed["no_tests"], 1);
+        assert_eq!(parsed["errors"], 1);
+
+        // INV-5: total == killed + survived + no_tests + timeout + errors
+        let sum = parsed["killed"].as_u64().unwrap()
+            + parsed["survived"].as_u64().unwrap()
+            + parsed["no_tests"].as_u64().unwrap()
+            + parsed["timeout"].as_u64().unwrap()
+            + parsed["errors"].as_u64().unwrap();
+        assert_eq!(sum, parsed["total"].as_u64().unwrap());
+    }
+
+    /// INV-2: mutation_score_pct = killed / (killed + survived) * 100, rounded to 1 decimal.
+    #[test]
+    fn test_json_results_mutation_score_pct() {
+        // 3 killed out of 4 (3 killed + 1 survived) = 75.0%
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 1), // killed
+            raw("c", 1), // killed
+            raw("d", 0), // survived
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutation_score_pct, 75.0);
+    }
+
+    /// INV-2: score rounds to 1 decimal correctly.
+    #[test]
+    fn test_json_results_mutation_score_rounding() {
+        // 2 killed / 3 total relevant = 66.666...% → rounds to 66.7
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 1), // killed
+            raw("c", 0), // survived
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutation_score_pct, 66.7);
+    }
+
+    /// Failure mode: no results → JSON with total: 0 and empty mutants array (not an error).
+    #[test]
+    fn test_json_results_empty_input() {
+        let json_out = build_json_results(&[], true);
+        assert_eq!(json_out.total, 0);
+        assert_eq!(json_out.killed, 0);
+        assert_eq!(json_out.survived, 0);
+        assert_eq!(json_out.mutants.len(), 0);
+        assert_eq!(json_out.mutation_score_pct, 0.0);
+        // Must still serialize without panic
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["total"], 0);
+    }
+
+    /// When show_all=false, mutants array contains only survived entries.
+    #[test]
+    fn test_json_results_show_all_false_only_survived() {
+        let results = vec![
+            raw("a", 1), // killed
+            raw("b", 0), // survived
+            raw("c", 0), // survived
+        ];
+        let json_out = build_json_results(&results, false);
+        assert_eq!(json_out.mutants.len(), 2);
+        for m in &json_out.mutants {
+            assert_eq!(m.status, MutantStatus::Survived);
+        }
+    }
+
+    /// When show_all=true, mutants array includes all statuses.
+    #[test]
+    fn test_json_results_show_all_true_includes_all() {
+        let results = vec![
+            raw("a", 1),  // killed
+            raw("b", 0),  // survived
+            raw("c", 33), // no_tests
+        ];
+        let json_out = build_json_results(&results, true);
+        assert_eq!(json_out.mutants.len(), 3);
+    }
+
+    /// INV-4: All status strings in JSON are lowercase snake_case.
+    #[test]
+    fn test_json_results_status_serialization_snake_case() {
+        let results = vec![
+            raw("a", 0),  // survived
+            raw("b", 1),  // killed
+            raw("c", 33), // no_tests
+        ];
+        let json_out = build_json_results(&results, true);
+        let serialized = serde_json::to_string(&json_out).unwrap();
+        assert!(serialized.contains("\"survived\""));
+        assert!(serialized.contains("\"killed\""));
+        assert!(serialized.contains("\"no_tests\""));
+    }
+
+    // --- extract_function tests ---
+
+    #[test]
+    fn test_extract_function_single() {
+        let src = "def foo():\n    return 1\n";
+        let result = extract_function(src, "def foo():");
+        assert_eq!(result, Some("def foo():\n    return 1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_function_stops_at_top_level() {
+        let src = "def foo():\n    return 1\n\ndef bar():\n    return 2\n";
+        let result = extract_function(src, "def foo():");
+        // Should include foo's body but stop before bar
+        let s = result.unwrap();
+        assert!(s.contains("def foo():"));
+        assert!(s.contains("return 1"));
+        assert!(!s.contains("def bar():"));
+    }
+
+    #[test]
+    fn test_extract_function_first_match_only() {
+        // When two functions have the same marker prefix, only the first is returned
+        let src = "def foo():\n    return 1\n\ndef foo_extra():\n    return 2\n";
+        let result = extract_function(src, "def foo():");
+        let s = result.unwrap();
+        assert!(!s.contains("foo_extra"));
+    }
+
+    #[test]
+    fn test_extract_function_no_match() {
+        let src = "def bar():\n    return 42\n";
+        assert_eq!(extract_function(src, "def foo():"), None);
+    }
+
+    #[test]
+    fn test_extract_function_nested_blocks() {
+        let src = "def foo():\n    if True:\n        for i in range(3):\n            pass\n    return 0\n\nx = 1\n";
+        let result = extract_function(src, "def foo():");
+        let s = result.unwrap();
+        assert!(s.contains("if True:"));
+        assert!(s.contains("for i in range(3):"));
+        assert!(s.contains("return 0"));
+        assert!(!s.contains("x = 1"));
+    }
+
+    #[test]
+    fn test_extract_function_empty_source() {
+        assert_eq!(extract_function("", "def foo():"), None);
+    }
+
+    // --- diff_lines tests ---
+
+    #[test]
+    fn test_diff_lines_identical() {
+        let lines = diff_lines("a\nb\nc", "a\nb\nc");
+        assert_eq!(lines, vec![" a", " b", " c"]);
+    }
+
+    #[test]
+    fn test_diff_lines_single_change() {
+        let lines = diff_lines("a\nb\nc", "a\nX\nc");
+        assert!(lines.contains(&"-b".to_string()));
+        assert!(lines.contains(&"+X".to_string()));
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&" c".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_added_lines() {
+        // mutant has more lines than original
+        let lines = diff_lines("a", "a\nb");
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&"+b".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_removed_lines() {
+        // original has more lines than mutant
+        let lines = diff_lines("a\nb", "a");
+        assert!(lines.contains(&" a".to_string()));
+        assert!(lines.contains(&"-b".to_string()));
+    }
+
+    #[test]
+    fn test_diff_lines_both_empty() {
+        assert_eq!(diff_lines("", ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_diff_lines_one_empty() {
+        // original empty, mutant has a line
+        let lines = diff_lines("", "hello");
+        assert!(lines.contains(&"+hello".to_string()));
     }
 }

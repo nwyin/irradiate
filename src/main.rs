@@ -233,9 +233,9 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Results { all, json, report, output } => {
-            irradiate::pipeline::results(all, json, report, output)
+            irradiate::report::results(all, json, report, output)
         }
-        Commands::Show { mutant_name } => irradiate::pipeline::show(&mutant_name),
+        Commands::Show { mutant_name } => irradiate::report::show(&mutant_name),
         Commands::Cache { command } => match command {
             CacheCommands::Clean => {
                 let project_dir = std::env::current_dir()?;
