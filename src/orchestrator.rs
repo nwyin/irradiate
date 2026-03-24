@@ -446,556 +446,610 @@ pub(crate) fn determine_recycle_after(
     }
 }
 
+/// Mutable state for the dispatch loop, extracted from the monolithic `dispatch_work` function.
+struct DispatchState<'a> {
+    // Core state
+    results: Vec<MutantResult>,
+    work_queue: Vec<WorkItem>,
+    total_items: usize,
+
+    // Worker tracking
+    worker_senders: HashMap<usize, mpsc::Sender<OrchestratorMessage>>,
+    idle_workers: Vec<usize>,
+    active_mutants: HashMap<usize, String>,
+    next_worker_id: usize,
+
+    // Recycling
+    worker_recycle_counts: HashMap<usize, usize>,
+    recycled_worker_ids: HashSet<usize>,
+    pending_accepts: usize,
+    recycle_after: usize,
+    session_detection_done: bool,
+
+    // Memory monitoring
+    worker_pids: HashMap<usize, u32>,
+    workers_pending_memory_recycle: HashSet<usize>,
+
+    // Tracing
+    spawn_times: HashMap<usize, u64>,
+    dispatch_times: HashMap<usize, (u64, String)>,
+    trace: &'a mut TraceLog,
+
+    // Resources (owned by the dispatch loop, passed through for respawning)
+    processes: Vec<Child>,
+    progress: Option<crate::progress::ProgressBar>,
+    event_tx: mpsc::Sender<WorkerEvent>,
+
+    // Config (borrowed)
+    config: &'a PoolConfig,
+    harness_dir: &'a Path,
+    socket_path: &'a Path,
+}
+
+impl<'a> DispatchState<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        work_items: Vec<WorkItem>,
+        processes: Vec<Child>,
+        progress: Option<crate::progress::ProgressBar>,
+        event_tx: mpsc::Sender<WorkerEvent>,
+        config: &'a PoolConfig,
+        harness_dir: &'a Path,
+        socket_path: &'a Path,
+        trace: &'a mut TraceLog,
+    ) -> Self {
+        let total_items = work_items.len();
+        let pending_accepts = processes.len();
+        let initial_spawn_us = trace.now_us();
+
+        let mut spawn_times = HashMap::new();
+        for i in 0..processes.len() {
+            spawn_times.insert(i, initial_spawn_us);
+        }
+
+        Self {
+            results: Vec::with_capacity(total_items),
+            work_queue: prioritize_work_items(work_items).into_iter().rev().collect(),
+            total_items,
+            worker_senders: HashMap::new(),
+            idle_workers: Vec::new(),
+            active_mutants: HashMap::new(),
+            next_worker_id: 0,
+            worker_recycle_counts: HashMap::new(),
+            recycled_worker_ids: HashSet::new(),
+            pending_accepts,
+            recycle_after: config.worker_recycle_after.unwrap_or(100),
+            session_detection_done: false,
+            worker_pids: HashMap::new(),
+            workers_pending_memory_recycle: HashSet::new(),
+            spawn_times,
+            dispatch_times: HashMap::new(),
+            trace,
+            processes,
+            progress,
+            event_tx,
+            config,
+            harness_dir,
+            socket_path,
+        }
+    }
+
+    /// Record an error result for a mutant.
+    fn record_error(&mut self, mutant_name: String) {
+        if let Some(ref mut pb) = self.progress {
+            pb.worker_done(0);
+            pb.record(MutantStatus::Error);
+        }
+        self.results.push(MutantResult {
+            mutant_name,
+            exit_code: -1,
+            duration: 0.0,
+            status: MutantStatus::Error,
+        });
+    }
+
+    /// Record an error result for a worker's active mutant, updating progress.
+    fn record_worker_error(&mut self, worker_id: usize) {
+        if let Some(mutant_name) = self.active_mutants.remove(&worker_id) {
+            if let Some(ref mut pb) = self.progress {
+                pb.worker_done(worker_id);
+                pb.record(MutantStatus::Error);
+            }
+            self.results.push(MutantResult {
+                mutant_name,
+                exit_code: -1,
+                duration: 0.0,
+                status: MutantStatus::Error,
+            });
+        }
+    }
+
+    /// Try to spawn a replacement worker. Returns true on success.
+    fn respawn_worker(&mut self) -> bool {
+        let spawn_id = self.next_worker_id;
+        match spawn_worker(spawn_id, self.config, self.harness_dir, self.socket_path) {
+            Ok(child) => {
+                self.processes.push(child);
+                self.pending_accepts += 1;
+                self.spawn_times.insert(spawn_id, self.trace.now_us());
+                info!("Spawned replacement worker {spawn_id}");
+                true
+            }
+            Err(e) => {
+                error!("Failed to spawn replacement worker: {e}");
+                false
+            }
+        }
+    }
+
+    /// Dispatch work to all idle workers that have items in the queue.
+    async fn dispatch_pending(&mut self) {
+        while let Some(&worker_id) = self.idle_workers.last() {
+            let Some(item) = self.work_queue.pop() else {
+                break;
+            };
+            self.idle_workers.pop();
+            self.active_mutants.insert(worker_id, item.mutant_name.clone());
+            self.dispatch_times
+                .insert(worker_id, (self.trace.now_us(), item.mutant_name.clone()));
+            if let Some(sender) = self.worker_senders.get(&worker_id) {
+                if let Some(ref mut pb) = self.progress {
+                    pb.worker_start(worker_id, &item.mutant_name);
+                }
+                let msg = OrchestratorMessage::Run {
+                    mutant: item.mutant_name,
+                    tests: item.test_ids,
+                    timeout_secs: Some(item.timeout_secs),
+                };
+                if sender.send(msg).await.is_err() {
+                    warn!("Worker {worker_id} channel closed while dispatching");
+                    self.record_worker_error(worker_id);
+                }
+            }
+        }
+    }
+
+    /// Returns true if the dispatch loop should exit.
+    fn is_done(&self) -> bool {
+        if self.results.len() >= self.total_items {
+            return true;
+        }
+        self.results.len() + self.active_mutants.len() == 0
+            && self.work_queue.is_empty()
+            && self.pending_accepts == 0
+    }
+
+    /// Detect and handle stuck state (no workers, no pending accepts, but work remains).
+    /// Returns true if we're stuck and the loop should exit.
+    async fn handle_stuck(&mut self) -> bool {
+        if !(self.idle_workers.is_empty()
+            && self.active_mutants.is_empty()
+            && !self.work_queue.is_empty()
+            && self.pending_accepts == 0
+            && self.worker_senders.is_empty())
+        {
+            return false;
+        }
+
+        // Try to capture stderr from crashed worker processes for diagnostics
+        let mut stderr_snippet = String::new();
+        for proc in self.processes.iter_mut() {
+            if let Some(stderr) = proc.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 2048];
+                let mut async_stderr = stderr;
+                if let Ok(Ok(n)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    async_stderr.read(&mut buf),
+                )
+                .await
+                {
+                    if n > 0 {
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        if !text.trim().is_empty() {
+                            stderr_snippet = text.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        if stderr_snippet.is_empty() {
+            error!(
+                "No available workers; marking {} remaining items as errors. \
+                 All workers crashed or failed to start. Check that your test suite runs \
+                 cleanly with: pytest {}",
+                self.work_queue.len(),
+                self.config.tests_dir.display(),
+            );
+        } else {
+            error!(
+                "No available workers; marking {} remaining items as errors. \
+                 All workers crashed or failed to start.\n\
+                 Worker stderr:\n{}\n\
+                 Check that your test suite runs cleanly with: pytest {}",
+                self.work_queue.len(),
+                stderr_snippet,
+                self.config.tests_dir.display(),
+            );
+        }
+
+        for item in self.work_queue.drain(..).rev() {
+            if let Some(ref mut pb) = self.progress {
+                pb.record(MutantStatus::Error);
+            }
+            self.results.push(MutantResult {
+                mutant_name: item.mutant_name,
+                exit_code: -1,
+                duration: 0.0,
+                status: MutantStatus::Error,
+            });
+        }
+        true
+    }
+
+    /// Handle an accepted worker connection: read the ready message, register the worker.
+    async fn handle_accept(&mut self, stream: tokio::net::UnixStream) {
+        let worker_id = self.next_worker_id;
+        self.next_worker_id += 1;
+
+        let (reader, writer) = stream.into_split();
+        let mut buf_reader = BufReader::new(reader);
+
+        let mut line = String::new();
+        match timeout(Duration::from_secs(10), buf_reader.read_line(&mut line)).await {
+            Ok(Ok(0)) => {
+                error!(
+                    "Worker {worker_id}: disconnected before sending ready message. \
+                     Common causes: import error in your source code, missing dependency, \
+                     or incompatible pytest plugin."
+                );
+            }
+            Ok(Ok(_)) => {
+                match serde_json::from_str::<WorkerMessage>(line.trim()) {
+                    Ok(WorkerMessage::Ready {
+                        pid,
+                        has_session_fixtures,
+                        session_fixture_count,
+                        ..
+                    }) => {
+                        info!("Worker {worker_id} (pid {pid}) connected and ready");
+
+                        // Auto-tune recycling interval on first worker connection.
+                        if !self.session_detection_done {
+                            self.session_detection_done = true;
+                            let new_recycle = determine_recycle_after(
+                                self.config.worker_recycle_after,
+                                has_session_fixtures,
+                                session_fixture_count,
+                            );
+                            if has_session_fixtures && self.config.worker_recycle_after.is_none() {
+                                warn!(
+                                    "Session-scoped fixtures detected ({session_fixture_count}); \
+                                     reducing worker recycle interval to {new_recycle} for correctness. \
+                                     Use --worker-recycle-after to override."
+                                );
+                                info!(
+                                    "Auto-tuning worker recycle interval: {} → {new_recycle}",
+                                    self.recycle_after
+                                );
+                                self.recycle_after = new_recycle;
+                            } else if has_session_fixtures {
+                                info!(
+                                    "Session-scoped fixtures detected ({session_fixture_count}); \
+                                     respecting explicit --worker-recycle-after={}",
+                                    self.recycle_after
+                                );
+                            }
+                        }
+
+                        // Trace: worker startup span
+                        if let Some(&spawn_us) = self.spawn_times.get(&worker_id) {
+                            let now = self.trace.now_us();
+                            self.trace.complete(
+                                "worker_startup".to_string(),
+                                "lifecycle",
+                                spawn_us,
+                                now.saturating_sub(spawn_us),
+                                worker_id,
+                                Some(serde_json::json!({"pid": pid})),
+                            );
+                        }
+
+                        self.worker_pids.insert(worker_id, pid);
+                        let msg_tx = spawn_worker_task(
+                            worker_id,
+                            buf_reader.into_inner(),
+                            writer,
+                            self.event_tx.clone(),
+                            self.config.default_timeout,
+                            self.config.timeout_multiplier,
+                        );
+                        self.worker_senders.insert(worker_id, msg_tx);
+                        self.idle_workers.push(worker_id);
+                    }
+                    Ok(other) => {
+                        warn!("Worker {worker_id}: unexpected first message: {other:?}");
+                    }
+                    Err(e) => {
+                        error!("Worker {worker_id}: failed to parse ready message: {e}");
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                error!("Worker {worker_id}: error reading ready message: {e}");
+            }
+            Err(_) => {
+                error!(
+                    "Worker {worker_id}: timeout reading ready message (10s). \
+                     This usually means test collection is very slow or the worker is stuck."
+                );
+            }
+        }
+    }
+
+    /// Handle a worker event (ready, result, error, disconnected).
+    async fn handle_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::Ready { worker_id } => {
+                debug!("Worker {worker_id} ready");
+                if !self.idle_workers.contains(&worker_id) {
+                    self.idle_workers.push(worker_id);
+                }
+            }
+            WorkerEvent::Result { worker_id, result } => {
+                self.handle_result(worker_id, result).await;
+            }
+            WorkerEvent::Error {
+                worker_id,
+                message,
+                mutant,
+            } => {
+                error!("Worker {worker_id} error: {message}");
+                if let Some(mutant_name) =
+                    mutant.or_else(|| self.active_mutants.remove(&worker_id))
+                {
+                    if let Some(ref mut pb) = self.progress {
+                        pb.worker_done(worker_id);
+                        pb.record(MutantStatus::Error);
+                    }
+                    self.results.push(MutantResult {
+                        mutant_name,
+                        exit_code: -1,
+                        duration: 0.0,
+                        status: MutantStatus::Error,
+                    });
+                }
+                self.active_mutants.remove(&worker_id);
+                self.idle_workers.push(worker_id);
+            }
+            WorkerEvent::Disconnected { worker_id } => {
+                self.handle_disconnect(worker_id).await;
+            }
+        }
+    }
+
+    /// Handle a mutant result: record it, decide whether to recycle the worker.
+    async fn handle_result(&mut self, worker_id: usize, result: MutantResult) {
+        info!(
+            "Mutant {} -> {:?} ({:.3}s)",
+            result.mutant_name, result.status, result.duration
+        );
+        // Trace: mutant execution span
+        if let Some((dispatch_us, _)) = self.dispatch_times.remove(&worker_id) {
+            let now = self.trace.now_us();
+            self.trace.complete(
+                result.mutant_name.clone(),
+                "mutant",
+                dispatch_us,
+                now.saturating_sub(dispatch_us),
+                worker_id,
+                Some(serde_json::json!({
+                    "status": format!("{:?}", result.status),
+                    "duration_s": result.duration,
+                })),
+            );
+        }
+        self.active_mutants.remove(&worker_id);
+        if let Some(ref mut pb) = self.progress {
+            pb.worker_done(worker_id);
+            pb.record(result.status);
+        }
+        self.results.push(result);
+
+        let count = self.worker_recycle_counts.entry(worker_id).or_insert(0);
+        *count += 1;
+
+        let memory_recycle = self.workers_pending_memory_recycle.remove(&worker_id);
+        let count_recycle = self.recycle_after > 0 && *count >= self.recycle_after;
+
+        // Skip count-based recycling when the queue is nearly drained:
+        // spawning a replacement takes ~500ms and won't pay for itself
+        // if there are only a few mutants left. Memory-based recycling
+        // is always honored (OOM is a correctness concern).
+        let active_count = self.active_mutants.len();
+        let worth_recycling = memory_recycle
+            || (count_recycle
+                && self.work_queue.len() > active_count + self.pending_accepts);
+
+        if worth_recycling && !self.work_queue.is_empty() {
+            if memory_recycle {
+                info!("Worker {worker_id}: recycling due to memory limit exceeded");
+            } else {
+                info!(
+                    "Worker {worker_id}: recycling after {count} mutants (queue: {})",
+                    self.work_queue.len()
+                );
+            }
+            if let Some(sender) = self.worker_senders.remove(&worker_id) {
+                let _ = sender.send(OrchestratorMessage::Shutdown).await;
+            }
+            self.worker_recycle_counts.remove(&worker_id);
+            self.worker_pids.remove(&worker_id);
+            self.recycled_worker_ids.insert(worker_id);
+            self.respawn_worker();
+        } else {
+            self.idle_workers.push(worker_id);
+        }
+    }
+
+    /// Handle a worker disconnect (expected from recycling, or unexpected crash).
+    async fn handle_disconnect(&mut self, worker_id: usize) {
+        self.worker_pids.remove(&worker_id);
+        self.workers_pending_memory_recycle.remove(&worker_id);
+        if self.recycled_worker_ids.remove(&worker_id) {
+            debug!("Worker {worker_id}: recycled cleanly");
+        } else {
+            warn!(
+                "Worker {worker_id} disconnected unexpectedly — \
+                 the worker process may have crashed"
+            );
+            self.record_worker_error(worker_id);
+            self.worker_senders.remove(&worker_id);
+
+            if !self.work_queue.is_empty() {
+                info!(
+                    "Respawning worker to replace crashed {worker_id}"
+                );
+                self.respawn_worker();
+            }
+        }
+    }
+
+    /// Check health of active workers: detect dead processes immediately.
+    fn handle_health_check(&mut self) {
+        let active_pids: Vec<(usize, u32)> = self
+            .active_mutants
+            .keys()
+            .filter_map(|&wid| self.worker_pids.get(&wid).map(|&pid| (wid, pid)))
+            .collect();
+        for (worker_id, pid) in active_pids {
+            if !is_process_alive(pid) {
+                warn!("Worker {worker_id} (pid {pid}) died — marking active mutant as error");
+                self.record_worker_error(worker_id);
+                self.worker_senders.remove(&worker_id);
+                self.worker_pids.remove(&worker_id);
+
+                if !self.work_queue.is_empty() {
+                    info!("Respawning worker to replace dead {worker_id}");
+                    self.respawn_worker();
+                }
+            }
+        }
+    }
+
+    /// Check memory usage of active workers: flag those over the limit for recycling.
+    async fn handle_memory_check(&mut self) {
+        for (&worker_id, &pid) in &self.worker_pids {
+            if self.workers_pending_memory_recycle.contains(&worker_id) {
+                continue;
+            }
+            if let Ok(rss_kb) = check_rss(pid).await {
+                let rss_mb = rss_kb / 1024;
+                if rss_mb > self.config.max_worker_memory_mb {
+                    warn!(
+                        "Worker {worker_id} (pid {pid}) RSS {rss_mb}MB exceeds limit \
+                         {}MB; scheduling recycle after current task",
+                        self.config.max_worker_memory_mb
+                    );
+                    self.workers_pending_memory_recycle.insert(worker_id);
+                }
+            }
+        }
+    }
+
+    /// Shut down remaining workers and wait for processes to exit.
+    async fn shutdown(self) -> Vec<MutantResult> {
+        for sender in self.worker_senders.values() {
+            let _ = sender.send(OrchestratorMessage::Shutdown).await;
+        }
+
+        let mut wait_set = tokio::task::JoinSet::new();
+        for mut proc in self.processes {
+            wait_set.spawn(async move { proc.wait().await });
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while wait_set.join_next().await.is_some() {}
+        })
+        .await;
+
+        if let Some(pb) = self.progress {
+            pb.finish();
+        }
+
+        self.results
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_work(
     listener: UnixListener,
-    mut processes: Vec<Child>,
+    processes: Vec<Child>,
     work_items: Vec<WorkItem>,
     config: &PoolConfig,
     harness_dir: &Path,
     socket_path: &Path,
-    mut progress: Option<crate::progress::ProgressBar>,
+    progress: Option<crate::progress::ProgressBar>,
     trace: &mut TraceLog,
 ) -> Result<Vec<MutantResult>> {
-    let total_items = work_items.len();
-    let mut results: Vec<MutantResult> = Vec::with_capacity(total_items);
-    let mut work_queue: Vec<WorkItem> = prioritize_work_items(work_items)
-        .into_iter()
-        .rev()
-        .collect();
-
-    // Channel for worker events
     let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(64);
+    let mut state = DispatchState::new(
+        work_items, processes, progress, event_tx, config, harness_dir, socket_path, trace,
+    );
 
-    // Track which workers are idle
-    let mut worker_senders: HashMap<usize, mpsc::Sender<OrchestratorMessage>> = HashMap::new();
-    let mut idle_workers: Vec<usize> = Vec::new();
-    let mut active_mutants: HashMap<usize, String> = HashMap::new(); // worker_id -> mutant_name
-    let mut next_worker_id: usize = 0;
-
-    // Recycling state
-    let mut worker_recycle_counts: HashMap<usize, usize> = HashMap::new();
-    let mut recycled_worker_ids: HashSet<usize> = HashSet::new();
-    // Number of spawned workers whose connection we're still waiting to accept.
-    // Starts at num_workers (initial workers already spawned before dispatch_work is called).
-    let mut pending_accepts: usize = processes.len();
-
-    // PID tracking for memory monitoring
-    let mut worker_pids: HashMap<usize, u32> = HashMap::new();
-    // Workers flagged for recycling on next result (memory limit exceeded)
-    let mut workers_pending_memory_recycle: HashSet<usize> = HashSet::new();
-
-    // Trace: track spawn and dispatch timestamps per worker
-    let mut spawn_times: HashMap<usize, u64> = HashMap::new(); // worker_id -> spawn timestamp (us)
-    let mut dispatch_times: HashMap<usize, (u64, String)> = HashMap::new(); // worker_id -> (timestamp, mutant)
-    // Record spawn times for the initial workers (spawned before dispatch_work)
-    let initial_spawn_us = trace.now_us();
-    for i in 0..processes.len() {
-        spawn_times.insert(i, initial_spawn_us);
-    }
-
-    // Effective recycle interval: starts at the user-configured value (or 100 if auto).
-    // May be reduced on first Ready message if session fixtures are detected.
-    let mut recycle_after = config.worker_recycle_after.unwrap_or(100);
-    let mut session_detection_done = false;
-    let max_worker_memory_mb = config.max_worker_memory_mb;
     let accept_timeout = Duration::from_secs(30);
-    let default_timeout = config.default_timeout;
-    let timeout_multiplier = config.timeout_multiplier;
-
-    // Memory check interval (only active when a limit is set)
+    let max_worker_memory_mb = config.max_worker_memory_mb;
     let mut memory_check = tokio::time::interval(Duration::from_secs(2));
-
-    // Process health check: detect dead workers faster than the per-mutant
-    // socket read timeout. Polls every 500ms; a dead process triggers an
-    // immediate error result instead of waiting for the full timeout.
     let mut health_check = tokio::time::interval(Duration::from_millis(500));
 
-    // Main dispatch loop — accepts initial worker connections and processes events
     loop {
-        // Dispatch work to idle workers
-        while let Some(&worker_id) = idle_workers.last() {
-            if let Some(item) = work_queue.pop() {
-                idle_workers.pop();
-                active_mutants.insert(worker_id, item.mutant_name.clone());
-                dispatch_times.insert(worker_id, (trace.now_us(), item.mutant_name.clone()));
-                if let Some(sender) = worker_senders.get(&worker_id) {
-                    if let Some(ref mut pb) = progress {
-                        pb.worker_start(worker_id, &item.mutant_name);
-                    }
-                    let msg = OrchestratorMessage::Run {
-                        mutant: item.mutant_name,
-                        tests: item.test_ids,
-                        timeout_secs: Some(item.timeout_secs),
-                    };
-                    if sender.send(msg).await.is_err() {
-                        warn!("Worker {worker_id} channel closed while dispatching");
-                        // Put the work item back
-                        if let Some(mutant_name) = active_mutants.remove(&worker_id) {
-                            if let Some(ref mut pb) = progress {
-                                pb.worker_done(worker_id);
-                                pb.record(MutantStatus::Error);
-                            }
-                            results.push(MutantResult {
-                                mutant_name,
-                                exit_code: -1,
-                                duration: 0.0,
-                                status: MutantStatus::Error,
-                            });
-                        }
-                    }
-                }
-            } else {
-                break; // no more work
-            }
-        }
+        state.dispatch_pending().await;
 
-        // Check if we're done
-        if results.len() >= total_items {
+        if state.is_done() {
             break;
         }
-        if results.len() + active_mutants.len() == 0
-            && work_queue.is_empty()
-            && pending_accepts == 0
-        {
-            break;
-        }
-
-        // Stuck detection: no workers available, no active work, no pending accepts, but work remains
-        if idle_workers.is_empty()
-            && active_mutants.is_empty()
-            && !work_queue.is_empty()
-            && pending_accepts == 0
-            && worker_senders.is_empty()
-        {
-            // Try to capture stderr from crashed worker processes for diagnostics
-            let mut stderr_snippet = String::new();
-            for proc in processes.iter_mut() {
-                if let Some(stderr) = proc.stderr.take() {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = [0u8; 2048];
-                    let mut async_stderr = stderr;
-                    if let Ok(Ok(n)) = tokio::time::timeout(
-                        Duration::from_millis(500),
-                        async_stderr.read(&mut buf),
-                    ).await {
-                        if n > 0 {
-                            let text = String::from_utf8_lossy(&buf[..n]);
-                            if !text.trim().is_empty() {
-                                stderr_snippet = text.trim().to_string();
-                            }
-                        }
-                    }
-                }
-            }
-
-            if stderr_snippet.is_empty() {
-                error!(
-                    "No available workers; marking {} remaining items as errors. \
-                     All workers crashed or failed to start. Check that your test suite runs \
-                     cleanly with: pytest {}",
-                    work_queue.len(),
-                    config.tests_dir.display(),
-                );
-            } else {
-                error!(
-                    "No available workers; marking {} remaining items as errors. \
-                     All workers crashed or failed to start.\n\
-                     Worker stderr:\n{}\n\
-                     Check that your test suite runs cleanly with: pytest {}",
-                    work_queue.len(),
-                    stderr_snippet,
-                    config.tests_dir.display(),
-                );
-            }
-
-            for item in work_queue.drain(..).rev() {
-                if let Some(ref mut pb) = progress {
-                    pb.record(MutantStatus::Error);
-                }
-                results.push(MutantResult {
-                    mutant_name: item.mutant_name,
-                    exit_code: -1,
-                    duration: 0.0,
-                    status: MutantStatus::Error,
-                });
-            }
+        if state.handle_stuck().await {
             break;
         }
 
         tokio::select! {
-            // Accept a pending worker connection (initial or replacement)
-            r = timeout(accept_timeout, listener.accept()), if pending_accepts > 0 => {
-                pending_accepts -= 1;
+            r = timeout(accept_timeout, listener.accept()), if state.pending_accepts > 0 => {
+                state.pending_accepts -= 1;
                 match r {
-                    Ok(Ok((stream, _))) => {
-                        let worker_id = next_worker_id;
-                        next_worker_id += 1;
-
-                        let (reader, writer) = stream.into_split();
-                        let mut buf_reader = BufReader::new(reader);
-
-                        // Read the ready message
-                        let mut line = String::new();
-                        match timeout(Duration::from_secs(10), buf_reader.read_line(&mut line)).await {
-                            Ok(Ok(0)) => {
-                                error!(
-                                    "Worker {worker_id}: disconnected before sending ready message. \
-                                     Common causes: import error in your source code, missing dependency, \
-                                     or incompatible pytest plugin."
-                                );
-                            }
-                            Ok(Ok(_)) => {
-                                match serde_json::from_str::<WorkerMessage>(line.trim()) {
-                                    Ok(WorkerMessage::Ready {
-                                        pid,
-                                        has_session_fixtures,
-                                        session_fixture_count,
-                                        ..
-                                    }) => {
-                                        info!("Worker {worker_id} (pid {pid}) connected and ready");
-
-                                        // Auto-tune recycling interval on first worker connection.
-                                        if !session_detection_done {
-                                            session_detection_done = true;
-                                            let new_recycle = determine_recycle_after(
-                                                config.worker_recycle_after,
-                                                has_session_fixtures,
-                                                session_fixture_count,
-                                            );
-                                            if has_session_fixtures && config.worker_recycle_after.is_none() {
-                                                warn!(
-                                                    "Session-scoped fixtures detected ({session_fixture_count}); \
-                                                     reducing worker recycle interval to {new_recycle} for correctness. \
-                                                     Use --worker-recycle-after to override."
-                                                );
-                                                info!(
-                                                    "Auto-tuning worker recycle interval: {recycle_after} → {new_recycle}"
-                                                );
-                                                recycle_after = new_recycle;
-                                            } else if has_session_fixtures {
-                                                info!(
-                                                    "Session-scoped fixtures detected ({session_fixture_count}); \
-                                                     respecting explicit --worker-recycle-after={recycle_after}"
-                                                );
-                                            }
-                                        }
-
-                                        // Trace: worker startup span
-                                        if let Some(&spawn_us) = spawn_times.get(&worker_id) {
-                                            let now = trace.now_us();
-                                            trace.complete(
-                                                "worker_startup".to_string(),
-                                                "lifecycle",
-                                                spawn_us,
-                                                now.saturating_sub(spawn_us),
-                                                worker_id,
-                                                Some(serde_json::json!({"pid": pid})),
-                                            );
-                                        }
-
-                                        worker_pids.insert(worker_id, pid);
-                                        let msg_tx = spawn_worker_task(
-                                            worker_id,
-                                            buf_reader.into_inner(),
-                                            writer,
-                                            event_tx.clone(),
-                                            default_timeout,
-                                            timeout_multiplier,
-                                        );
-                                        worker_senders.insert(worker_id, msg_tx);
-                                        idle_workers.push(worker_id);
-                                    }
-                                    Ok(other) => {
-                                        warn!("Worker {worker_id}: unexpected first message: {other:?}");
-                                    }
-                                    Err(e) => {
-                                        error!("Worker {worker_id}: failed to parse ready message: {e}");
-                                    }
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                error!("Worker {worker_id}: error reading ready message: {e}");
-                            }
-                            Err(_) => {
-                                error!(
-                                    "Worker {worker_id}: timeout reading ready message (10s). \
-                                     This usually means test collection is very slow or the worker is stuck."
-                                );
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        error!("Failed to accept worker connection: {e}");
-                    }
-                    Err(_) => {
-                        error!(
-                            "Timeout waiting for worker connection (30s). \
-                             The worker process may have crashed during startup."
-                        );
-                    }
+                    Ok(Ok((stream, _))) => state.handle_accept(stream).await,
+                    Ok(Err(e)) => error!("Failed to accept worker connection: {e}"),
+                    Err(_) => error!(
+                        "Timeout waiting for worker connection (30s). \
+                         The worker process may have crashed during startup."
+                    ),
                 }
             }
 
-            // Process events from workers
             event = event_rx.recv() => {
                 match event {
-                    Some(WorkerEvent::Ready { worker_id }) => {
-                        debug!("Worker {worker_id} ready");
-                        if !idle_workers.contains(&worker_id) {
-                            idle_workers.push(worker_id);
-                        }
-                    }
-                    Some(WorkerEvent::Result { worker_id, result }) => {
-                        info!(
-                            "Mutant {} -> {:?} ({:.3}s)",
-                            result.mutant_name, result.status, result.duration
-                        );
-                        // Trace: mutant execution span
-                        if let Some((dispatch_us, _)) = dispatch_times.remove(&worker_id) {
-                            let now = trace.now_us();
-                            trace.complete(
-                                result.mutant_name.clone(),
-                                "mutant",
-                                dispatch_us,
-                                now.saturating_sub(dispatch_us),
-                                worker_id,
-                                Some(serde_json::json!({
-                                    "status": format!("{:?}", result.status),
-                                    "duration_s": result.duration,
-                                })),
-                            );
-                        }
-                        active_mutants.remove(&worker_id);
-                        if let Some(ref mut pb) = progress {
-                            pb.worker_done(worker_id);
-                            pb.record(result.status);
-                        }
-                        results.push(result);
-
-                        let count = worker_recycle_counts.entry(worker_id).or_insert(0);
-                        *count += 1;
-
-                        let memory_recycle = workers_pending_memory_recycle.remove(&worker_id);
-                        let count_recycle = recycle_after > 0 && *count >= recycle_after;
-
-                        // Skip count-based recycling when the queue is nearly drained:
-                        // spawning a replacement takes ~500ms and won't pay for itself
-                        // if there are only a few mutants left. Memory-based recycling
-                        // is always honored (OOM is a correctness concern).
-                        let active_count = active_mutants.len();
-                        let worth_recycling = memory_recycle
-                            || (count_recycle && work_queue.len() > active_count + pending_accepts);
-
-                        if worth_recycling && !work_queue.is_empty() {
-                            // Recycle: send shutdown, spawn a fresh replacement
-                            if memory_recycle {
-                                info!("Worker {worker_id}: recycling due to memory limit exceeded");
-                            } else {
-                                info!("Worker {worker_id}: recycling after {count} mutants (queue: {})", work_queue.len());
-                            }
-                            if let Some(sender) = worker_senders.remove(&worker_id) {
-                                let _ = sender.send(OrchestratorMessage::Shutdown).await;
-                            }
-                            worker_recycle_counts.remove(&worker_id);
-                            worker_pids.remove(&worker_id);
-                            recycled_worker_ids.insert(worker_id);
-
-                            let spawn_id = next_worker_id; // ID the replacement will be assigned on accept
-                            match spawn_worker(spawn_id, config, harness_dir, socket_path) {
-                                Ok(child) => {
-                                    processes.push(child);
-                                    pending_accepts += 1;
-                                    spawn_times.insert(spawn_id, trace.now_us());
-                                    info!("Spawned replacement worker {spawn_id}");
-                                }
-                                Err(e) => {
-                                    error!("Failed to spawn replacement worker: {e}");
-                                    // Stuck detection will surface the lack of workers if needed
-                                }
-                            }
-                            // Do NOT add worker_id back to idle_workers — it is being recycled
-                        } else {
-                            idle_workers.push(worker_id);
-                        }
-                    }
-                    Some(WorkerEvent::Error {
-                        worker_id,
-                        message,
-                        mutant,
-                    }) => {
-                        error!("Worker {worker_id} error: {message}");
-                        if let Some(mutant_name) = mutant.or_else(|| active_mutants.remove(&worker_id)) {
-                            if let Some(ref mut pb) = progress {
-                                pb.worker_done(worker_id);
-                                pb.record(MutantStatus::Error);
-                            }
-                            results.push(MutantResult {
-                                mutant_name,
-                                exit_code: -1,
-                                duration: 0.0,
-                                status: MutantStatus::Error,
-                            });
-                        }
-                        active_mutants.remove(&worker_id);
-                        idle_workers.push(worker_id);
-                    }
-                    Some(WorkerEvent::Disconnected { worker_id }) => {
-                        worker_pids.remove(&worker_id);
-                        workers_pending_memory_recycle.remove(&worker_id);
-                        if recycled_worker_ids.remove(&worker_id) {
-                            // Expected: we asked this worker to shut down for recycling
-                            debug!("Worker {worker_id}: recycled cleanly");
-                        } else {
-                            warn!(
-                                "Worker {worker_id} disconnected unexpectedly — \
-                                 the worker process may have crashed"
-                            );
-                            // Record any active mutant as error
-                            if let Some(mutant_name) = active_mutants.remove(&worker_id) {
-                                if let Some(ref mut pb) = progress {
-                                    pb.worker_done(worker_id);
-                                    pb.record(MutantStatus::Error);
-                                }
-                                results.push(MutantResult {
-                                    mutant_name,
-                                    exit_code: -1,
-                                    duration: 0.0,
-                                    status: MutantStatus::Error,
-                                });
-                            }
-                            worker_senders.remove(&worker_id);
-
-                            // Respawn if we still have work
-                            if !work_queue.is_empty() {
-                                let spawn_id = next_worker_id;
-                                info!("Respawning worker {spawn_id} to replace crashed {worker_id}");
-                                match spawn_worker(spawn_id, config, harness_dir, socket_path) {
-                                    Ok(child) => {
-                                        processes.push(child);
-                                        pending_accepts += 1;
-                                        spawn_times.insert(spawn_id, trace.now_us());
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to respawn worker: {e}");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Some(e) => state.handle_event(e).await,
                     None => {
-                        // All event_tx clones dropped — all worker tasks finished
                         warn!("All worker tasks finished");
-                        for (_, mutant_name) in active_mutants.drain() {
-                            if let Some(ref mut pb) = progress {
-                                pb.record(MutantStatus::Error);
-                            }
-                            results.push(MutantResult {
-                                mutant_name,
-                                exit_code: -1,
-                                duration: 0.0,
-                                status: MutantStatus::Error,
-                            });
+                        let orphaned: Vec<String> = state.active_mutants.drain().map(|(_, n)| n).collect();
+                        for mutant_name in orphaned {
+                            state.record_error(mutant_name);
                         }
                         break;
                     }
                 }
             }
 
-            // Process health check: detect dead workers immediately instead of
-            // waiting for the per-mutant socket read timeout (which can be 20s+).
             _ = health_check.tick() => {
-                // Only check workers that have an active mutant assignment
-                let active_pids: Vec<(usize, u32)> = active_mutants
-                    .keys()
-                    .filter_map(|&wid| worker_pids.get(&wid).map(|&pid| (wid, pid)))
-                    .collect();
-                for (worker_id, pid) in active_pids {
-                    if !is_process_alive(pid) {
-                        warn!("Worker {worker_id} (pid {pid}) died — marking active mutant as error");
-                        if let Some(mutant_name) = active_mutants.remove(&worker_id) {
-                            if let Some(ref mut pb) = progress {
-                                pb.worker_done(worker_id);
-                                pb.record(MutantStatus::Error);
-                            }
-                            results.push(MutantResult {
-                                mutant_name,
-                                exit_code: -1,
-                                duration: 0.0,
-                                status: MutantStatus::Error,
-                            });
-                        }
-                        worker_senders.remove(&worker_id);
-                        worker_pids.remove(&worker_id);
-
-                        // Respawn if there's still work
-                        if !work_queue.is_empty() {
-                            let spawn_id = next_worker_id;
-                            info!("Respawning worker {spawn_id} to replace dead {worker_id}");
-                            match spawn_worker(spawn_id, config, harness_dir, socket_path) {
-                                Ok(child) => {
-                                    processes.push(child);
-                                    pending_accepts += 1;
-                                    spawn_times.insert(spawn_id, trace.now_us());
-                                }
-                                Err(e) => {
-                                    error!("Failed to respawn worker: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
+                state.handle_health_check();
             }
 
-            // Periodic memory check: sample RSS for each worker and flag those over the limit
             _ = memory_check.tick(), if max_worker_memory_mb > 0 => {
-                for (&worker_id, &pid) in &worker_pids {
-                    if workers_pending_memory_recycle.contains(&worker_id) {
-                        continue; // already flagged
-                    }
-                    match check_rss(pid).await {
-                        Ok(rss_kb) => {
-                            let rss_mb = rss_kb / 1024;
-                            if rss_mb > max_worker_memory_mb {
-                                warn!(
-                                    "Worker {worker_id} (pid {pid}) RSS {rss_mb}MB exceeds limit \
-                                     {max_worker_memory_mb}MB; scheduling recycle after current task"
-                                );
-                                workers_pending_memory_recycle.insert(worker_id);
-                            }
-                        }
-                        Err(_) => {
-                            // Process may have already exited; ignore
-                        }
-                    }
-                }
+                state.handle_memory_check().await;
             }
         }
     }
 
-    // Shutdown remaining workers
-    for sender in worker_senders.values() {
-        let _ = sender.send(OrchestratorMessage::Shutdown).await;
-    }
-
-    // Wait for all processes concurrently with a single shared timeout.
-    // Recycled workers may already have exited; stuck processes are killed on
-    // Child drop (kill_on_drop=true). A single timeout avoids sequential 5s
-    // waits per stuck process.
-    let mut wait_set = tokio::task::JoinSet::new();
-    for mut proc in processes {
-        wait_set.spawn(async move { proc.wait().await });
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        while wait_set.join_next().await.is_some() {}
-    })
-    .await;
-
-    if let Some(pb) = progress {
-        pb.finish();
-    }
-
-    Ok(results)
+    Ok(state.shutdown().await)
 }
 
 fn prioritize_work_items(mut work_items: Vec<WorkItem>) -> Vec<WorkItem> {
