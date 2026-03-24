@@ -55,6 +55,8 @@ pub struct RunConfig {
     pub sample: Option<f64>,
     /// RNG seed for `--sample`. Default 0 for deterministic reproducibility.
     pub sample_seed: u64,
+    /// Ignore cached results — re-run all mutants from scratch.
+    pub no_cache: bool,
     /// Extra arguments appended to every pytest invocation.
     /// Sourced from `pytest_add_cli_args` in pyproject.toml and/or `--pytest-args` CLI flag.
     pub pytest_add_cli_args: Vec<String>,
@@ -443,23 +445,25 @@ async fn phase_execute(
             continue;
         }
 
-        item.cache_key = cache::build_cache_key(
-            &ctx.project_dir, &item.descriptor, &item.work_item.test_ids,
-            &mut resolved_test_paths, &mut test_file_hashes,
-        )?;
+        if !config.no_cache {
+            item.cache_key = cache::build_cache_key(
+                &ctx.project_dir, &item.descriptor, &item.work_item.test_ids,
+                &mut resolved_test_paths, &mut test_file_hashes,
+            )?;
 
-        if let Some(ref key) = item.cache_key {
-            if let Some(entry) = cache::load_entry(&ctx.project_dir, key)? {
-                cache_counts.hits += 1;
-                results.push(MutantResult {
-                    mutant_name: item.work_item.mutant_name.clone(),
-                    exit_code: entry.exit_code,
-                    duration: entry.duration,
-                    status: entry.status,
-                });
-                continue;
+            if let Some(ref key) = item.cache_key {
+                if let Some(entry) = cache::load_entry(&ctx.project_dir, key)? {
+                    cache_counts.hits += 1;
+                    results.push(MutantResult {
+                        mutant_name: item.work_item.mutant_name.clone(),
+                        exit_code: entry.exit_code,
+                        duration: entry.duration,
+                        status: entry.status,
+                    });
+                    continue;
+                }
+                cache_counts.misses += 1;
             }
-            cache_counts.misses += 1;
         }
 
         covered_work.push(item);
@@ -500,16 +504,18 @@ async fn phase_execute(
             "executed": run_results.len(),
         })));
 
-        // Store results in cache
-        let cache_keys_by_mutant: HashMap<String, String> = covered_work
-            .iter()
-            .filter_map(|item| {
-                item.cache_key.as_ref().map(|key| (item.work_item.mutant_name.clone(), key.clone()))
-            })
-            .collect();
-        for result in &run_results {
-            if let Some(key) = cache_keys_by_mutant.get(&result.mutant_name) {
-                cache::store_entry(&ctx.project_dir, key, result.exit_code, result.duration, result.status)?;
+        // Store results in cache (skip when --no-cache)
+        if !config.no_cache {
+            let cache_keys_by_mutant: HashMap<String, String> = covered_work
+                .iter()
+                .filter_map(|item| {
+                    item.cache_key.as_ref().map(|key| (item.work_item.mutant_name.clone(), key.clone()))
+                })
+                .collect();
+            for result in &run_results {
+                if let Some(key) = cache_keys_by_mutant.get(&result.mutant_name) {
+                    cache::store_entry(&ctx.project_dir, key, result.exit_code, result.duration, result.status)?;
+                }
             }
         }
         results.extend(run_results);
@@ -2585,6 +2591,7 @@ index 000..abc
             diff_ref: None,
             report: None,
             report_output: None,
+            no_cache: false,
             sample: None,
             sample_seed: 0,
             pytest_add_cli_args: vec![],

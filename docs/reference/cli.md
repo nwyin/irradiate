@@ -47,6 +47,7 @@ irradiate run [OPTIONS] [MUTANT_NAMES]...
 | `-o, --output` | path | auto | Report output path |
 | `--sample` | float | -- | Random mutant sample. 0.0-1.0 = fraction, >1 = count |
 | `--sample-seed` | int | `0` | RNG seed for `--sample` (deterministic by default) |
+| `--no-cache` | flag | -- | Ignore cached results; re-test all mutants from scratch |
 | `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation |
 
 ### Examples
@@ -63,6 +64,7 @@ irradiate run mylib.x_add__irradiate_3           # test one specific mutant
 irradiate run --workers 4 --covered-only         # tuning
 irradiate run --sample 0.1                       # test 10% of mutants (fast CI)
 irradiate run --sample 50 --sample-seed 42       # test exactly 50, reproducible
+irradiate run --no-cache                         # ignore cache, re-test everything
 ```
 
 

@@ -111,6 +111,10 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         sample_seed: u64,
 
+        /// Ignore cached results — re-test all mutants from scratch
+        #[arg(long)]
+        no_cache: bool,
+
         /// Extra arguments to pass to every pytest invocation (appended after config file values).
         /// Example: --pytest-args=-v --pytest-args=--tb=short
         #[arg(long = "pytest-args")]
@@ -182,6 +186,7 @@ async fn main() -> Result<()> {
             diff,
             report,
             output,
+            no_cache,
             sample,
             sample_seed,
             pytest_args,
@@ -226,6 +231,7 @@ async fn main() -> Result<()> {
                 diff_ref: diff,
                 report,
                 report_output: output,
+                no_cache,
                 sample,
                 sample_seed,
                 pytest_add_cli_args,
