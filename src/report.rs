@@ -843,6 +843,48 @@ pub fn print_summary(
         eprintln!("  (sampled — score is an estimate)");
     }
 
+    // Per-operator kill rates (only when we have descriptor info and enough mutants)
+    if tested > 0 && !descriptors.is_empty() {
+        let mut operator_killed: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        let mut operator_tested: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for r in results {
+            if r.status == MutantStatus::NoTests || r.status == MutantStatus::Error {
+                continue;
+            }
+            let op = descriptors
+                .get(&r.mutant_name)
+                .map(|d| d.operator.as_str())
+                .unwrap_or("unknown");
+            *operator_tested.entry(op).or_default() += 1;
+            if r.status == MutantStatus::Killed || r.status == MutantStatus::Timeout {
+                *operator_killed.entry(op).or_default() += 1;
+            }
+        }
+        if operator_tested.len() > 1 {
+            eprintln!();
+            eprintln!("  By operator:");
+            // Sort by kill rate ascending (weakest first)
+            let mut ops: Vec<_> = operator_tested.keys().copied().collect();
+            ops.sort_by(|a, b| {
+                let rate_a =
+                    *operator_killed.get(a).unwrap_or(&0) as f64 / *operator_tested.get(a).unwrap_or(&1) as f64;
+                let rate_b =
+                    *operator_killed.get(b).unwrap_or(&0) as f64 / *operator_tested.get(b).unwrap_or(&1) as f64;
+                rate_a
+                    .partial_cmp(&rate_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for op in &ops {
+                let k = *operator_killed.get(op).unwrap_or(&0);
+                let t = *operator_tested.get(op).unwrap_or(&1);
+                let pct = k as f64 / t as f64 * 100.0;
+                eprintln!("    {op:<36} {k:>3}/{t:<3} {pct:>5.1}%");
+            }
+        }
+    }
+
     if survived > 0 {
         eprintln!();
         eprintln!("Survived mutants:");
