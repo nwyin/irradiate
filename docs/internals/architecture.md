@@ -78,15 +78,101 @@ Worker → Orchestrator:
   {"type":"error","message":"..."}
 ```
 
-## Architecture
+## Module dependency graph
+
+Generated from `cargo modules dependencies`. Solid arrows are ownership (parent module), dashed arrows are `use` dependencies.
+
+```mermaid
+graph LR
+    main["main.rs<br/><small>CLI + clap</small>"]
+    pipeline["pipeline<br/><small>orchestration</small>"]
+    codegen["codegen<br/><small>file mutation</small>"]
+    orchestrator["orchestrator<br/><small>worker pool</small>"]
+    mutation["mutation<br/><small>shared types</small>"]
+    tree_sitter["tree_sitter_mutation<br/><small>mutation engine</small>"]
+    regex_mut["regex_mutation<br/><small>regex operators</small>"]
+    trampoline["trampoline<br/><small>code generation</small>"]
+    cache["cache<br/><small>content-addressed</small>"]
+    stats["stats<br/><small>coverage + timing</small>"]
+    report["report<br/><small>output + reports</small>"]
+    protocol["protocol<br/><small>IPC types</small>"]
+    harness["harness<br/><small>Python extraction</small>"]
+    config["config<br/><small>pyproject.toml</small>"]
+    git_diff["git_diff<br/><small>incremental mode</small>"]
+    progress["progress<br/><small>terminal UI</small>"]
+    trace["trace<br/><small>chrome tracing</small>"]
+
+    main --> pipeline
+    main --> report
+
+    pipeline --> codegen
+    pipeline --> orchestrator
+    pipeline --> cache
+    pipeline --> stats
+    pipeline --> report
+    pipeline --> harness
+    pipeline --> git_diff
+    pipeline --> progress
+    pipeline --> trace
+
+    codegen --> mutation
+    codegen --> trampoline
+    codegen --> cache
+    codegen --> git_diff
+
+    orchestrator --> harness
+    orchestrator --> protocol
+    orchestrator --> progress
+    orchestrator --> trace
+
+    tree_sitter --> mutation
+    regex_mut --> mutation
+    trampoline --> mutation
+
+    cache --> protocol
+    report --> cache
+    report --> protocol
+    report --> stats
+    report --> config
+    progress --> protocol
+```
+
+## Execution pipeline
+
+Data flow through a single `irradiate run` invocation:
+
+```mermaid
+flowchart TD
+    A["<b>Phase 1: Generate</b><br/>tree-sitter parses .py files<br/>→ FunctionMutations per file<br/>→ trampolined source in mutants/"]
+    B["<b>Phase 2: Stats</b><br/>single pytest run collects:<br/>- which tests hit which functions<br/>- per-test durations<br/>- fail path validation"]
+    C["<b>Phase 3: Schedule</b><br/>build WorkItems per mutant<br/>→ cache lookup (SHA-256)<br/>→ split: cached / uncovered / execute"]
+    D["<b>Phase 4: Execute</b><br/>worker pool or --isolate<br/>fork-per-mutant, IPC results<br/>→ cache store"]
+    E["<b>Phase 4b: Verify</b><br/>--verify-survivors re-tests<br/>in isolate mode"]
+    F["<b>Phase 5: Report</b><br/>.meta files, terminal summary<br/>JSON/HTML/GitHub annotations<br/>--fail-under check"]
+
+    A --> B --> C --> D --> E --> F
+
+    subgraph "Worker Pool (Phase 4)"
+        W1["worker 0<br/><small>fork → set active_mutant<br/>→ run tests → exit code</small>"]
+        W2["worker 1"]
+        W3["worker N"]
+    end
+
+    D --> W1
+    D --> W2
+    D --> W3
+```
+
+## Component overview
 
 ```
 irradiate (Rust binary)
 ├── CLI (clap)
 ├── Mutation Engine
 │   ├── Python parser (tree-sitter + tree-sitter-python)
-│   ├── 27 mutation operator categories (~160+ distinct mutations)
-│   ├── Trampoline code generation (descriptor-aware for @property/@classmethod/@staticmethod)
+│   ├── 28+ mutation operator categories
+│   ├── Regex pattern mutation (regex-syntax crate)
+│   ├── Trampoline code generation (descriptor-aware)
 │   └── Parallel file processing (rayon)
 ├── Worker Pool Orchestrator
 │   ├── Fork-per-mutant inside pre-warmed workers
