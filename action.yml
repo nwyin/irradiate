@@ -92,45 +92,55 @@ runs:
     - name: Run irradiate
       id: run
       shell: bash
+      env:
+        INPUT_PATHS_TO_MUTATE: ${{ inputs.paths-to-mutate }}
+        INPUT_TESTS_DIR: ${{ inputs.tests-dir }}
+        INPUT_DIFF: ${{ inputs.diff }}
+        INPUT_FAIL_UNDER: ${{ inputs.fail-under }}
+        INPUT_SAMPLE: ${{ inputs.sample }}
+        INPUT_REPORT: ${{ inputs.report }}
+        INPUT_REPORT_OUTPUT: ${{ inputs.report-output }}
+        INPUT_WORKERS: ${{ inputs.workers }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra-args }}
       run: |
         args=""
 
-        if [ -n "${{ inputs.paths-to-mutate }}" ]; then
-          for p in ${{ inputs.paths-to-mutate }}; do
+        if [ -n "$INPUT_PATHS_TO_MUTATE" ]; then
+          for p in $INPUT_PATHS_TO_MUTATE; do
             args="$args --paths-to-mutate $p"
           done
         fi
 
-        if [ -n "${{ inputs.tests-dir }}" ]; then
-          args="$args --tests-dir ${{ inputs.tests-dir }}"
+        if [ -n "$INPUT_TESTS_DIR" ]; then
+          args="$args --tests-dir $INPUT_TESTS_DIR"
         fi
 
-        if [ -n "${{ inputs.diff }}" ]; then
-          args="$args --diff ${{ inputs.diff }}"
+        if [ -n "$INPUT_DIFF" ]; then
+          args="$args --diff $INPUT_DIFF"
         fi
 
-        if [ -n "${{ inputs.fail-under }}" ]; then
-          args="$args --fail-under ${{ inputs.fail-under }}"
+        if [ -n "$INPUT_FAIL_UNDER" ]; then
+          args="$args --fail-under $INPUT_FAIL_UNDER"
         fi
 
-        if [ -n "${{ inputs.sample }}" ]; then
-          args="$args --sample ${{ inputs.sample }}"
+        if [ -n "$INPUT_SAMPLE" ]; then
+          args="$args --sample $INPUT_SAMPLE"
         fi
 
-        if [ -n "${{ inputs.report }}" ]; then
-          args="$args --report ${{ inputs.report }}"
+        if [ -n "$INPUT_REPORT" ]; then
+          args="$args --report $INPUT_REPORT"
         fi
 
-        if [ -n "${{ inputs.report-output }}" ]; then
-          args="$args --output ${{ inputs.report-output }}"
+        if [ -n "$INPUT_REPORT_OUTPUT" ]; then
+          args="$args --output $INPUT_REPORT_OUTPUT"
         fi
 
-        if [ -n "${{ inputs.workers }}" ]; then
-          args="$args --workers ${{ inputs.workers }}"
+        if [ -n "$INPUT_WORKERS" ]; then
+          args="$args --workers $INPUT_WORKERS"
         fi
 
-        if [ -n "${{ inputs.extra-args }}" ]; then
-          args="$args ${{ inputs.extra-args }}"
+        if [ -n "$INPUT_EXTRA_ARGS" ]; then
+          args="$args $INPUT_EXTRA_ARGS"
         fi
 
         # Run and capture output for parsing
@@ -139,9 +149,11 @@ runs:
         exit_code=${PIPESTATUS[0]}
         set -e
 
-        # Parse outputs
-        killed=$(grep -oP 'Killed:\s+\K\d+' /tmp/irradiate-output.txt || echo 0)
-        survived=$(grep -oP 'Survived:\s+\K\d+' /tmp/irradiate-output.txt || echo 0)
+        # Parse outputs (POSIX-compatible, no -P flag)
+        killed=$(sed -n 's/.*Killed:[[:space:]]*\([0-9]*\).*/\1/p' /tmp/irradiate-output.txt)
+        survived=$(sed -n 's/.*Survived:[[:space:]]*\([0-9]*\).*/\1/p' /tmp/irradiate-output.txt)
+        killed=${killed:-0}
+        survived=${survived:-0}
         total=$((killed + survived))
         if [ "$total" -gt 0 ]; then
           score=$(echo "scale=1; $killed * 100 / $total" | bc)

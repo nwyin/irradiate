@@ -80,7 +80,9 @@ Mutation testing complete (14 mutants in 0.1s, 175 mutants/sec)
   Score:     91.7%
 
 Survived mutants:
-  simple_lib/__init__.py:6  replaced `0` with `1` (number_mutation)
+
+  number_mutation (1):
+    simple_lib/__init__.py:6  replaced `0` with `1`  [simple_lib.x_add__irradiate_3]
 ```
 
 ## Configuration

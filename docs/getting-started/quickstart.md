@@ -102,6 +102,22 @@ Results are cached by content hash. Unchanged functions with unchanged tests ski
 irradiate cache clean   # clear if needed
 ```
 
+## GitHub Actions
+
+Add mutation testing to your PR checks:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: nwyin/irradiate@v0
+  with:
+    diff: origin/main
+    fail-under: "80"
+```
+
+This installs irradiate, tests only functions changed in the PR, fails if the mutation score drops below 80%, and adds inline annotations on survived mutants. See [CI Integration](../guide/ci-integration.md) for the full reference.
+
 ## Next steps
 
 - [Configuration](configuration.md) — pyproject.toml settings
