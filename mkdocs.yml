@@ -80,6 +80,7 @@ nav:
     - Mutation Operators: internals/mutation-operators.md
     - Import Hook: internals/import-hook.md
     - Decorators: internals/decorators.md
+    - Contributing: internals/contributing.md
   - Mutation Pruning: mutation-pruning.md
   - Reference:
     - CLI: reference/cli.md
