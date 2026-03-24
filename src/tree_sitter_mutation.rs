@@ -152,7 +152,7 @@ const METHOD_SWAPS: &[(&str, &str)] = &[
 ];
 const CONDITIONAL_METHOD_SWAPS: &[(&str, &str)] = &[("split", "rsplit"), ("rsplit", "split")];
 
-pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations> {
+pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
     let tree = match parse_python(source) {
         Some(tree) => tree,
         None => return vec![],
@@ -1900,7 +1900,7 @@ mod tests {
             "    return 0\n",
         );
 
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -1931,7 +1931,7 @@ mod tests {
             "    )\n",
         );
 
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -1956,7 +1956,7 @@ mod tests {
         // INV-3: decorated functions produce zero mutations
         let source = "@decorator\ndef f():\n    return 1\n";
         assert!(
-            collect_file_mutations_tree_sitter(source).is_empty(),
+            collect_file_mutations(source).is_empty(),
             "decorated function must produce zero FunctionMutations"
         );
     }
@@ -1974,7 +1974,7 @@ mod tests {
             "            return \"other\"\n",
         );
 
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -1998,7 +1998,7 @@ mod tests {
     fn tree_sitter_default_arg_and_name_mutations_work() {
         let source =
             "def f(flag=True, value=0, copier=deepcopy):\n    return flag, value, copier\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
         assert!(
@@ -2017,7 +2017,7 @@ mod tests {
             "        break\n",
             "    return total\n",
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2045,7 +2045,7 @@ mod tests {
             "    except ValueError:\n",
             "        return dict(foo=1)\n",
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2068,7 +2068,7 @@ mod tests {
         // INV-4: NEVER_MUTATE_FUNCTIONS produce zero mutations
         for name in NEVER_MUTATE_FUNCTIONS {
             let source = format!("def {name}(self, x):\n    return x + 1\n");
-            let fms = collect_file_mutations_tree_sitter(&source);
+            let fms = collect_file_mutations(&source);
             assert!(
                 fms.is_empty(),
                 "NEVER_MUTATE_FUNCTIONS: {name} must produce zero FunctionMutations"
@@ -2081,21 +2081,21 @@ mod tests {
     #[test]
     fn tree_sitter_skips_enum_class_methods() {
         let source = "class Color(IntEnum):\n    RED = 1\n    def label(self):\n        return 'color'\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "Enum subclass methods should produce zero mutations");
     }
 
     #[test]
     fn tree_sitter_skips_qualified_enum_base() {
         let source = "class Status(enum.StrEnum):\n    ACTIVE = 'active'\n    def display(self):\n        return self.value\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty());
     }
 
     #[test]
     fn tree_sitter_does_not_skip_regular_classes() {
         let source = "class Foo(Base):\n    def bar(self):\n        return 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "Regular class methods should still be mutated");
     }
 
@@ -2103,7 +2103,7 @@ mod tests {
     fn tree_sitter_skips_all_enum_variants() {
         for base in &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "enum.Enum", "enum.IntEnum", "enum.StrEnum", "enum.Flag", "enum.IntFlag"] {
             let source = format!("class C({base}):\n    A = 1\n    def f(self):\n        return 1\n");
-            let fms = collect_file_mutations_tree_sitter(&source);
+            let fms = collect_file_mutations(&source);
             assert!(fms.is_empty(), "Expected empty for base {base}, got {:?}", fms.len());
         }
     }
@@ -2113,7 +2113,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_function_with_nonlocal() {
         let source = "def outer():\n    x = 0\n    def inner():\n        nonlocal x\n        x += 1\n    return inner\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "Function containing nonlocal should be skipped");
     }
 
@@ -2121,7 +2121,7 @@ mod tests {
     fn tree_sitter_skips_direct_nonlocal() {
         // nonlocal at function body level (not nested) should also be skipped
         let source = "def f():\n    nonlocal x\n    return x + 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty());
     }
 
@@ -2130,21 +2130,21 @@ mod tests {
     #[test]
     fn tree_sitter_skips_repr_method() {
         let source = "class C:\n    def __repr__(self):\n        return f'C({self.x})'\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "__repr__ must produce zero mutations");
     }
 
     #[test]
     fn tree_sitter_skips_str_method() {
         let source = "class C:\n    def __str__(self):\n        return str(self.x)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "__str__ must produce zero mutations");
     }
 
     #[test]
     fn tree_sitter_skips_hash_method() {
         let source = "class C:\n    def __hash__(self):\n        return hash(self.x)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(fms.is_empty(), "__hash__ must produce zero mutations");
     }
 
@@ -2153,7 +2153,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_logging_statement_deletion() {
         let source = "def f(x):\n    logging.info('processing %s', x)\n    return x + 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let stmt_dels: Vec<_> = fm
             .mutations
@@ -2168,7 +2168,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_logger_statement_deletion() {
         let source = "def f(x):\n    logger.warning('bad value: %s', x)\n    return x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let stmt_dels: Vec<_> = fm
             .mutations
@@ -2181,7 +2181,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_warnings_warn_statement_deletion() {
         let source = "def f(x):\n    warnings.warn('deprecated')\n    return x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let stmt_dels: Vec<_> = fm
             .mutations
@@ -2194,7 +2194,7 @@ mod tests {
     #[test]
     fn tree_sitter_does_not_skip_non_arid_calls() {
         let source = "def f(x):\n    process(x)\n    return x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let stmt_dels: Vec<_> = fm
             .mutations
@@ -2209,7 +2209,7 @@ mod tests {
     #[test]
     fn tree_sitter_suppresses_string_plus_to_minus() {
         let source = "def f(a, b):\n    return a + b\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         // a + b where neither is a known string → binop_swap IS generated
         let binops: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
@@ -2217,7 +2217,7 @@ mod tests {
 
         // Now with a string literal
         let source2 = "def f(name):\n    return \"hello\" + name\n";
-        let fms2 = collect_file_mutations_tree_sitter(source2);
+        let fms2 = collect_file_mutations(source2);
         let fm2 = &fms2[0];
         let binops2: Vec<_> = fm2.mutations.iter().filter(|m| m.operator == "binop_swap").collect();
         assert!(binops2.is_empty(), "string + → - must be suppressed (always TypeError)");
@@ -2227,7 +2227,7 @@ mod tests {
     fn tree_sitter_suppresses_len_gt_zero_to_gte() {
         // len(x) > 0 → len(x) >= 0 is equivalent (len always >= 0)
         let source = "def f(items):\n    if len(items) > 0:\n        return True\n    return False\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let compops: Vec<_> = fm
             .mutations
@@ -2244,7 +2244,7 @@ mod tests {
     fn tree_sitter_does_not_suppress_non_len_gt_zero() {
         // x > 0 (not len) → both >= and != should be generated
         let source = "def f(x):\n    if x > 0:\n        return True\n    return False\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let compops: Vec<_> = fm
             .mutations
@@ -2259,7 +2259,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_len_arg_removal() {
         let source = "def f(items):\n    return len(items)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(
             !fms.is_empty(),
             "f(items) with return should produce mutations"
@@ -2273,7 +2273,7 @@ mod tests {
     #[test]
     fn tree_sitter_skips_isinstance_arg_removal() {
         let source = "def f(x):\n    return isinstance(x, int)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(
             !fms.is_empty(),
             "f(x) with return should produce mutations"
@@ -2288,7 +2288,7 @@ mod tests {
     fn tree_sitter_does_mutate_non_filtered_calls() {
         // A user-defined function call should still get arg_removal mutations.
         let source = "def f(x, y):\n    return foo(x, y)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         assert!(
             fms[0].mutations.iter().any(|m| m.operator == "arg_removal"),
@@ -2301,7 +2301,7 @@ mod tests {
         // tuple(expr for x in items) — the genexpr is the sole arg with no parens.
         // Replacing it with None produces invalid syntax: tuple(None, for x in items)
         let source = "def f(value):\n    return tuple(helper(x) for x in value)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         // The outer tuple() call must NOT get arg_removal (genexpr),
         // but the inner helper(x) call CAN get arg_removal (normal call).
@@ -2319,7 +2319,7 @@ mod tests {
         // "extra" nodes. If collected as arguments, arg_removal produces invalid
         // code like `foo(# type: ignore, None, y)` where the `#` swallows the `)`.
         let source = "def f(ctx, val):\n    return bar(  # type: ignore\n        ctx, val\n    )\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert!(!fms.is_empty());
         for m in &fms[0].mutations {
             if m.operator == "arg_removal" {
@@ -2338,7 +2338,7 @@ mod tests {
     fn condition_replacement_if_kaminski_single_bool() {
         // `>` is a strict operator → Kaminski says only False is sufficient.
         let source = "def f(x):\n    if x > 0:\n        return 1\n    return 0\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
         let cond_muts: Vec<_> = fm
@@ -2356,7 +2356,7 @@ mod tests {
     fn condition_replacement_compound_produces_both() {
         // Compound condition (boolean_operator) → not a simple comparison → both True and False.
         let source = "def f(x, y):\n    if x > 0 and y < 10:\n        return 1\n    return 0\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let cond_muts: Vec<_> = fm
             .mutations
@@ -2372,7 +2372,7 @@ mod tests {
     fn condition_replacement_while_kaminski_single_bool() {
         // `<` is a strict operator → only False.
         let source = "def f(items):\n    i = 0\n    while i < 10:\n        i += 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let cond_muts: Vec<_> = fm
             .mutations
@@ -2386,7 +2386,7 @@ mod tests {
     #[test]
     fn condition_replacement_skips_literal_true() {
         let source = "def f():\n    if True:\n        return 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let cond_muts: Vec<_> = fm
             .mutations
@@ -2401,7 +2401,7 @@ mod tests {
     #[test]
     fn condition_replacement_skips_literal_false() {
         let source = "def f():\n    if False:\n        return 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let cond_muts: Vec<_> = fm
             .mutations
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn condition_replacement_elif() {
         let source = "def f(x):\n    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n    return 0\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         // Both if and elif should get condition_replacement
         let cond_muts: Vec<_> = fm
@@ -2432,7 +2432,7 @@ mod tests {
     #[test]
     fn slice_removal_basic_two_part() {
         let source = "def f(items):\n    return items[1:3]\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
         let slice_muts: Vec<_> = fm
@@ -2452,7 +2452,7 @@ mod tests {
     #[test]
     fn slice_removal_three_part() {
         let source = "def f(items):\n    return items[1:5:2]\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let slice_muts: Vec<_> = fm
             .mutations
@@ -2473,7 +2473,7 @@ mod tests {
     fn slice_removal_skips_already_empty_parts() {
         // x[:3] — start is already empty, only stop can be removed
         let source = "def f(items):\n    return items[:3]\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let slice_muts: Vec<_> = fm
             .mutations
@@ -2487,7 +2487,7 @@ mod tests {
     fn slice_removal_no_mutations_for_empty_slice() {
         // x[:] — both parts already empty, nothing to remove
         let source = "def f(items):\n    return items[:]\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let slice_muts: Vec<_> = fm
             .mutations
@@ -2500,7 +2500,7 @@ mod tests {
     #[test]
     fn slice_removal_negative_index() {
         let source = "def f(items):\n    return items[-1:]\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         let slice_muts: Vec<_> = fm
             .mutations
@@ -2521,7 +2521,7 @@ mod tests {
     fn line_span_single_function_at_top_of_file() {
         // INV-2: first line of file is 1; INV-1: start_line <= end_line
         let source = "def f(x):\n    return x + 1\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         assert_eq!(fm.start_line, 1, "function starts on line 1");
@@ -2533,7 +2533,7 @@ mod tests {
     fn line_span_function_not_at_line_one() {
         // Function that starts on line 3 (two blank lines precede it)
         let source = "\n\ndef g(a, b):\n    return a + b\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         assert_eq!(fm.start_line, 3, "function starts on line 3");
@@ -2551,7 +2551,7 @@ mod tests {
             "def second(y):\n",   // line 4
             "    return y - 1\n", // line 5
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 2, "expected two functions");
 
         let first = fms.iter().find(|f| f.name == "first").expect("first");
@@ -2575,7 +2575,7 @@ mod tests {
             "    def bar(self):\n", // line 2
             "        return 1\n",  // line 3
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         assert_eq!(fm.name, "bar");
@@ -2593,7 +2593,7 @@ mod tests {
             "    y = b - c\n",          // line 3
             "    return x + y\n",       // line 4
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         assert_eq!(fm.start_line, 1);
@@ -2604,7 +2604,7 @@ mod tests {
     #[test]
     fn constant_replacement_integer_nonzero_produces_zero() {
         let source = "def f():\n    return 42\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2623,7 +2623,7 @@ mod tests {
     #[test]
     fn constant_replacement_zero_has_no_extra_mutations() {
         let source = "def f():\n    return 0\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2638,7 +2638,7 @@ mod tests {
         // so tree-sitter sees the integer node as "1" not "-1".
         // The integer "1" gets: number_mutation(1→2), constant_replacement(1→0, 1→-1).
         let source = "def f():\n    x = -1\n    return x\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2649,7 +2649,7 @@ mod tests {
     #[test]
     fn constant_replacement_float_nonzero() {
         let source = "def f():\n    return 3.14\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2667,7 +2667,7 @@ mod tests {
     #[test]
     fn constant_replacement_float_zero_has_no_extra() {
         let source = "def f():\n    return 0.0\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
 
         let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
@@ -2684,7 +2684,7 @@ mod tests {
             "        return rate * x\n",
             "    return 0\n",
         );
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         let fm = &fms[0];
         check_span_invariant(fm);
 
@@ -2705,7 +2705,7 @@ mod tests {
     #[test]
     fn regex_mutations_in_re_compile() {
         let source = "import re\n\ndef f():\n    return re.compile(r\"^\\d+$\")\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         check_span_invariant(fm);
@@ -2717,7 +2717,7 @@ mod tests {
     #[test]
     fn regex_mutations_in_re_match() {
         let source = "import re\n\ndef f(s):\n    return re.match(r\"[a-z]+\", s)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         let regex_muts: Vec<_> = fm.mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
@@ -2729,7 +2729,7 @@ mod tests {
     #[test]
     fn regex_mutations_in_regex_module() {
         let source = "import regex\n\ndef f(s):\n    return regex.search(r\"\\d+\", s)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
         assert!(!regex_muts.is_empty(), "regex module should be detected");
@@ -2738,7 +2738,7 @@ mod tests {
     #[test]
     fn no_regex_mutations_on_non_re_call() {
         let source = "def f():\n    return foo.compile(r\"\\d+\")\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
         assert!(regex_muts.is_empty(), "non-re calls should not get regex mutations");
@@ -2747,7 +2747,7 @@ mod tests {
     #[test]
     fn no_regex_mutations_on_variable_arg() {
         let source = "import re\n\ndef f(pat):\n    return re.compile(pat)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
         assert!(regex_muts.is_empty(), "variable pattern should not get regex mutations");
@@ -2756,7 +2756,7 @@ mod tests {
     #[test]
     fn no_regex_mutations_on_non_raw_string() {
         let source = "import re\n\ndef f():\n    return re.compile(\"\\\\d+\")\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
         assert!(regex_muts.is_empty(), "non-raw strings should be skipped in v1");
@@ -2766,7 +2766,7 @@ mod tests {
     fn regex_coexists_with_other_call_mutations() {
         // re.compile with a flags arg should still get arg_removal mutations
         let source = "import re\n\ndef f():\n    return re.compile(r\"\\d+\", re.IGNORECASE)\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         let regex_muts: Vec<_> = fm.mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
@@ -2779,7 +2779,7 @@ mod tests {
     #[test]
     fn regex_mutations_produce_valid_python() {
         let source = "import re\n\ndef validate(email):\n    return re.match(r\"^[^@]+@[^@]+\\.[^@]+$\", email) is not None\n";
-        let fms = collect_file_mutations_tree_sitter(source);
+        let fms = collect_file_mutations(source);
         assert_eq!(fms.len(), 1);
         let fm = &fms[0];
         check_span_invariant(fm);

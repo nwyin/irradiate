@@ -63,13 +63,8 @@ pub struct FunctionMutations {
     pub descriptor_decorator: Option<DescriptorDecorator>,
 }
 
-/// Collect all function mutations from a Python source file.
-///
-/// Delegates to the tree-sitter-based collector, which uses byte spans directly
-/// from the parser — no monotonic cursor hack needed.
-pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
-    crate::tree_sitter_mutation::collect_file_mutations_tree_sitter(source)
-}
+/// Re-export from `tree_sitter_mutation` so callers can use `mutation::collect_file_mutations`.
+pub use crate::tree_sitter_mutation::collect_file_mutations;
 
 /// Apply a single mutation to a function's source text.
 pub fn apply_mutation(func_source: &str, mutation: &Mutation) -> String {
@@ -79,6 +74,17 @@ pub fn apply_mutation(func_source: &str, mutation: &Mutation) -> String {
         mutation.replacement,
         &func_source[mutation.end..]
     )
+}
+
+/// Convert a byte offset within source text to a 1-indexed (line, column) pair.
+///
+/// `line` is the 1-indexed line number; `column` is the 1-indexed byte column within that line.
+/// Used to convert `fn_byte_offset + mutation.start` into a human-readable file position.
+pub fn byte_offset_to_location(source: &str, byte_offset: usize) -> (usize, usize) {
+    let prefix = &source[..byte_offset.min(source.len())];
+    let line = prefix.matches('\n').count() + 1;
+    let col = prefix.len() - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0) + 1;
+    (line, col)
 }
 
 /// Check whether source is syntactically valid Python (tree-sitter based).

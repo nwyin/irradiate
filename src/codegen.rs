@@ -321,17 +321,6 @@ pub fn mutate_file(
     })
 }
 
-/// Convert an absolute byte offset in a source string to `(line, column)`, both 1-indexed.
-///
-/// `line` is the 1-indexed line number; `column` is the 1-indexed byte column within that line.
-/// Used to convert `fn_byte_offset + mutation.start` into a human-readable file position.
-pub fn byte_offset_to_location(source: &str, byte_offset: usize) -> (usize, usize) {
-    let prefix = &source[..byte_offset.min(source.len())];
-    let line = prefix.matches('\n').count() + 1;
-    let col = prefix.len() - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0) + 1;
-    (line, col)
-}
-
 /// Find the index of the trampoline for (class_name, func_name) in function_mutations.
 fn find_trampoline_idx(
     function_mutations: &[FunctionMutations],
@@ -384,7 +373,7 @@ fn indent_code(code: &str, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mutation::collect_file_mutations;
+    use crate::mutation::{byte_offset_to_location, collect_file_mutations};
 
     const SIMPLE_ADD: &str = "def add(a, b):\n    return a + b\n";
     const TWO_FUNCTIONS: &str = "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n";

@@ -313,9 +313,9 @@ pub fn build_stryker_report(
         // --- Location ---
         let location = if let Some(d) = desc {
             let (rel_start_line, start_col) =
-                crate::codegen::byte_offset_to_location(&d.function_source, d.start);
+                crate::mutation::byte_offset_to_location(&d.function_source, d.start);
             let (rel_end_line, end_col) =
-                crate::codegen::byte_offset_to_location(&d.function_source, d.end);
+                crate::mutation::byte_offset_to_location(&d.function_source, d.end);
             // fn_start_line is 1-indexed; rel_*_line are also 1-indexed relative to function start.
             let abs_start_line = d.fn_start_line + rel_start_line - 1;
             let abs_end_line = d.fn_start_line + rel_end_line - 1;
@@ -850,7 +850,7 @@ pub fn print_summary(
             if r.status == MutantStatus::Survived {
                 if let Some(desc) = descriptors.get(&r.mutant_name) {
                     let (rel_line, _col) =
-                        crate::codegen::byte_offset_to_location(&desc.function_source, desc.start);
+                        crate::mutation::byte_offset_to_location(&desc.function_source, desc.start);
                     let abs_line = desc.fn_start_line + rel_line - 1;
                     let file = if desc.source_file.is_empty() {
                         &r.mutant_name
@@ -1148,7 +1148,7 @@ mod tests {
         // The '+' at 'a + b' on line 2 column 14 (1-indexed).
         let source = "def add(a, b):\n    return a + b\n";
         // byte offset of '+': "def add(a, b):\n    return a " = 15+11 = 26 bytes
-        let (line, col) = crate::codegen::byte_offset_to_location(source, 26);
+        let (line, col) = crate::mutation::byte_offset_to_location(source, 26);
         assert_eq!(line, 2, "line should be 1-indexed (line 2 = second line)");
         assert_eq!(col, 12, "column should be 1-indexed");
     }
