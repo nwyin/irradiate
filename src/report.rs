@@ -846,24 +846,41 @@ pub fn print_summary(
     if survived > 0 {
         eprintln!();
         eprintln!("Survived mutants:");
+
+        // Group survivors by operator category
+        let mut by_operator: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         for r in results {
-            if r.status == MutantStatus::Survived {
-                if let Some(desc) = descriptors.get(&r.mutant_name) {
-                    let (rel_line, _col) =
-                        crate::mutation::byte_offset_to_location(&desc.function_source, desc.start);
-                    let abs_line = desc.fn_start_line + rel_line - 1;
-                    let file = if desc.source_file.is_empty() {
-                        &r.mutant_name
-                    } else {
-                        &desc.source_file
-                    };
-                    eprintln!(
-                        "  {file}:{abs_line}  replaced `{}` with `{}` ({})  [{}]",
-                        desc.original, desc.replacement, desc.operator, r.mutant_name,
-                    );
+            if r.status != MutantStatus::Survived {
+                continue;
+            }
+            let (operator, line) = if let Some(desc) = descriptors.get(&r.mutant_name) {
+                let (rel_line, _col) =
+                    crate::mutation::byte_offset_to_location(&desc.function_source, desc.start);
+                let abs_line = desc.fn_start_line + rel_line - 1;
+                let file = if desc.source_file.is_empty() {
+                    &r.mutant_name
                 } else {
-                    eprintln!("  {}", r.mutant_name);
-                }
+                    &desc.source_file
+                };
+                (
+                    desc.operator.clone(),
+                    format!(
+                        "  {file}:{abs_line}  replaced `{}` with `{}`  [{}]",
+                        desc.original, desc.replacement, r.mutant_name,
+                    ),
+                )
+            } else {
+                ("unknown".to_string(), format!("  {}", r.mutant_name))
+            };
+            by_operator.entry(operator).or_default().push(line);
+        }
+
+        for (operator, lines) in &by_operator {
+            eprintln!();
+            eprintln!("  {} ({}):", operator, lines.len());
+            for line in lines {
+                eprintln!("  {line}");
             }
         }
     }
