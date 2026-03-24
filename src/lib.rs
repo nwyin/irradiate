@@ -12,4 +12,5 @@ pub mod report;
 pub mod stats;
 pub mod trace;
 pub mod trampoline;
+pub mod regex_mutation;
 pub mod tree_sitter_mutation;

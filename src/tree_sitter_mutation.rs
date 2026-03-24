@@ -68,6 +68,11 @@ const ENUM_BASES: &[&str] = &[
 /// Builtin function calls that are never arg_removal-mutated.
 static NEVER_MUTATE_FUNCTION_CALLS: &[&str] = &["len", "isinstance"];
 
+/// `re` / `regex` module function names whose first positional arg is a regex pattern.
+const RE_PATTERN_FUNCTIONS: &[&str] = &[
+    "compile", "match", "search", "findall", "finditer", "fullmatch", "sub", "subn", "split",
+];
+
 const BINOP_SWAPS: &[(&str, &str)] = &[
     ("+", "-"),
     ("-", "+"),
@@ -179,7 +184,7 @@ pub fn collect_file_mutations_tree_sitter(source: &str) -> Vec<FunctionMutations
 }
 
 /// Parse Python source with tree-sitter, returning None if the source has syntax errors.
-pub(crate) fn parse_python(source: &str) -> Option<Tree> {
+pub fn parse_python(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_python::LANGUAGE.into()).ok()?;
     let tree = parser.parse(source, None)?;
@@ -430,6 +435,7 @@ fn collect_node_mutations(
             add_arg_removal_mutations(node, source, fn_start, mutations);
             add_method_mutations(node, source, fn_start, mutations);
             add_dict_kwarg_mutations(node, source, fn_start, mutations);
+            add_regex_mutations(node, source, fn_start, mutations);
         }
         "match_statement" => add_match_case_removal_mutations(node, source, fn_start, mutations),
         "raise_statement" => add_raise_statement_mutation(node, source, fn_start, mutations),
@@ -1466,6 +1472,53 @@ fn add_dict_kwarg_mutations(
             mutations,
         );
     }
+}
+
+/// Detect a `re.<func>(pattern, ...)` or `regex.<func>(pattern, ...)` call and
+/// return the first positional string argument node (the regex pattern).
+fn detect_regex_call<'a>(node: Node<'a>, source: &str) -> Option<Node<'a>> {
+    let function_node = node.child_by_field_name("function")?;
+    if function_node.kind() != "attribute" {
+        return None;
+    }
+    let object = function_node.child_by_field_name("object")?;
+    let attribute = function_node.child_by_field_name("attribute")?;
+    let obj_text = node_text(source, object);
+    let attr_text = node_text(source, attribute);
+    if obj_text != "re" && obj_text != "regex" {
+        return None;
+    }
+    if !RE_PATTERN_FUNCTIONS.contains(&attr_text) {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    first_positional_string_arg(arguments)
+}
+
+/// Return the first positional (non-keyword) argument that is a string node.
+fn first_positional_string_arg(arguments: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = arguments.walk();
+    for child in arguments.named_children(&mut cursor) {
+        if child.kind() == "keyword_argument" {
+            continue;
+        }
+        if child.kind() == "string" {
+            return Some(child);
+        }
+        // First positional is not a string — bail.
+        return None;
+    }
+    None
+}
+
+fn add_regex_mutations(node: Node<'_>, source: &str, fn_start: usize, mutations: &mut Vec<Mutation>) {
+    let Some(string_node) = detect_regex_call(node, source) else {
+        return;
+    };
+    let pattern_text = node_text(source, string_node);
+    let node_start = string_node.start_byte() - fn_start;
+    let regex_muts = crate::regex_mutation::collect_regex_mutations(pattern_text, node_start);
+    mutations.extend(regex_muts);
 }
 
 fn add_match_case_removal_mutations(
@@ -2644,6 +2697,101 @@ mod tests {
                 parse_python(&mutated).is_some(),
                 "constant_replacement must produce valid Python:\n{mutated}"
             );
+        }
+    }
+
+    // ── Regex mutation integration tests ──
+
+    #[test]
+    fn regex_mutations_in_re_compile() {
+        let source = "import re\n\ndef f():\n    return re.compile(r\"^\\d+$\")\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+        let regex_muts: Vec<_> = fm.mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        // Should have: 2 anchor_removal, 1 shorthand_negation, 1 quantifier_removal
+        assert!(regex_muts.len() >= 4, "expected >= 4 regex mutations, got {}", regex_muts.len());
+    }
+
+    #[test]
+    fn regex_mutations_in_re_match() {
+        let source = "import re\n\ndef f(s):\n    return re.match(r\"[a-z]+\", s)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let regex_muts: Vec<_> = fm.mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        // charclass_negation + quantifier_removal at minimum
+        assert!(regex_muts.len() >= 2);
+        check_span_invariant(fm);
+    }
+
+    #[test]
+    fn regex_mutations_in_regex_module() {
+        let source = "import regex\n\ndef f(s):\n    return regex.search(r\"\\d+\", s)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        assert!(!regex_muts.is_empty(), "regex module should be detected");
+    }
+
+    #[test]
+    fn no_regex_mutations_on_non_re_call() {
+        let source = "def f():\n    return foo.compile(r\"\\d+\")\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        assert!(regex_muts.is_empty(), "non-re calls should not get regex mutations");
+    }
+
+    #[test]
+    fn no_regex_mutations_on_variable_arg() {
+        let source = "import re\n\ndef f(pat):\n    return re.compile(pat)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        assert!(regex_muts.is_empty(), "variable pattern should not get regex mutations");
+    }
+
+    #[test]
+    fn no_regex_mutations_on_non_raw_string() {
+        let source = "import re\n\ndef f():\n    return re.compile(\"\\\\d+\")\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let regex_muts: Vec<_> = fms[0].mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        assert!(regex_muts.is_empty(), "non-raw strings should be skipped in v1");
+    }
+
+    #[test]
+    fn regex_coexists_with_other_call_mutations() {
+        // re.compile with a flags arg should still get arg_removal mutations
+        let source = "import re\n\ndef f():\n    return re.compile(r\"\\d+\", re.IGNORECASE)\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        let regex_muts: Vec<_> = fm.mutations.iter().filter(|m| m.operator.starts_with("regex_")).collect();
+        let arg_removals: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "arg_removal").collect();
+        assert!(!regex_muts.is_empty(), "should have regex mutations");
+        assert!(!arg_removals.is_empty(), "should still have arg_removal mutations");
+        check_span_invariant(fm);
+    }
+
+    #[test]
+    fn regex_mutations_produce_valid_python() {
+        let source = "import re\n\ndef validate(email):\n    return re.match(r\"^[^@]+@[^@]+\\.[^@]+$\", email) is not None\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        assert_eq!(fms.len(), 1);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+        for m in &fm.mutations {
+            if m.operator.starts_with("regex_") {
+                let mutated = apply_mutation(&fm.source, m);
+                assert!(
+                    parse_python(&mutated).is_some(),
+                    "regex mutation must produce valid Python:\noperator={}\noriginal={:?}\nreplacement={:?}\nmutated=\n{}",
+                    m.operator, m.original, m.replacement, mutated
+                );
+            }
         }
     }
 

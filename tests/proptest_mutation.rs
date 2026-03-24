@@ -4,6 +4,7 @@
 //! their documented contracts regardless of input variation.
 
 use irradiate::mutation::{apply_mutation, collect_file_mutations};
+use irradiate::tree_sitter_mutation::parse_python;
 use proptest::prelude::*;
 
 /// Generate a single valid Python function source with a binary/boolean/comparison expression.
@@ -1544,6 +1545,63 @@ proptest! {
                 "non-descriptor decorated function must produce no mutations; source:\n{}",
                 source
             );
+        }
+    }
+}
+
+// ── Regex mutation proptest ──
+
+/// Generate a function containing `re.compile(r"<pattern>")` with random patterns.
+fn regex_func_strategy() -> impl Strategy<Value = String> {
+    let re_funcs = prop::sample::select(vec!["compile", "match", "search", "findall"]);
+    // Safe regex alphabet: chars that produce valid Python raw strings and diverse mutations.
+    let pattern = prop::string::string_regex(r"[\^$\.\d\w\s\+\*\?\[\]abc\|]{0,20}")
+        .unwrap();
+
+    (re_funcs, pattern).prop_map(|(func, pat)| {
+        // Escape any double-quotes in the pattern to keep the Python string valid.
+        let safe_pat = pat.replace('"', "");
+        if func == "compile" {
+            format!("import re\n\ndef f():\n    return re.{}(r\"{}\")\n", func, safe_pat)
+        } else {
+            format!("import re\n\ndef f(s):\n    return re.{}(r\"{}\", s)\n", func, safe_pat)
+        }
+    })
+}
+
+proptest! {
+    #[test]
+    fn regex_mutations_span_invariant(source in regex_func_strategy()) {
+        let fms = collect_file_mutations(&source);
+        for fm in &fms {
+            for m in &fm.mutations {
+                prop_assert!(m.start < m.end, "start < end failed for operator={}", m.operator);
+                prop_assert_eq!(
+                    m.start + m.original.len(),
+                    m.end,
+                    "start + original.len() != end for operator={}",
+                    m.operator
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regex_mutations_produce_valid_python(source in regex_func_strategy()) {
+        let fms = collect_file_mutations(&source);
+        for fm in &fms {
+            for m in &fm.mutations {
+                if m.operator.starts_with("regex_") {
+                    let mutated_func = apply_mutation(&fm.source, m);
+                    // Reconstruct the full source with the mutated function.
+                    let mutated_source = source.replacen(&fm.source, &mutated_func, 1);
+                    prop_assert!(
+                        parse_python(&mutated_source).is_some(),
+                        "regex mutation produced invalid Python:\noperator={}\noriginal={:?}\nreplacement={:?}\nmutated=\n{}",
+                        m.operator, m.original, m.replacement, mutated_source
+                    );
+                }
+            }
         }
     }
 }

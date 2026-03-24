@@ -358,5 +358,41 @@ if ! echo "$SAMPLE_OUTPUT" | grep -q "sampled"; then
 fi
 echo "  --sample score note present: OK"
 
+# ── Regex mutation detection ──
+echo ""
+echo "=== E2E: regex_project ==="
+REGEX_FIXTURE="$SCRIPT_DIR/fixtures/regex_project"
+
+# Ensure venv exists
+if [ ! -d "$REGEX_FIXTURE/.venv" ]; then
+    echo "Setting up Python venv..."
+    (cd "$REGEX_FIXTURE" && uv venv --python 3.12 && uv pip install pytest)
+fi
+
+# Clean previous run
+rm -rf "$REGEX_FIXTURE/mutants" "$REGEX_FIXTURE/.irradiate"
+
+# Run mutation testing
+REGEX_OUTPUT=$( cd "$REGEX_FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
+echo "$REGEX_OUTPUT"
+
+# Verify pipeline completed
+if ! echo "$REGEX_OUTPUT" | grep -q "stats + validation"; then
+    echo "FAIL: regex_project did not complete stats + validation"
+    exit 1
+fi
+echo "  regex_project completed: OK"
+
+# Verify mutations were found (at least some killed)
+REGEX_RESULTS=$( cd "$REGEX_FIXTURE" && "$BINARY" results --all 2>&1 )
+REGEX_KILLED=$(echo "$REGEX_RESULTS" | grep -c "🎉" || true)
+echo "  Regex killed: $REGEX_KILLED"
+
+if [ "$REGEX_KILLED" -lt 1 ]; then
+    echo "FAIL: Expected at least 1 killed mutant in regex_project, got $REGEX_KILLED"
+    exit 1
+fi
+echo "  regex_project killed mutants: OK"
+
 echo ""
 echo "=== E2E tests: PASS ==="

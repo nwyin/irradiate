@@ -373,6 +373,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sha2",
