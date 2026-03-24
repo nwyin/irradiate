@@ -192,39 +192,44 @@ fn validate_environment(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-/// Run the full mutation testing pipeline.
-pub async fn run(config: RunConfig) -> Result<()> {
-    validate_environment(&config)?;
+/// Shared context threaded through pipeline phases.
+struct PipelineCtx {
+    project_dir: PathBuf,
+    mutants_dir: PathBuf,
+    harness_dir: PathBuf,
+    pythonpath: String,
+    trace: crate::trace::TraceLog,
+}
 
-    let project_dir = std::env::current_dir()?;
-    let mutants_dir = project_dir.join("mutants");
-    let mut trace = crate::trace::TraceLog::new();
-
-    // Resolve diff filter when --diff is specified.
+/// Phase 1: Generate mutations, apply filters and sampling.
+///
+/// Returns the generation output, filtered mutant list, and sampling info.
+fn phase_generate(
+    config: &RunConfig,
+    ctx: &mut PipelineCtx,
+) -> Result<Option<(GenerationOutput, Vec<MutantCacheDescriptor>, Option<usize>)>> {
+    #![allow(clippy::type_complexity)]
     let diff_filter = if let Some(ref diff_ref) = config.diff_ref {
-        let repo_root = crate::git_diff::find_git_root(&project_dir)?;
+        let repo_root = crate::git_diff::find_git_root(&ctx.project_dir)?;
         let filter = crate::git_diff::parse_git_diff(diff_ref, &repo_root)?;
-        eprintln!(
-            "Generating mutants (incremental: diff against {diff_ref})..."
-        );
+        eprintln!("Generating mutants (incremental: diff against {diff_ref})...");
         Some((filter, repo_root))
     } else {
         eprintln!("Generating mutants...");
         None
     };
 
-    // Phase 1: Mutation generation
-    let phase_start = trace.now_us();
+    let phase_start = ctx.trace.now_us();
     let start = Instant::now();
     let generation = generate_mutants(
         &config.paths_to_mutate,
-        &mutants_dir,
+        &ctx.mutants_dir,
         &config.do_not_mutate,
         diff_filter.as_ref().map(|(f, r)| (f, r.as_path())),
     )?;
     let gen_time = start.elapsed();
     let mutant_count: usize = generation.names_by_module.values().map(|v| v.len()).sum();
-    trace.phase("mutation_generation", phase_start, Some(serde_json::json!({
+    ctx.trace.phase("mutation_generation", phase_start, Some(serde_json::json!({
         "mutants": mutant_count,
         "files": generation.names_by_module.len(),
     })));
@@ -241,22 +246,20 @@ pub async fn run(config: RunConfig) -> Result<()> {
             "No mutations found in {}. Check that your source files contain functions to mutate.",
             paths_str.join(", ")
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let mut all_mutants: Vec<MutantCacheDescriptor> =
         generation.descriptors_by_name.values().cloned().collect();
 
-    // Apply filter if specific mutants requested
     if let Some(ref filter) = config.mutant_filter {
         all_mutants.retain(|desc| filter.iter().any(|f| desc.mutant_name.contains(f)));
         if all_mutants.is_empty() {
             eprintln!("No mutants match the filter.");
-            return Ok(());
+            return Ok(None);
         }
     }
 
-    // Apply sampling if requested.
     let sampled_from = if let Some(sample_value) = config.sample {
         let population = all_mutants.len();
         all_mutants = sample_mutants(all_mutants, sample_value, config.sample_seed);
@@ -271,35 +274,22 @@ pub async fn run(config: RunConfig) -> Result<()> {
         None
     };
 
-    let total_mutants = all_mutants.len();
+    Ok(Some((generation, all_mutants, sampled_from)))
+}
 
-    // Extract harness
-    let harness_dir = harness::extract_harness(&project_dir)?;
-
-    // Build PYTHONPATH once — all subprocess invocations use this same string
-    // so that import resolution is identical everywhere (INV-1, INV-2).
-    // mutants_dir is handled by the MutantFinder import hook, not PYTHONPATH.
-    let pythonpath = build_pythonpath(&harness_dir, &config.paths_to_mutate);
-
+/// Phase 2: Collect stats + validate, optionally pre-spawn workers.
+async fn phase_stats(
+    config: &RunConfig,
+    ctx: &mut PipelineCtx,
+    total_mutants: usize,
+    has_mutants: bool,
+) -> Result<(Option<TestStats>, Option<crate::orchestrator::PreSpawnedPool>)> {
     // Pre-spawn workers before stats so they boot (~480ms) in parallel with
-    // stats collection (~3-4s). Workers only need harness + PYTHONPATH + socket,
-    // none of which depend on stats results.
+    // stats collection (~3-4s).
     let pre_spawned = if !config.isolate && !config.no_stats {
-        let pool_config = PoolConfig {
-            num_workers: config.workers,
-            python: config.python.clone(),
-            project_dir: project_dir.clone(),
-            mutants_dir: mutants_dir.clone(),
-            tests_dir: PathBuf::from(&config.tests_dir),
-            timeout_multiplier: config.timeout_multiplier,
-            pythonpath: pythonpath.clone(),
-            worker_recycle_after: config.worker_recycle_after,
-            max_worker_memory_mb: config.max_worker_memory_mb,
-            pytest_add_cli_args: config.pytest_add_cli_args.clone(),
-            ..Default::default()
-        };
+        let pool_config = build_pool_config(config, ctx);
         let num_workers = config.workers.min(total_mutants);
-        match crate::orchestrator::pre_spawn_pool(&pool_config, &harness_dir, num_workers) {
+        match crate::orchestrator::pre_spawn_pool(&pool_config, &ctx.harness_dir, num_workers) {
             Ok(pool) => Some(pool),
             Err(e) => {
                 tracing::warn!("Pre-spawn failed, will spawn later: {e}");
@@ -310,88 +300,71 @@ pub async fn run(config: RunConfig) -> Result<()> {
         None
     };
 
-    // Phase 2: Stats collection + validation
-    // When stats are enabled, a single pytest run collects coverage, timing,
-    // and performs an in-process fail probe — replacing the old separate clean
-    // and forced-fail validation subprocesses.
     let test_stats = if config.no_stats {
-        // --no-stats path: run clean + fail validation separately
         eprintln!("Running clean tests...");
         validate_clean_run(
-            &config.python,
-            &project_dir,
-            &pythonpath,
-            &mutants_dir,
-            &config.tests_dir,
-            &config.pytest_add_cli_args,
-        )
-        .await?;
+            &config.python, &ctx.project_dir, &ctx.pythonpath,
+            &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+        ).await?;
         eprintln!("  done");
-
         eprintln!("Running forced-fail validation...");
         validate_fail_run(
-            &config.python,
-            &project_dir,
-            &pythonpath,
-            &mutants_dir,
-            &config.tests_dir,
-            &config.pytest_add_cli_args,
-        )
-        .await?;
+            &config.python, &ctx.project_dir, &ctx.pythonpath,
+            &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+        ).await?;
         eprintln!("  done");
         None
     } else {
-        // Try cached stats first — skips the 4+ second pytest run when source/tests haven't changed
-        let phase_start = trace.now_us();
+        let phase_start = ctx.trace.now_us();
         let start = Instant::now();
-        let s = if let Some(cached) = stats::load_cached_stats(&project_dir, &config.paths_to_mutate, &config.tests_dir) {
+        let s = if let Some(cached) = stats::load_cached_stats(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir) {
             eprintln!("Using cached stats (source/tests unchanged)");
-            trace.phase("stats_cache_hit", phase_start, None);
+            ctx.trace.phase("stats_cache_hit", phase_start, None);
             cached
         } else {
             eprintln!("Running stats + validation...");
             let s = stats::collect_stats(
-                &config.python,
-                &project_dir,
-                &pythonpath,
-                &mutants_dir,
-                &config.tests_dir,
-                &config.pytest_add_cli_args,
-            )
-            .context("Stats collection failed")?;
-            stats::save_stats_fingerprint(&project_dir, &config.paths_to_mutate, &config.tests_dir);
-            trace.phase("stats_collection", phase_start, None);
+                &config.python, &ctx.project_dir, &ctx.pythonpath,
+                &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+            ).context("Stats collection failed")?;
+            stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
+            ctx.trace.phase("stats_collection", phase_start, None);
             eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
             s
         };
 
-        // Validate using fields from the stats run
         if let Some(exit_code) = s.exit_status {
             if exit_code > 1 {
-                bail!(
-                    "Stats run failed (exit code {exit_code}) — tests could not run with trampolined code"
-                );
+                bail!("Stats run failed (exit code {exit_code}) — tests could not run with trampolined code");
             }
             if exit_code == 1 {
                 eprintln!("Warning: some tests failed during stats run (pre-existing failures)");
             }
         }
-
         if s.fail_validated == Some(false) {
             bail!("Trampoline fail path not wired — in-process fail probe did not raise ProgrammaticFailException");
         }
-
-        if s.tests_by_function.is_empty() && !all_mutants.is_empty() {
+        if s.tests_by_function.is_empty() && has_mutants {
             bail!("No functions were hit during stats collection, but mutants exist — trampoline may not be loading");
         }
 
         Some(s)
     };
 
-    // Phase 3: Scheduling (work item building + cache lookup)
-    let phase_start = trace.now_us();
+    Ok((test_stats, pre_spawned))
+}
 
-    // Phase 4: Mutation testing
+/// Phase 3+4: Schedule work items (with cache lookup) and execute mutation testing.
+async fn phase_execute(
+    config: &RunConfig,
+    ctx: &mut PipelineCtx,
+    all_mutants: &[MutantCacheDescriptor],
+    test_stats: &Option<TestStats>,
+    pre_spawned: Option<crate::orchestrator::PreSpawnedPool>,
+    total_mutants: usize,
+) -> Result<(Vec<MutantResult>, CacheCounts, Vec<ScheduledMutant>)> {
+    let phase_start = ctx.trace.now_us();
+
     if config.isolate {
         eprintln!("Running mutation testing ({total_mutants} mutants, isolated mode)...");
     } else {
@@ -400,7 +373,6 @@ pub async fn run(config: RunConfig) -> Result<()> {
             config.workers
         );
     }
-    let start = Instant::now();
 
     // Build work items
     let work_items: Vec<ScheduledMutant> = all_mutants
@@ -408,7 +380,6 @@ pub async fn run(config: RunConfig) -> Result<()> {
         .filter_map(|descriptor| {
             let mutant_name = &descriptor.mutant_name;
             let test_ids = if let Some(ref stats) = test_stats {
-                // Extract the function key from mutant name: "module.x_func__irradiate_N" → "module.x_func"
                 let func_key = mutant_name
                     .rsplit_once("__irradiate_")
                     .map(|(prefix, _)| prefix)
@@ -416,22 +387,16 @@ pub async fn run(config: RunConfig) -> Result<()> {
                 let tests = stats.tests_for_function_by_duration(func_key);
                 if tests.is_empty() {
                     if config.covered_only {
-                        return None; // completely exclude from results
+                        return None;
                     }
-                    // No coverage → leave test_ids empty → marked NoTests at scheduling time.
-                    // Previously ran all tests against uncovered functions, which is very expensive
-                    // for large projects and almost never catches anything.
                     vec![]
                 } else {
                     tests
                 }
             } else {
-                // No stats — will be filled by worker's collected tests
                 vec![]
             };
 
-            // Compute per-mutant timeout using the same formula as isolated mode:
-            // multiply estimated test duration, floor at multiplier×DEFAULT and MIN.
             let estimated_secs = test_stats
                 .as_ref()
                 .map(|s| s.estimated_duration(&test_ids))
@@ -451,18 +416,12 @@ pub async fn run(config: RunConfig) -> Result<()> {
         })
         .collect();
 
-    // For no-stats mode, we need all test IDs — collect them from a dummy pytest run
+    // For no-stats mode, fill in all test IDs
     let work_items = if config.no_stats {
-        // Use all tests discovered by the worker
         let all_tests = discover_tests(
-            &config.python,
-            &project_dir,
-            &pythonpath,
-            &mutants_dir,
-            &config.tests_dir,
-            &config.pytest_add_cli_args,
-        )
-        .await?;
+            &config.python, &ctx.project_dir, &ctx.pythonpath,
+            &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+        ).await?;
         work_items
             .into_iter()
             .map(|mut item| {
@@ -476,7 +435,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
         work_items
     };
 
-    // Handle uncovered mutants (exit_code 33)
+    // Split: uncovered → NoTests, cached → cache hit, rest → execute
     let mut results: Vec<MutantResult> = Vec::new();
     let mut cache_counts = CacheCounts::default();
     let mut resolved_test_paths: HashMap<String, Option<PathBuf>> = HashMap::new();
@@ -494,15 +453,12 @@ pub async fn run(config: RunConfig) -> Result<()> {
         }
 
         item.cache_key = cache::build_cache_key(
-            &project_dir,
-            &item.descriptor,
-            &item.work_item.test_ids,
-            &mut resolved_test_paths,
-            &mut test_file_hashes,
+            &ctx.project_dir, &item.descriptor, &item.work_item.test_ids,
+            &mut resolved_test_paths, &mut test_file_hashes,
         )?;
 
         if let Some(ref key) = item.cache_key {
-            if let Some(entry) = cache::load_entry(&project_dir, key)? {
+            if let Some(entry) = cache::load_entry(&ctx.project_dir, key)? {
                 cache_counts.hits += 1;
                 results.push(MutantResult {
                     mutant_name: item.work_item.mutant_name.clone(),
@@ -518,7 +474,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
         covered_work.push(item);
     }
 
-    trace.phase("scheduling", phase_start, Some(serde_json::json!({
+    ctx.trace.phase("scheduling", phase_start, Some(serde_json::json!({
         "cache_hits": cache_counts.hits,
         "cache_misses": cache_counts.misses,
         "uncovered": results.len(),
@@ -530,164 +486,131 @@ pub async fn run(config: RunConfig) -> Result<()> {
             .iter()
             .map(|item| item.work_item.clone())
             .collect();
-        let phase_start = trace.now_us();
+        let phase_start = ctx.trace.now_us();
         let run_results = if config.isolate {
             run_isolated(
-                &config,
-                execution_work,
-                &harness_dir,
-                &mutants_dir,
-                test_stats.as_ref(),
-                &project_dir,
-            )
-            .await?
+                config, execution_work, &ctx.harness_dir, &ctx.mutants_dir,
+                test_stats.as_ref(), &ctx.project_dir,
+            ).await?
         } else {
-            let pool_config = PoolConfig {
-                num_workers: config.workers,
-                python: config.python.clone(),
-                project_dir: project_dir.clone(),
-                mutants_dir: mutants_dir.clone(),
-                tests_dir: PathBuf::from(&config.tests_dir),
-                timeout_multiplier: config.timeout_multiplier,
-                pythonpath: pythonpath.clone(),
-                worker_recycle_after: config.worker_recycle_after,
-                max_worker_memory_mb: config.max_worker_memory_mb,
-                pytest_add_cli_args: config.pytest_add_cli_args.clone(),
-                ..Default::default()
-            };
+            let pool_config = build_pool_config(config, ctx);
             let progress = crate::progress::ProgressBar::new(total_mutants);
             let (results, worker_trace) = if let Some(pool) = pre_spawned {
-                // Workers were pre-spawned during stats — they're already booted
                 crate::orchestrator::run_worker_pool_pre_spawned(
                     &pool_config, execution_work, Some(progress), pool,
                 ).await?
             } else {
                 run_worker_pool(&pool_config, execution_work, Some(progress)).await?
             };
-            trace.merge(worker_trace);
+            ctx.trace.merge(worker_trace);
             results
         };
-        trace.phase("worker_pool", phase_start, Some(serde_json::json!({
+        ctx.trace.phase("worker_pool", phase_start, Some(serde_json::json!({
             "executed": run_results.len(),
         })));
 
+        // Store results in cache
         let cache_keys_by_mutant: HashMap<String, String> = covered_work
             .iter()
             .filter_map(|item| {
-                item.cache_key
-                    .as_ref()
-                    .map(|key| (item.work_item.mutant_name.clone(), key.clone()))
+                item.cache_key.as_ref().map(|key| (item.work_item.mutant_name.clone(), key.clone()))
             })
             .collect();
         for result in &run_results {
             if let Some(key) = cache_keys_by_mutant.get(&result.mutant_name) {
-                cache::store_entry(
-                    &project_dir,
-                    key,
-                    result.exit_code,
-                    result.duration,
-                    result.status,
-                )?;
+                cache::store_entry(&ctx.project_dir, key, result.exit_code, result.duration, result.status)?;
             }
         }
         results.extend(run_results);
     }
 
-    // Phase 4b: Survivor verification (optional)
-    //
-    // If `--verify-survivors` is set and we ran in warm-session mode, re-test
-    // every survived mutant in isolate mode to catch false negatives from state
-    // leakage (session-scoped fixtures, mutable plugin state, etc.).
-    if config.verify_survivors && !config.isolate {
-        // Build lookup: mutant_name → (WorkItem, Option<cache_key>)
-        // Own the data so it doesn't borrow `covered_work` past this point.
-        let survivor_lookup: HashMap<String, (WorkItem, Option<String>)> = covered_work
-            .iter()
-            .map(|s| {
-                (
-                    s.work_item.mutant_name.clone(),
-                    (s.work_item.clone(), s.cache_key.clone()),
-                )
-            })
-            .collect();
+    Ok((results, cache_counts, covered_work))
+}
 
-        let survivor_items: Vec<WorkItem> = results
-            .iter()
-            .filter(|r| r.status == MutantStatus::Survived)
-            .filter_map(|r| survivor_lookup.get(&r.mutant_name))
-            .map(|(wi, _)| wi.clone())
-            .collect();
-
-        if !survivor_items.is_empty() {
-            let survivor_count = survivor_items.len();
-            eprintln!("Verifying {survivor_count} survived mutants in isolate mode...");
-
-            let verify_results = run_isolated(
-                &config,
-                survivor_items,
-                &harness_dir,
-                &mutants_dir,
-                test_stats.as_ref(),
-                &project_dir,
-            )
-            .await?;
-
-            // Log which mutants will be corrected before applying corrections
-            for vr in &verify_results {
-                if vr.status == MutantStatus::Killed {
-                    eprintln!(
-                        "  [verify] {} survived warm-session but killed in isolate — false negative corrected",
-                        vr.mutant_name
-                    );
-                    // Update the cache entry so future runs get the correct result
-                    if let Some((_, Some(key))) = survivor_lookup.get(&vr.mutant_name) {
-                        cache::force_update_entry(
-                            &project_dir,
-                            key,
-                            vr.exit_code,
-                            vr.duration,
-                            vr.status,
-                        )?;
-                    }
-                }
-            }
-            let flipped = apply_verification_corrections(&mut results, &verify_results);
-
-            if flipped > 0 {
-                eprintln!(
-                    "Verification complete: {flipped}/{survivor_count} survivors were false negatives (corrected)"
-                );
-            } else {
-                eprintln!("Verification complete: all {survivor_count} survivors confirmed");
-            }
-        } else {
-            eprintln!("Verification: no warm-session survivors to verify");
+/// Phase 4b: Optionally re-test survivors in isolated mode.
+async fn phase_verify_survivors(
+    config: &RunConfig,
+    ctx: &PipelineCtx,
+    results: &mut [MutantResult],
+    covered_work: &[ScheduledMutant],
+    test_stats: &Option<TestStats>,
+) -> Result<()> {
+    if !config.verify_survivors || config.isolate {
+        if config.verify_survivors {
+            eprintln!("Verification skipped: already running in isolate mode (all results are already isolated)");
         }
-    } else if config.verify_survivors && config.isolate {
-        eprintln!("Verification skipped: already running in isolate mode (all results are already isolated)");
+        return Ok(());
     }
 
-    let test_time = start.elapsed();
+    let survivor_lookup: HashMap<String, (WorkItem, Option<String>)> = covered_work
+        .iter()
+        .map(|s| (s.work_item.mutant_name.clone(), (s.work_item.clone(), s.cache_key.clone())))
+        .collect();
 
-    // Phase 5: Results
-    let phase_start = trace.now_us();
-    // Write .meta files
-    write_meta_files(&mutants_dir, &generation.names_by_module, &results)?;
+    let survivor_items: Vec<WorkItem> = results
+        .iter()
+        .filter(|r| r.status == MutantStatus::Survived)
+        .filter_map(|r| survivor_lookup.get(&r.mutant_name))
+        .map(|(wi, _)| wi.clone())
+        .collect();
 
-    // Optional: generate Stryker-format report
+    if survivor_items.is_empty() {
+        eprintln!("Verification: no warm-session survivors to verify");
+        return Ok(());
+    }
+
+    let survivor_count = survivor_items.len();
+    eprintln!("Verifying {survivor_count} survived mutants in isolate mode...");
+
+    let verify_results = run_isolated(
+        config, survivor_items, &ctx.harness_dir, &ctx.mutants_dir,
+        test_stats.as_ref(), &ctx.project_dir,
+    ).await?;
+
+    for vr in &verify_results {
+        if vr.status == MutantStatus::Killed {
+            eprintln!(
+                "  [verify] {} survived warm-session but killed in isolate — false negative corrected",
+                vr.mutant_name
+            );
+            if let Some((_, Some(key))) = survivor_lookup.get(&vr.mutant_name) {
+                cache::force_update_entry(&ctx.project_dir, key, vr.exit_code, vr.duration, vr.status)?;
+            }
+        }
+    }
+    let flipped = apply_verification_corrections(results, &verify_results);
+
+    if flipped > 0 {
+        eprintln!("Verification complete: {flipped}/{survivor_count} survivors were false negatives (corrected)");
+    } else {
+        eprintln!("Verification complete: all {survivor_count} survivors confirmed");
+    }
+    Ok(())
+}
+
+/// Phase 5: Write results, generate reports, emit annotations, check fail-under.
+#[allow(clippy::too_many_arguments)]
+fn phase_results(
+    config: &RunConfig,
+    ctx: &mut PipelineCtx,
+    results: &[MutantResult],
+    generation: &GenerationOutput,
+    test_stats: &Option<TestStats>,
+    cache_counts: CacheCounts,
+    test_time_secs: f64,
+    sampled_from: Option<usize>,
+) -> Result<()> {
+    let phase_start = ctx.trace.now_us();
+
+    write_meta_files(&ctx.mutants_dir, &generation.names_by_module, results)?;
+
     if let Some(ref fmt) = config.report {
-        let output_path = config
-            .report_output
-            .clone()
+        let output_path = config.report_output.clone()
             .unwrap_or_else(|| PathBuf::from(format!("irradiate-report.{fmt}")));
         let all_descriptors: Vec<MutantCacheDescriptor> =
             generation.descriptors_by_name.values().cloned().collect();
         let report = crate::report::build_stryker_report(
-            &results,
-            &all_descriptors,
-            test_stats.as_ref(),
-            &project_dir,
-            &config.paths_to_mutate,
+            results, &all_descriptors, test_stats.as_ref(), &ctx.project_dir, &config.paths_to_mutate,
         );
         if fmt == "html" {
             crate::report::write_html_report(&report, &output_path)?;
@@ -699,37 +622,94 @@ pub async fn run(config: RunConfig) -> Result<()> {
         eprintln!("Report written to {}", output_path.display());
     }
 
-    // Print summary
-    let (killed, survived) = print_summary(&results, test_time.as_secs_f64(), cache_counts, &generation.descriptors_by_name, sampled_from);
+    let (killed, survived) = print_summary(
+        results, test_time_secs, cache_counts, &generation.descriptors_by_name, sampled_from,
+    );
 
-    // Emit GitHub Actions annotations (no-op outside GitHub Actions).
     let all_descriptors: Vec<_> = generation.descriptors_by_name.values().cloned().collect();
-    crate::report::emit_github_annotations(&results, &all_descriptors, killed, survived);
+    crate::report::emit_github_annotations(results, &all_descriptors, killed, survived);
 
-    trace.phase("results_output", phase_start, None);
+    ctx.trace.phase("results_output", phase_start, None);
 
-    // Write combined trace file (pipeline phases + worker events)
-    let trace_path = project_dir.join(".irradiate").join("trace.json");
-    if let Err(e) = crate::trace::write_trace_file(&trace_path, &trace.events) {
+    let trace_path = ctx.project_dir.join(".irradiate").join("trace.json");
+    if let Err(e) = crate::trace::write_trace_file(&trace_path, &ctx.trace.events) {
         tracing::warn!("Failed to write trace file: {e}");
     } else {
         eprintln!("Trace written to {}", trace_path.display());
     }
 
-    // INV-1: When fail_under is None, always return Ok(()).
-    // INV-4: When no mutants were tested (killed + survived == 0), never fail.
     if let Some(threshold) = config.fail_under {
         let tested = killed + survived;
         if tested > 0 {
             let score = killed as f64 / tested as f64 * 100.0;
-            // INV-2: score >= threshold → Ok(()), INV-3: score < threshold → Err
             if score < threshold {
-                bail!(
-                    "Mutation score {score:.1}% is below threshold {threshold:.1}%"
-                );
+                bail!("Mutation score {score:.1}% is below threshold {threshold:.1}%");
             }
         }
     }
+
+    Ok(())
+}
+
+/// Build a PoolConfig from RunConfig and PipelineCtx.
+fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
+    PoolConfig {
+        num_workers: config.workers,
+        python: config.python.clone(),
+        project_dir: ctx.project_dir.clone(),
+        mutants_dir: ctx.mutants_dir.clone(),
+        tests_dir: PathBuf::from(&config.tests_dir),
+        timeout_multiplier: config.timeout_multiplier,
+        pythonpath: ctx.pythonpath.clone(),
+        worker_recycle_after: config.worker_recycle_after,
+        max_worker_memory_mb: config.max_worker_memory_mb,
+        pytest_add_cli_args: config.pytest_add_cli_args.clone(),
+        ..Default::default()
+    }
+}
+
+/// Run the full mutation testing pipeline.
+pub async fn run(config: RunConfig) -> Result<()> {
+    validate_environment(&config)?;
+
+    let project_dir = std::env::current_dir()?;
+    let mutants_dir = project_dir.join("mutants");
+    let harness_dir = harness::extract_harness(&project_dir)?;
+    let pythonpath = build_pythonpath(&harness_dir, &config.paths_to_mutate);
+
+    let mut ctx = PipelineCtx {
+        project_dir,
+        mutants_dir,
+        harness_dir,
+        pythonpath,
+        trace: crate::trace::TraceLog::new(),
+    };
+
+    // Phase 1: Generate mutations
+    let Some((generation, all_mutants, sampled_from)) = phase_generate(&config, &mut ctx)? else {
+        return Ok(()); // no mutants found or all filtered out
+    };
+    let total_mutants = all_mutants.len();
+
+    // Phase 2: Stats + validation (+ pre-spawn workers)
+    let (test_stats, pre_spawned) =
+        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty()).await?;
+
+    // Phase 3+4: Schedule + execute
+    let start = Instant::now();
+    let (mut results, cache_counts, covered_work) =
+        phase_execute(&config, &mut ctx, &all_mutants, &test_stats, pre_spawned, total_mutants).await?;
+
+    // Phase 4b: Verify survivors
+    phase_verify_survivors(&config, &ctx, &mut results, &covered_work, &test_stats).await?;
+
+    let test_time = start.elapsed();
+
+    // Phase 5: Results + reports
+    phase_results(
+        &config, &mut ctx, &results, &generation, &test_stats,
+        cache_counts, test_time.as_secs_f64(), sampled_from,
+    )?;
 
     Ok(())
 }
