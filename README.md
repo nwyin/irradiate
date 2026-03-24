@@ -7,14 +7,14 @@ Fast mutation testing for Python, written in Rust.
 
 ## Why
 
-Mutation testing is slow. The bottleneck isn't generating mutants — it's running the test suite once per mutant. A typical pytest startup costs 200-500ms, and with hundreds of mutants that adds up to minutes of pure overhead.
+Mutation testing is slow. The bottleneck isn't generating mutants, it's running the test suite once per mutant. A typical pytest startup costs 200-500ms, and with hundreds of mutants that adds up to minutes of pure overhead.
 
-irradiate eliminates this by maintaining a pool of pre-warmed pytest workers. Pytest starts once, collects tests once, then forks a child process for each mutant. The result: mutation testing at 30-60 mutants/sec on real codebases.
+irradiate keeps a pool of pre-warmed pytest workers. Pytest starts once, collects tests once, then forks a child process for each mutant. 30-60 mutants/sec on real codebases.
 
 ## How it works
 
-1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (28+ mutation operator categories including regex pattern mutations)
-2. Generate trampolined mutants — each function gets an original, N mutated variants, and a runtime dispatcher
+1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (28+ mutation operator categories including regex patterns)
+2. Generate trampolined mutants: each function gets an original, N mutated variants, and a runtime dispatcher
 3. Collect test coverage and timing in a single pytest run
 4. Fork a child process per mutant inside pre-warmed workers (no pytest restart)
 5. Report results as terminal output, JSON (Stryker schema v2), HTML, or GitHub Actions annotations
@@ -109,9 +109,7 @@ Functions can be excluded with `# pragma: no mutate`.
 
 ### Execution model
 
-- **Fork-per-mutant** (default): Workers fork after pytest collection. Each mutant runs in an isolated child process — no state leakage between mutants, no pytest restart overhead.
-- **`--isolate`**: Full subprocess isolation. Slower but guaranteed clean for projects with complex test infrastructure.
-- **`--verify-survivors`**: After the main run, re-tests survived mutants in isolate mode to catch false negatives from warm-session state leakage.
+By default, workers fork after pytest collection. Each mutant runs in an isolated child process with no restart overhead. For projects with complex test infrastructure, `--isolate` runs each mutant in a fresh subprocess instead. `--verify-survivors` re-tests survivors in isolate mode after the main run to catch false negatives from warm-session state leakage.
 
 ### Incremental mode (`--diff`)
 
@@ -119,18 +117,15 @@ Only mutate functions touched by a git diff. Uses `git merge-base` to compare ag
 
 ### Reporting
 
-- **Terminal**: summary table + list of survived mutants
-- **JSON**: [Stryker mutation-testing-report-schema v2](https://github.com/stryker-mutator/mutation-testing-elements/tree/master/packages/report-schema) — compatible with Stryker Dashboard
-- **HTML**: self-contained report using [mutation-testing-elements](https://github.com/stryker-mutator/mutation-testing-elements) web component
-- **GitHub Actions**: auto-detected `::warning` annotations on survived mutants + Markdown step summary
+Terminal output groups survived mutants by operator. `--report json` writes [Stryker mutation-testing-report-schema v2](https://github.com/stryker-mutator/mutation-testing-elements/tree/master/packages/report-schema), compatible with the Stryker Dashboard. `--report html` generates a self-contained report using [mutation-testing-elements](https://github.com/stryker-mutator/mutation-testing-elements). On GitHub Actions, irradiate auto-emits `::warning` annotations on survived mutants and writes a Markdown step summary.
 
 ### Caching
 
-Content-addressable cache keyed on SHA-256 of function body + test IDs + operator. Survives rebases, branch switches, and `touch` — unlike mtime-based caches.
+Content-addressable cache keyed on SHA-256 of function body, test IDs, and operator. Survives rebases, branch switches, and `touch` (mtime-based caches don't). Use `--no-cache` to force a full re-run.
 
 ### Decorator support
 
-`@property`, `@classmethod`, and `@staticmethod` are handled natively via a descriptor-aware trampoline. Other decorated functions are skipped (source-patching fallback planned — see [#13](https://github.com/nwyin/irradiate/issues/13)).
+`@property`, `@classmethod`, and `@staticmethod` are handled natively via a descriptor-aware trampoline. Other decorated functions are currently skipped; a source-patching fallback is planned ([#13](https://github.com/nwyin/irradiate/issues/13)).
 
 ### Sampling (`--sample`)
 
@@ -140,7 +135,7 @@ Test a random subset of mutants for fast CI feedback. Academic research shows 5-
 - `--sample 100`: test exactly 100 mutants
 - `--sample-seed 42`: override RNG seed (default: 0 for reproducibility)
 
-Sampling is operator-stratified — every mutation category is proportionally represented.
+Sampling is operator-stratified, so every mutation category is proportionally represented.
 
 ### CI integration
 
@@ -157,26 +152,21 @@ Auto-detects GitHub Actions and emits inline `::warning` annotations on survived
 
 ### Performance tuning
 
-- `--workers N`: control parallelism (defaults to CPU count)
-- `--timeout-multiplier N`: scale per-mutant timeout (default 10x baseline)
-- `--worker-recycle-after N`: respawn workers after N mutants (auto-tuned)
-- `--max-worker-memory N`: recycle workers exceeding N MB RSS
-- `--covered-only`: skip mutants with no test coverage
-- `--no-stats`: skip coverage collection, test all mutants against all tests
+Parallelism defaults to CPU count (`--workers N` to override). Workers are recycled automatically to limit memory growth, tunable with `--worker-recycle-after N` and `--max-worker-memory N`. `--covered-only` skips mutants with no test coverage. `--no-stats` skips coverage collection when you want to test all mutants against all tests. Per-mutant timeout defaults to 10x baseline (`--timeout-multiplier N`).
 
 ## How it compares to mutmut
 
 | | mutmut | irradiate |
 |---|---|---|
-| **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant — pytest starts once |
+| **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant, pytest starts once |
 | **Parser** | LibCST (Python) | tree-sitter (Rust, parallel) |
 | **Operators** | ~20 categories | 28+ categories (incl. regex) |
 | **Cache** | mtime-based | Content-addressable (SHA-256) |
 | **Orchestration** | Python multiprocessing | Rust + tokio async |
-| **Incremental** | — | `--diff` with merge-base |
+| **Incremental** | no | `--diff` with merge-base |
 | **Reports** | Terminal only | JSON, HTML, GitHub Actions annotations |
 | **Decorator support** | Skip all | @property/@classmethod/@staticmethod handled |
-| **Sampling** | — | `--sample` with operator stratification |
+| **Sampling** | no | `--sample` with operator stratification |
 | **CI integration** | Manual | `--fail-under`, GitHub Actions action, annotations, step summary |
 | **Isolation** | Fork only | Warm-session + `--isolate` + `--verify-survivors` |
 
