@@ -348,7 +348,7 @@ The following gaps from the original audit have been closed:
 2. ~~**Constant replacement**~~ — `constant_replacement` operator: `n`→`0` (non-zero), `n`→`-n` (positive); both int and float. Complements existing `number_mutation` (n→n+1).
 3. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
 4. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
-5. **Regex mutation** — Applicable but complex. Would need a regex parser. See `docs/internals/regex-mutation-design.md`.
+5. **Regex mutation** — Applicable but complex. Would need a regex parser. See `docs/internals/regex-mutation-plan.md`.
 
 ### Not applicable to Python
 
