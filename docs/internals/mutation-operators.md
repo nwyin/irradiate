@@ -4,7 +4,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ## irradiate (current)
 
-27 operator categories, ~160+ distinct mutations. Python-specific, operates on tree-sitter CST.
+28 operator categories, ~160+ distinct mutations. Python-specific, operates on tree-sitter CST.
 
 ### Operators implemented
 
@@ -19,6 +19,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 | String methods | `method_swap` | 15 pairs: `lower`↔`upper`, `lstrip`↔`rstrip`, `find`↔`rfind`, `ljust`↔`rjust`, `index`↔`rindex`, `removeprefix`↔`removesuffix`, `partition`↔`rpartition` |
 | Constants | `name_swap` | `True`↔`False`, `deepcopy`→`copy` |
 | Numbers | `number_mutation` | `n`→`n+1` (int and float) |
+| Constant replacement | `constant_replacement` | `n`→`0` (non-zero), `n`→`-n` (positive); int and float |
 | Strings | `string_mutation` | `"foo"`→`"XXfooXX"` (skip docstrings, delimiter-containing) |
 | String emptying | `string_emptying` | `"foo"`→`""` (catches empty-string handling bugs) |
 | Lambdas | `lambda_mutation` | body→`None` (or `None`→`0`) |
@@ -315,7 +316,7 @@ Operators that exist in 3+ ecosystems are considered "universal". Operators uniq
 | Visibility reduction | -- | -- | -- | -- | -- | -- | -- | Yes |
 | Struct/object field deletion | -- | -- | -- | -- | -- | Yes | -- | -- |
 | Match arm guard mutation | -- | -- | -- | -- | -- | Yes | -- | -- |
-| Constant→42 | -- | -- | PIT (CRCR) | -- | -- | -- | Yes | -- |
+| Constant→0/negate | Yes | -- | PIT (CRCR) | -- | -- | -- | Yes | -- |
 | Operand deletion (`a+b`→`a`) | -- | -- | PIT, Major | -- | -- | -- | -- | -- |
 | Argument propagation | -- | -- | PIT, Arcmutate | -- | -- | -- | -- | -- |
 
@@ -344,10 +345,10 @@ The following gaps from the original audit have been closed:
 ### Remaining opportunities
 
 1. **Decorator removal** — Remove `@decorator` individually (cosmic-ray, mutpy). Blocked: trampoline architecture skips decorated functions entirely. Requires architectural changes to support.
-2. **Constant replacement** (`42`→`0`, `0`→`1`, `c`→`-c`) — More aggressive than current `n+1`. May produce many equivalent mutants.
+2. ~~**Constant replacement**~~ — `constant_replacement` operator: `n`→`0` (non-zero), `n`→`-n` (positive); both int and float. Complements existing `number_mutation` (n→n+1).
 3. **`self.x`→`x`** — mutpy only. Tests that `self` is correctly used. Narrow.
 4. **`super()` manipulation** — mutpy only. Tests inheritance chains. Narrow.
-5. **Regex mutation** — Applicable but complex. Would need a regex parser.
+5. **Regex mutation** — Applicable but complex. Would need a regex parser. See `docs/internals/regex-mutation-design.md`.
 
 ### Not applicable to Python
 

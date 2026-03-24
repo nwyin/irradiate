@@ -647,15 +647,24 @@ fn add_integer_mutation(
 ) {
     let text = node_text(source, node);
     if let Ok(value) = text.replace('_', "").parse::<i64>() {
-        let replacement = (value + 1).to_string();
-        if replacement != text {
-            record_mutation(
-                text,
-                &replacement,
-                "number_mutation",
-                node.start_byte() - fn_start,
-                mutations,
-            );
+        let start = node.start_byte() - fn_start;
+
+        // n → n+1 (existing operator)
+        let plus_one = (value + 1).to_string();
+        if plus_one != text {
+            record_mutation(text, &plus_one, "number_mutation", start, mutations);
+        }
+
+        // n → 0 (boundary — catches "is the value checked at all?")
+        if value != 0 {
+            record_mutation(text, "0", "constant_replacement", start, mutations);
+        }
+
+        // n → -n (sign flip — catches sign-sensitive logic)
+        // Only for non-zero; skip if already negative-one (n+1 already covers 0→1).
+        if value > 0 {
+            let negated = (-value).to_string();
+            record_mutation(text, &negated, "constant_replacement", start, mutations);
         }
     }
 }
@@ -668,15 +677,23 @@ fn add_float_mutation(
 ) {
     let text = node_text(source, node);
     if let Ok(value) = text.parse::<f64>() {
-        let replacement = format!("{}", value + 1.0);
-        if replacement != text {
-            record_mutation(
-                text,
-                &replacement,
-                "number_mutation",
-                node.start_byte() - fn_start,
-                mutations,
-            );
+        let start = node.start_byte() - fn_start;
+
+        // n → n+1.0 (existing operator)
+        let plus_one = format!("{}", value + 1.0);
+        if plus_one != text {
+            record_mutation(text, &plus_one, "number_mutation", start, mutations);
+        }
+
+        // n → 0.0 (boundary)
+        if value != 0.0 {
+            record_mutation(text, "0.0", "constant_replacement", start, mutations);
+        }
+
+        // n → -n (sign flip)
+        if value > 0.0 {
+            let negated = format!("{}", -value);
+            record_mutation(text, &negated, "constant_replacement", start, mutations);
         }
     }
 }
@@ -2529,6 +2546,105 @@ mod tests {
         assert_eq!(fm.start_line, 1);
         assert_eq!(fm.end_line, 4);
         assert!(fm.start_line <= fm.end_line, "INV-1");
+    }
+
+    #[test]
+    fn constant_replacement_integer_nonzero_produces_zero() {
+        let source = "def f():\n    return 42\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        // 42 → 0 and 42 → -42
+        assert_eq!(cr.len(), 2, "expected 2 constant_replacement mutations, got: {cr:?}");
+        assert!(cr.iter().any(|m| m.replacement == "0"), "expected 42 → 0");
+        assert!(cr.iter().any(|m| m.replacement == "-42"), "expected 42 → -42");
+
+        for m in &cr {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_python(&mutated).is_some(), "must produce valid Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn constant_replacement_zero_has_no_extra_mutations() {
+        let source = "def f():\n    return 0\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+
+        // 0 → 1 from number_mutation; no constant_replacement (0→0 and 0→-0 are no-ops)
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        assert!(cr.is_empty(), "zero should not produce constant_replacement mutations, got: {cr:?}");
+    }
+
+    #[test]
+    fn constant_replacement_negative_integer_produces_zero_only() {
+        // Negative integers in Python are parsed as unary_operator(-) + integer(1),
+        // so tree-sitter sees the integer node as "1" not "-1".
+        // The integer "1" gets: number_mutation(1→2), constant_replacement(1→0, 1→-1).
+        let source = "def f():\n    x = -1\n    return x\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        assert!(cr.iter().any(|m| m.replacement == "0"), "expected 1 → 0");
+    }
+
+    #[test]
+    fn constant_replacement_float_nonzero() {
+        let source = "def f():\n    return 3.14\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        assert_eq!(cr.len(), 2, "expected 2 constant_replacement for float, got: {cr:?}");
+        assert!(cr.iter().any(|m| m.replacement == "0.0"), "expected 3.14 → 0.0");
+        assert!(cr.iter().any(|m| m.replacement == "-3.14"), "expected 3.14 → -3.14");
+
+        for m in &cr {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_python(&mutated).is_some(), "must produce valid Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn constant_replacement_float_zero_has_no_extra() {
+        let source = "def f():\n    return 0.0\n";
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        assert!(cr.is_empty(), "0.0 should not produce constant_replacement, got: {cr:?}");
+    }
+
+    #[test]
+    fn constant_replacement_preserves_parseability() {
+        let source = concat!(
+            "def f(x):\n",
+            "    threshold = 100\n",
+            "    rate = 0.5\n",
+            "    if x > threshold:\n",
+            "        return rate * x\n",
+            "    return 0\n",
+        );
+        let fms = collect_file_mutations_tree_sitter(source);
+        let fm = &fms[0];
+        check_span_invariant(fm);
+
+        let cr: Vec<_> = fm.mutations.iter().filter(|m| m.operator == "constant_replacement").collect();
+        assert!(!cr.is_empty(), "expected constant_replacement mutations");
+
+        for m in &cr {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(
+                parse_python(&mutated).is_some(),
+                "constant_replacement must produce valid Python:\n{mutated}"
+            );
+        }
     }
 
 }
