@@ -1099,10 +1099,56 @@ fn generate_mutants(
         }
     }
 
+    // Copy non-Python data files (e.g. .txt, .json, .grammar) from source directories
+    // into the mutants directory. Packages like parso use `Path(__file__).parent` to locate
+    // data files at runtime; without these, the trampolined code fails with FileNotFoundError.
+    for path in paths_to_mutate {
+        if !path.is_dir() {
+            continue;
+        }
+        let strip_base = if path.join("__init__.py").exists() {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        copy_data_files(path, &strip_base, mutants_dir)?;
+    }
+
     Ok(GenerationOutput {
         names_by_module: all_names,
         descriptors_by_name,
     })
+}
+
+/// Recursively copy non-Python data files from `dir` into `mutants_dir`, preserving
+/// relative paths. Skips `.py`, `.pyc`, `__pycache__`, hidden dirs, and `.meta` files.
+fn copy_data_files(dir: &Path, strip_base: &Path, mutants_dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with('.') || name == "__pycache__" {
+                continue;
+            }
+            copy_data_files(&path, strip_base, mutants_dir)?;
+        } else {
+            let ext = path.extension().unwrap_or_default().to_string_lossy();
+            if ext == "py" || ext == "pyc" || ext == "meta" {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(strip_base) {
+                let dest = mutants_dir.join(rel);
+                if !dest.exists() {
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(&path, &dest)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_python_files(dir: &Path) -> Result<Vec<PathBuf>> {
