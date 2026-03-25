@@ -59,6 +59,11 @@ fn extract_pattern_parts(text: &str) -> Option<(usize, &str, char)> {
     if lower_prefix.contains('b') {
         return None;
     }
+    // Skip f-strings: regex mutations that alter `{` or `}` inside character
+    // classes produce `SyntaxError: f-string: single '}' is not allowed`.
+    if lower_prefix.contains('f') {
+        return None;
+    }
 
     let quote_char = text.as_bytes()[quote_start] as char;
 
