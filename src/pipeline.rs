@@ -219,6 +219,7 @@ fn phase_generate(
         &ctx.mutants_dir,
         &config.do_not_mutate,
         diff_filter.as_ref().map(|(f, r)| (f, r.as_path())),
+        &config.tests_dir,
     )?;
     let gen_time = start.elapsed();
     let mutant_count: usize = generation.names_by_module.values().map(|v| v.len()).sum();
@@ -908,6 +909,7 @@ fn generate_mutants(
     mutants_dir: &Path,
     do_not_mutate: &[String],
     diff_filter: Option<(&crate::git_diff::DiffFilter, &Path)>,
+    tests_dir: &str,
 ) -> Result<GenerationOutput> {
     // Clean mutants dir
     if mutants_dir.exists() {
@@ -973,6 +975,29 @@ fn generate_mutants(
         for py_file in py_files {
             file_entries.push((py_file, strip_base.clone()));
         }
+    }
+
+    // When tests_dir is inside paths_to_mutate (e.g. toolz/tests inside toolz/),
+    // exclude test files from the mutants directory to avoid import shadowing.
+    // Only activate when tests_dir is actually under a source path.
+    let tests_dir_canonical = std::fs::canonicalize(tests_dir).ok();
+    let source_canonicals: Vec<PathBuf> = paths_to_mutate
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    let tests_inside_source = tests_dir_canonical.as_ref().is_some_and(|tests_canon| {
+        source_canonicals.iter().any(|src| tests_canon.starts_with(src))
+    });
+    if tests_inside_source {
+        let tests_canon = tests_dir_canonical.as_ref().unwrap();
+        file_entries.retain(|(py_file, _strip_base)| {
+            if let Ok(file_canon) = std::fs::canonicalize(py_file) {
+                if file_canon.starts_with(tests_canon) {
+                    return false;
+                }
+            }
+            true
+        });
     }
 
     // Compute project root for do_not_mutate path matching (relative to cwd).
@@ -1749,7 +1774,7 @@ mod tests {
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
-        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
 
         // Both files must be present in mutants/
         assert!(
@@ -1784,7 +1809,7 @@ mod tests {
         // utils.py — only constants, no mutations
         std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
 
-        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
         assert!(
@@ -1829,7 +1854,7 @@ mod tests {
         std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points directly at the package directory "src/mypkg"
-        generate_mutants(&[pkg.clone()], mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[pkg.clone()], mutants_tmp.path(), &[], None, "tests").unwrap();
 
         // Files must land under mutants/mypkg/, not directly in mutants/
         let mutants_pkg = mutants_tmp.path().join("mypkg");
@@ -1867,7 +1892,7 @@ mod tests {
         std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points at the source root "src" (no __init__.py there)
-        generate_mutants(&[src.clone()], mutants_tmp.path(), &[], None).unwrap();
+        generate_mutants(&[src.clone()], mutants_tmp.path(), &[], None, "tests").unwrap();
 
         // Files must land under mutants/simple_lib/
         assert!(
@@ -1893,7 +1918,7 @@ mod tests {
         std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // Should not panic even when parent() returns an empty component
-        let result = generate_mutants(&[tmp.path().to_path_buf()], mutants_tmp.path(), &[], None);
+        let result = generate_mutants(&[tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests");
         assert!(
             result.is_ok(),
             "should not fail for package dirs with no parent prefix"
@@ -1970,7 +1995,7 @@ mod tests {
         // Build pattern that matches config.py. Since the test uses absolute paths,
         // we match using just the filename via **.
         let pattern = "**/config.py".to_string();
-        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[pattern], None).unwrap();
+        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[pattern], None, "tests").unwrap();
 
         // config.py should NOT be in the mutant names (skipped)
         for module in result.names_by_module.keys() {
@@ -2004,7 +2029,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None).unwrap();
+        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
         assert!(
             !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
@@ -2111,7 +2136,7 @@ mod tests {
 
         // Generate real mutants — the trampoline `if active == 'fail': raise …` must be present.
         let tmp_mutants = tempfile::tempdir().unwrap();
-        generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None)
+        generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None, "tests")
             .expect("mutant generation should succeed for fixture");
 
         let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2429,6 +2454,7 @@ mod tests {
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
+            "tests",
         )
         .unwrap();
 
@@ -2475,6 +2501,7 @@ index abc..def 100644
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
+            "tests",
         )
         .unwrap();
 
@@ -2512,9 +2539,9 @@ index abc..def 100644
         .unwrap();
 
         let result_no_filter =
-            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_a.path(), &[], None).unwrap();
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_a.path(), &[], None, "tests").unwrap();
         let result_none_filter =
-            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_b.path(), &[], None).unwrap();
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_b.path(), &[], None, "tests").unwrap();
 
         assert_eq!(
             result_no_filter.names_by_module.len(),
@@ -2557,6 +2584,7 @@ index 000..abc
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
+            "tests",
         )
         .unwrap();
 
