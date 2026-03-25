@@ -921,16 +921,9 @@ mod tests {
 
     #[test]
     fn test_split_at_depth0_colon_before_string() {
-        let (before, after) = split_at_depth0(r#" str = "a:b""#, ':');
-        // Should split at the first colon (outside string), not the one inside
-        // This simulates the annotation colon: `x: str = "a:b"`
-        // After split_params gives us `x: str = "a:b"`, split_at_depth0(':') finds the first ':'
-        // which is outside any string
-        // ... but here the input starts with ` str = "a:b"` which has no leading colon
-        // Let me test a realistic case
-        let (b2, a2) = split_at_depth0(r#"x: str = "a:b""#, ':');
-        assert_eq!(b2, "x");
-        assert_eq!(a2.unwrap(), r#" str = "a:b""#);
+        let (b, a) = split_at_depth0(r#"x: str = "a:b""#, ':');
+        assert_eq!(b, "x");
+        assert_eq!(a.unwrap(), r#" str = "a:b""#);
     }
 
     #[test]

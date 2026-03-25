@@ -122,6 +122,9 @@ pub fn mutate_file(
     // Track top-level trampolines emitted inline (both module_code + wrapper_code),
     // so the final append loop can skip them.
     let mut emitted_inline: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Track which trampoline indices have been emitted, so a property setter/deleter
+    // with the same name as the getter doesn't re-match the getter's trampoline.
+    let mut emitted_trampolines: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Buffer for decorator lines. When we encounter @decorator lines, we buffer them
     // instead of emitting immediately. If the following `def` is trampolined, we discard
@@ -168,7 +171,8 @@ pub fn mutate_file(
         let class_key = current_class.as_ref().map(|(name, _)| name.as_str());
 
         if !func_name.is_empty() {
-            if let Some(idx) = find_trampoline_idx(&function_mutations, class_key, func_name) {
+            if let Some(idx) = find_trampoline_idx(&function_mutations, class_key, func_name, &emitted_trampolines) {
+                emitted_trampolines.insert(idx);
                 // Discard buffered decorator lines — the trampoline provides its own.
                 decorator_buffer.clear();
 
@@ -317,10 +321,14 @@ fn find_trampoline_idx(
     function_mutations: &[FunctionMutations],
     class_name: Option<&str>,
     func_name: &str,
+    emitted: &std::collections::HashSet<usize>,
 ) -> Option<usize> {
     function_mutations
         .iter()
-        .position(|fm| fm.name == func_name && fm.class_name.as_deref() == class_name)
+        .enumerate()
+        .position(|(i, fm)| {
+            fm.name == func_name && fm.class_name.as_deref() == class_name && !emitted.contains(&i)
+        })
 }
 
 fn extract_class_name(line: &str) -> Option<&str> {
@@ -1598,6 +1606,46 @@ CACHED = make_cached_stream_func(42)
         assert!(
             result.source.contains("plain__irradiate"),
             "undecorated method must be trampolined;\n{}",
+            result.source
+        );
+    }
+
+    // INV-4: Property setter is preserved when getter is trampolined (issue #21).
+    // Both @property getter and @x.setter share the same function name. The codegen
+    // must not emit the getter's trampoline twice (which would strip the setter).
+    #[test]
+    fn test_property_setter_preserved() {
+        let source = concat!(
+            "class Env:\n",
+            "    @property\n",
+            "    def base_url(self):\n",
+            "        return self._url\n",
+            "\n",
+            "    @base_url.setter\n",
+            "    def base_url(self, value):\n",
+            "        if value is None:\n",
+            "            value = 'http://localhost/'\n",
+            "        self._url = value\n",
+            "\n",
+            "    def other(self, x):\n",
+            "        return x + 1\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should produce mutations");
+        // The getter should be trampolined with @property.
+        assert!(
+            result.source.contains("@property"),
+            "getter must have @property decorator;\n{}",
+            result.source
+        );
+        // The setter must be preserved as-is (with @base_url.setter decorator).
+        assert!(
+            result.source.contains("@base_url.setter"),
+            "setter decorator must be preserved;\n{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("self._url = value"),
+            "setter body must be preserved;\n{}",
             result.source
         );
     }
