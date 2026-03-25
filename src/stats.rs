@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tracing::info;
+
+/// Default timeout for the stats collection subprocess (seconds).
+const STATS_TIMEOUT_SECS: u64 = 300;
 
 /// Stats collected from running the test suite with `active_mutant = "stats"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,7 +209,7 @@ pub fn collect_stats(
 
     info!("Collecting stats with PYTHONPATH={pythonpath}");
 
-    let output = Command::new(python)
+    let mut child = Command::new(python)
         .arg("-m")
         .arg("pytest")
         .arg("--irradiate-stats")
@@ -220,8 +224,31 @@ pub fn collect_stats(
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)
         .current_dir(project_dir)
-        .output()
-        .context("Failed to run pytest for stats collection")?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to start pytest for stats collection")?;
+
+    // Wait with timeout to avoid hanging on projects with slow trampoline overhead.
+    let timeout = Duration::from_secs(STATS_TIMEOUT_SECS);
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "Stats collection timed out after {}s — the test suite may be too slow under the trampoline",
+                    STATS_TIMEOUT_SECS
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+
+    let output = child.wait_with_output()
+        .context("Failed to collect pytest output after stats run")?;
 
     // The stats plugin writes exit_status, test_count, and fail_validated into
     // the stats JSON. Pipeline reads those fields for validation. We only bail
