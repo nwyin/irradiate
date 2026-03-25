@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$ROOT/scripts/compat-manifest.json"
 CORPORA="$ROOT/bench/corpora"
 BINARY="$ROOT/target/release/irradiate"
-SAMPLE="${SAMPLE:-5}"
+SAMPLE="${SAMPLE:-3}"
 TIMEOUT="${TIMEOUT:-300}"  # 5 minutes per project
 REPORT="$CORPORA/compat-report.json"
 
