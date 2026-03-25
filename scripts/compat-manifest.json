@@ -30,7 +30,7 @@
   {"name": "faker",          "repo": "https://github.com/joke2k/faker",                    "src": "faker",             "tests": "tests", "install": "pytest freezegun validators Pillow -e ."},
   {"name": "factory-boy",    "repo": "https://github.com/FactoryBoy/factory_boy",          "src": "factory",           "tests": "tests", "install": "pytest -e '.[dev]'"},
   {"name": "apispec",        "repo": "https://github.com/marshmallow-code/apispec",        "src": "src/apispec",        "tests": "tests", "install": "pytest -e '.[dev]'"},
-  {"name": "webargs",        "repo": "https://github.com/marshmallow-code/webargs",        "src": "src/webargs",        "tests": "tests", "install": "pytest -e '.[dev]'"},
+  {"name": "webargs",        "repo": "https://github.com/marshmallow-code/webargs",        "src": "src/webargs",        "tests": "tests", "install": "pytest pytest-asyncio webtest webtest-aiohttp pytest-aiohttp Flask Django bottle tornado pyramid falcon aiohttp 'setuptools<82' -e ."},
   {"name": "desert",         "repo": "https://github.com/python-desert/desert",            "src": "src/desert",        "tests": "tests", "install": "pytest marshmallow attrs -e ."},
   {"name": "bottle",         "repo": "https://github.com/bottlepy/bottle",                 "src": "bottle.py",         "tests": "test", "install": "pytest mako jinja2 -e ."},
   {"name": "arrow",          "repo": "https://github.com/arrow-py/arrow",                  "src": "arrow",             "tests": "tests", "install": "pytest python-dateutil simplejson -e '.[test]'", "do_not_mutate": ["arrow/locales.py"]},
