@@ -986,7 +986,9 @@ fn generate_mutants(
         .filter_map(|p| std::fs::canonicalize(p).ok())
         .collect();
     let tests_inside_source = tests_dir_canonical.as_ref().is_some_and(|tests_canon| {
-        source_canonicals.iter().any(|src| tests_canon.starts_with(src))
+        source_canonicals
+            .iter()
+            .any(|src| tests_canon.starts_with(src) && tests_canon != src)
     });
     if tests_inside_source {
         let tests_canon = tests_dir_canonical.as_ref().unwrap();

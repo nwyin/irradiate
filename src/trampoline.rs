@@ -236,34 +236,76 @@ fn strip_inline_comments(s: &str) -> String {
         .join(" ")
 }
 
-/// Split a parameter list string by commas, respecting bracket nesting.
-/// Only splits on commas at bracket depth 0 (not inside `[`, `(`, or `{`).
+/// Split a parameter list string by commas, respecting bracket nesting and
+/// string literals.  Only splits on commas at bracket depth 0, outside strings.
 fn split_params(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut current = String::new();
     let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut start = 0;
 
-    for ch in s.chars() {
-        match ch {
-            '[' | '(' | '{' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ']' | ')' | '}' => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                parts.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => {
-                current.push(ch);
-            }
+    while i < len {
+        let ch = bytes[i];
+
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
         }
+        if ch == b'\\' && (in_single || in_double) {
+            escape = true;
+            i += 1;
+            continue;
+        }
+
+        if !in_single && !in_double {
+            // Triple-quote openers
+            if ch == b'\'' && i + 2 < len && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_single = true;
+                i += 3;
+                continue;
+            }
+            if ch == b'"' && i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_double = true;
+                i += 3;
+                continue;
+            }
+            match ch {
+                b'\'' => { in_single = true; }
+                b'"' => { in_double = true; }
+                b'[' | b'(' | b'{' => { depth += 1; }
+                b']' | b')' | b'}' => { depth -= 1; }
+                b',' if depth == 0 => {
+                    parts.push(s[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        } else if in_single {
+            if ch == b'\'' && i + 2 < len && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_single = false;
+                i += 3;
+                continue;
+            }
+            if ch == b'\'' { in_single = false; }
+        } else if in_double {
+            if ch == b'"' && i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_double = false;
+                i += 3;
+                continue;
+            }
+            if ch == b'"' { in_double = false; }
+        }
+
+        i += 1;
     }
 
-    let trimmed = current.trim().to_string();
+    let trimmed = s[start..].trim().to_string();
     if !trimmed.is_empty() {
         parts.push(trimmed);
     }
@@ -271,19 +313,67 @@ fn split_params(s: &str) -> Vec<String> {
     parts
 }
 
-/// Find the first occurrence of `sep` at bracket depth 0.
+/// Find the first occurrence of `sep` at bracket depth 0, outside string literals.
 /// Returns `(before, Some(after))` or `(whole_string, None)`.
 fn split_at_depth0(s: &str, sep: char) -> (&str, Option<&str>) {
     let mut depth: i32 = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '[' | '(' | '{' => depth += 1,
-            ']' | ')' | '}' => depth -= 1,
-            c if c == sep && depth == 0 => {
-                return (&s[..i], Some(&s[i + ch.len_utf8()..]));
-            }
-            _ => {}
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let sep_byte = sep as u8;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = bytes[i];
+
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
         }
+        if ch == b'\\' && (in_single || in_double) {
+            escape = true;
+            i += 1;
+            continue;
+        }
+
+        if !in_single && !in_double {
+            if ch == b'\'' && i + 2 < len && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_single = true;
+                i += 3;
+                continue;
+            }
+            if ch == b'"' && i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_double = true;
+                i += 3;
+                continue;
+            }
+            if ch == b'\'' { in_single = true; i += 1; continue; }
+            if ch == b'"' { in_double = true; i += 1; continue; }
+            if ch == b'[' || ch == b'(' || ch == b'{' { depth += 1; }
+            else if ch == b']' || ch == b')' || ch == b'}' { depth -= 1; }
+            else if ch == sep_byte && depth == 0 {
+                return (&s[..i], Some(&s[i + 1..]));
+            }
+        } else if in_single {
+            if ch == b'\'' && i + 2 < len && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_single = false;
+                i += 3;
+                continue;
+            }
+            if ch == b'\'' { in_single = false; }
+        } else if in_double {
+            if ch == b'"' && i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_double = false;
+                i += 3;
+                continue;
+            }
+            if ch == b'"' { in_double = false; }
+        }
+
+        i += 1;
     }
     (s, None)
 }
@@ -792,6 +882,82 @@ mod tests {
             strip_annotations_from_params("fn: Callable[[int, str], bool], x: int"),
             "fn, x"
         );
+    }
+
+    // --- String-aware split_params tests (issue #30) ---
+
+    #[test]
+    fn test_split_params_string_with_comma() {
+        // delimiter=", " must not split on the comma inside the string
+        let parts = split_params(r#"value, *, delimiter=", ", **kwargs"#);
+        assert_eq!(parts, vec!["value", "*", r#"delimiter=", ""#, "**kwargs"]);
+    }
+
+    #[test]
+    fn test_split_params_single_quoted_comma() {
+        let parts = split_params("x='a, b', y=1");
+        assert_eq!(parts, vec!["x='a, b'", "y=1"]);
+    }
+
+    #[test]
+    fn test_split_params_escaped_quote() {
+        let parts = split_params(r#"x="it\'s, ok", y=2"#);
+        assert_eq!(parts, vec![r#"x="it\'s, ok""#, "y=2"]);
+    }
+
+    #[test]
+    fn test_split_params_triple_quoted() {
+        let parts = split_params(r#"x="""a, b""", y=1"#);
+        assert_eq!(parts, vec![r#"x="""a, b""""#, "y=1"]);
+    }
+
+    #[test]
+    fn test_split_at_depth0_string_with_colon() {
+        // Colon inside a string default must be ignored
+        let (before, after) = split_at_depth0(r#"x = "a:b""#, ':');
+        assert_eq!(before, r#"x = "a:b""#);
+        assert!(after.is_none());
+    }
+
+    #[test]
+    fn test_split_at_depth0_colon_before_string() {
+        let (before, after) = split_at_depth0(r#" str = "a:b""#, ':');
+        // Should split at the first colon (outside string), not the one inside
+        // This simulates the annotation colon: `x: str = "a:b"`
+        // After split_params gives us `x: str = "a:b"`, split_at_depth0(':') finds the first ':'
+        // which is outside any string
+        // ... but here the input starts with ` str = "a:b"` which has no leading colon
+        // Let me test a realistic case
+        let (b2, a2) = split_at_depth0(r#"x: str = "a:b""#, ':');
+        assert_eq!(b2, "x");
+        assert_eq!(a2.unwrap(), r#" str = "a:b""#);
+    }
+
+    #[test]
+    fn test_strip_annotations_string_default_with_comma() {
+        // The full pipeline: strip_annotations should preserve string defaults containing commas
+        assert_eq!(
+            strip_annotations_from_params(r#"value, *, delimiter: str = ", ", **kwargs: Any"#),
+            r#"value, *, delimiter=", ", **kwargs"#
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_string_default_with_colon() {
+        assert_eq!(
+            strip_annotations_from_params(r#"x: str = "a:b", y: int = 1"#),
+            r#"x="a:b", y=1"#
+        );
+    }
+
+    #[test]
+    fn test_parse_param_names_string_default_with_comma() {
+        // parse_param_names must correctly extract names when defaults contain commas
+        let (pos, kw, kwargs) =
+            parse_param_names(r#"value, *, delimiter=", ", **kwargs"#, false);
+        assert_eq!(pos, vec!["value"]);
+        assert_eq!(kw, vec!["delimiter"]);
+        assert_eq!(kwargs, Some("kwargs".to_string()));
     }
 
     // INV-1/INV-2: All three passthrough paths in trampoline_impl must forward self_arg.
