@@ -3871,6 +3871,26 @@ mod ternary_swap_tests {
             );
         }
     }
+
+    // Multiline ternary with interspersed comment (networkx pattern).
+    // The comment between condition and else must not produce garbled output.
+    #[test]
+    fn test_multiline_ternary_with_comment() {
+        let source = "def f(self, args, kwargs, mutates_input):\n    n = len(args)\n    return any(\n        (args[arg_pos] if n > arg_pos else kwargs.get(arg_name)) is not None\n        if not arg_name.startswith(\"not \")\n        # This assumes that e.g. `copy=True` is the default\n        else not (args[arg_pos] if n > arg_pos else kwargs.get(arg_name[4:], True))\n        for arg_name, arg_pos in mutates_input.items()\n    )\n";
+        let fms = collect_file_mutations(source);
+        for fm in &fms {
+            for m in fm.mutations.iter().filter(|m| m.operator == "ternary_swap") {
+                let mutated = apply_mutation(&fm.source, m);
+                eprintln!("=== ternary_swap original ===\n{}", m.original);
+                eprintln!("=== ternary_swap replacement ===\n{}", m.replacement);
+                assert!(
+                    parses_as_python(&format!("def wrapper():\n    {mutated}")),
+                    "multiline ternary_swap must produce parseable Python:\n{mutated}"
+                );
+            }
+        }
+    }
+
 }
 
 mod loop_mutation_tests {

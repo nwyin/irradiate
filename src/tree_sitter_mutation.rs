@@ -1112,9 +1112,13 @@ fn add_ternary_swap_mutation(
     fn_start: usize,
     mutations: &mut Vec<Mutation>,
 ) {
+    // Filter out comment nodes — tree-sitter treats them as named children,
+    // but they are extras that can appear anywhere in the conditional_expression.
     let children: Vec<Node<'_>> = {
         let mut c = node.walk();
-        node.named_children(&mut c).collect()
+        node.named_children(&mut c)
+            .filter(|n| n.kind() != "comment")
+            .collect()
     };
     if children.len() < 3 {
         return;
@@ -1145,6 +1149,7 @@ fn add_ternary_swap_mutation(
     // Between body end and condition start there are whitespace + `if`; preserve it.
     let between_body_and_cond = &full_text[body_end..condition_start];
     // Between condition end and alt start there are whitespace + `else`; preserve it.
+    // Any comments in this region are preserved as-is.
     let between_cond_and_alt = &full_text[condition_end..alt_start];
     let replacement = format!(
         "{}{}{}{}{}",
@@ -1163,7 +1168,9 @@ fn add_condition_negation_ternary(
 ) {
     let children: Vec<Node<'_>> = {
         let mut c = node.walk();
-        node.named_children(&mut c).collect()
+        node.named_children(&mut c)
+            .filter(|n| n.kind() != "comment")
+            .collect()
     };
     if children.len() < 3 {
         return;
