@@ -184,7 +184,9 @@ fn generate_wrapper_function(
 /// Extract the first parameter name from a Python parameter list string.
 /// Handles type annotations and defaults: "mcs, klass: type" → Some("mcs").
 fn extract_first_param_name(params_source: &str) -> Option<String> {
-    let trimmed = params_source.trim();
+    // Strip inline comments first (handles `# type: ignore[override]` on def line)
+    let cleaned = strip_inline_comments(params_source);
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
     }
