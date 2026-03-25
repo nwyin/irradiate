@@ -1116,6 +1116,11 @@ fn add_ternary_swap_mutation(
     if body_text == alternative_text {
         return; // equivalent mutant
     }
+    // Walrus operator (:=) in a ternary branch produces a SyntaxError when
+    // swapped into the else position. Skip these.
+    if body_text.contains(":=") || alternative_text.contains(":=") {
+        return;
+    }
     let full_text = node_text(source, node);
     // Reconstruct swapped ternary: alternative if condition else body.
     // Find the positions of `if` and `else` keywords in the original text.
@@ -1265,16 +1270,48 @@ fn add_slice_mutations(
     mutations: &mut Vec<Mutation>,
 ) {
     let slice_text = node_text(source, slice_node);
-    // Split on colons, preserving structure: [start, stop] or [start, stop, step]
-    let parts: Vec<&str> = slice_text.splitn(3, ':').collect();
-    if parts.len() < 2 {
+
+    // Use tree-sitter's AST children instead of text-splitting on ':'.
+    // Text splitting breaks on expressions containing colons (walrus operator,
+    // ternary, dict literals). tree-sitter slice nodes have named children
+    // for start/stop/step and anonymous ':' tokens.
+    //
+    // tree-sitter slice children (all optional):
+    //   - first named child before first ':' = start
+    //   - named child between first and second ':' = stop
+    //   - named child after second ':' = step
+    let mut colons = Vec::new();
+    let mut named_children = Vec::new();
+    let child_count = slice_node.child_count();
+    for i in 0..child_count {
+        let child = slice_node.child(i).unwrap();
+        if child.kind() == ":" {
+            colons.push(i);
+        } else {
+            named_children.push((i, child));
+        }
+    }
+
+    if colons.is_empty() {
         return; // not a real slice
     }
 
-    let start = parts[0].trim();
-    let stop = parts[1].trim();
-    let step = parts.get(2).map(|s| s.trim()).unwrap_or("");
-    let has_step = parts.len() == 3;
+    // Identify start, stop, step by position relative to colons
+    let first_colon = colons[0];
+    let second_colon = colons.get(1).copied();
+
+    let start_node = named_children.iter().find(|(i, _)| *i < first_colon).map(|(_, n)| *n);
+    let stop_node = named_children.iter().find(|(i, _)| {
+        *i > first_colon && second_colon.is_none_or(|sc| *i < sc)
+    }).map(|(_, n)| *n);
+    let step_node = second_colon.and_then(|sc| {
+        named_children.iter().find(|(i, _)| *i > sc).map(|(_, n)| *n)
+    });
+
+    let start = start_node.map(|n| node_text(source, n)).unwrap_or("");
+    let stop = stop_node.map(|n| node_text(source, n)).unwrap_or("");
+    let step = step_node.map(|n| node_text(source, n)).unwrap_or("");
+    let has_step = second_colon.is_some();
 
     // Remove start (if present): `1:2:3` → `:2:3`
     if !start.is_empty() {
@@ -2512,6 +2549,26 @@ mod tests {
         for m in &slice_muts {
             let mutated = apply_mutation(&fm.source, m);
             assert!(parse_python(&mutated).is_some(), "slice_index_removal must produce parseable Python:\n{mutated}");
+        }
+    }
+
+    #[test]
+    fn slice_removal_walrus_operator_in_slice() {
+        // l[:(i := l.index("..."))] — the walrus expr contains colons
+        // Text-splitting on ':' would garble this; AST-based parsing handles it.
+        let source = "def f(l):\n    return l[:(i := l.index(\"...\"))]\n";
+        let fms = collect_file_mutations(source);
+        let fm = &fms[0];
+        let slice_muts: Vec<_> = fm
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "slice_index_removal")
+            .collect();
+        // Only the stop can be removed (start is empty)
+        assert_eq!(slice_muts.len(), 1, "walrus slice should produce 1 mutation");
+        for m in &slice_muts {
+            let mutated = apply_mutation(&fm.source, m);
+            assert!(parse_python(&mutated).is_some(), "slice_index_removal with walrus must produce parseable Python:\n{mutated}");
         }
     }
 
