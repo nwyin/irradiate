@@ -413,12 +413,15 @@ fn strip_annotations_from_params(params_source: &str) -> String {
             continue;
         }
 
-        // Regular param: strip `: annotation`, keep `= default`
-        let (name_part, after_colon) = split_at_depth0(part, ':');
-        let name = name_part.trim();
+        // Regular param: strip `: annotation`, keep `= default`.
+        // But if `=` appears before `:` at depth 0, the colon is part of the
+        // default value (e.g. `x=lambda _: True`), not an annotation delimiter.
+        let (before_colon, after_colon) = split_at_depth0(part, ':');
+        let (before_eq, _) = split_at_depth0(part, '=');
 
-        if let Some(after) = after_colon {
-            // Has annotation — look for default after it
+        if let (Some(after), true) = (after_colon, before_eq.len() > before_colon.len()) {
+            // Colon comes before equals → this is an annotation
+            let name = before_colon.trim();
             let (_, default_part) = split_at_depth0(after, '=');
             if let Some(default) = default_part {
                 result.push(format!("{}={}", name, default.trim()));
@@ -426,7 +429,7 @@ fn strip_annotations_from_params(params_source: &str) -> String {
                 result.push(name.to_string());
             }
         } else {
-            // No annotation — keep as-is (may have = default)
+            // No annotation, or `=` comes before `:` (lambda default) — keep as-is
             result.push(part.to_string());
         }
     }
@@ -940,6 +943,32 @@ mod tests {
         assert_eq!(
             strip_annotations_from_params(r#"x: str = "a:b", y: int = 1"#),
             r#"x="a:b", y=1"#
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_lambda_default() {
+        // Lambda defaults contain `:` — must not be treated as annotation
+        assert_eq!(
+            strip_annotations_from_params("path='', force_absolute=lambda _: False, strict=False"),
+            "path='', force_absolute=lambda _: False, strict=False"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_lambda_identity() {
+        assert_eq!(
+            strip_annotations_from_params("items, getter=lambda x: x"),
+            "items, getter=lambda x: x"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_lambda_with_annotation() {
+        // Mix: one param has annotation, another has lambda default
+        assert_eq!(
+            strip_annotations_from_params("x: int, fn=lambda a: a + 1"),
+            "x, fn=lambda a: a + 1"
         );
     }
 
