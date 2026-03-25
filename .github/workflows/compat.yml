@@ -1,0 +1,156 @@
+name: Compatibility Sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: "Mutants per project (absolute count)"
+        default: "3"
+      projects:
+        description: "Comma-separated project names (blank = all)"
+        default: ""
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        run: |
+          filter='${{ inputs.projects }}'
+          if [ -z "$filter" ]; then
+            matrix=$(python3 -c "
+          import json
+          with open('scripts/compat-manifest.json') as f:
+              data = json.load(f)
+          print(json.dumps({'include': [{'name': p['name']} for p in data]}))
+          ")
+          else
+            matrix=$(python3 -c "
+          import json, sys
+          names = [n.strip() for n in '$filter'.split(',')]
+          with open('scripts/compat-manifest.json') as f:
+              data = json.load(f)
+          filtered = [p for p in data if p['name'] in names]
+          print(json.dumps({'include': [{'name': p['name']} for p in filtered]}))
+          ")
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  test-project:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-compat-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run compat test
+        id: test
+        env:
+          SAMPLE: ${{ inputs.sample }}
+          TIMEOUT: "300"
+        run: |
+          set +e
+          bash scripts/compat-sweep.sh "${{ matrix.name }}" 2>&1 | tee sweep.log
+          exit_code=$?
+
+          # Parse result
+          name="${{ matrix.name }}"
+          if grep -q "panicked at" sweep.log; then
+            echo "status=panic" >> "$GITHUB_OUTPUT"
+            echo "::error::$name: PANIC in irradiate"
+          elif grep -q "mutants," sweep.log; then
+            score=$(sed -n 's/.*score=\(.*\)/\1/p' sweep.log)
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+            echo "::notice::$name: pass ($score)"
+          elif grep -q "FAIL:" sweep.log; then
+            detail=$(grep "FAIL:" sweep.log | head -1 | cut -c1-120)
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            echo "::warning::$name: $detail"
+          elif grep -q "tests broken" sweep.log; then
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-${{ matrix.name }}
+          path: sweep.log
+          retention-days: 30
+
+  summary:
+    needs: test-project
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all logs
+        uses: actions/download-artifact@v4
+        with:
+          path: logs
+          pattern: compat-*
+
+      - name: Generate summary
+        run: |
+          echo "## Compatibility Sweep Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Project | Status | Detail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          pass=0; fail=0; skip=0
+          for dir in logs/compat-*/; do
+            name=$(basename "$dir" | sed 's/^compat-//')
+            log="$dir/sweep.log"
+            [ -f "$log" ] || continue
+
+            if grep -q "panicked at" "$log"; then
+              echo "| $name | PANIC | $(grep 'panicked at' "$log" | head -1 | cut -c1-80) |" >> "$GITHUB_STEP_SUMMARY"
+              ((fail++))
+            elif grep -q "mutants," "$log"; then
+              detail=$(grep "mutants," "$log" | head -1 | sed 's/^  //')
+              echo "| $name | pass | $detail |" >> "$GITHUB_STEP_SUMMARY"
+              ((pass++))
+            elif grep -q "FAIL:" "$log"; then
+              detail=$(grep "FAIL:" "$log" | head -1 | sed 's/^  FAIL: //' | cut -c1-80)
+              echo "| $name | fail | $detail |" >> "$GITHUB_STEP_SUMMARY"
+              ((fail++))
+            elif grep -q "tests broken" "$log"; then
+              echo "| $name | skip | tests broken |" >> "$GITHUB_STEP_SUMMARY"
+              ((skip++))
+            else
+              echo "| $name | unknown | |" >> "$GITHUB_STEP_SUMMARY"
+              ((skip++))
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total: $pass pass, $fail fail, $skip skip**" >> "$GITHUB_STEP_SUMMARY"
