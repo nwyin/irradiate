@@ -37,5 +37,20 @@
   {"name": "parso",          "repo": "https://github.com/davidhalter/parso",               "src": "parso",             "tests": "test", "install": "pytest -e ."},
   {"name": "isort",          "repo": "https://github.com/PyCQA/isort",                     "src": "isort",             "tests": "tests", "install": "pytest -e ."},
   {"name": "prettytable",    "repo": "https://github.com/jazzband/prettytable",            "src": "src/prettytable",    "tests": "tests", "install": "pytest -e '.[tests]'"},
-  {"name": "environs",       "repo": "https://github.com/sloria/environs",                 "src": "environs",          "tests": "tests", "install": "pytest marshmallow -e '.[dev]'"}
+  {"name": "environs",       "repo": "https://github.com/sloria/environs",                 "src": "environs",          "tests": "tests", "install": "pytest marshmallow -e '.[dev]'"},
+
+  {"name": "scikit-learn",  "repo": "https://github.com/scikit-learn/scikit-learn",        "src": "sklearn",           "tests": "sklearn/tests", "install": "pytest numpy scipy -e .", "do_not_mutate": ["sklearn/tests/*", "sklearn/**/tests/*"]},
+  {"name": "pandas",        "repo": "https://github.com/pandas-dev/pandas",                "src": "pandas",            "tests": "pandas/tests", "install": "pytest numpy python-dateutil pytz -e .", "do_not_mutate": ["pandas/tests/*", "pandas/**/tests/*"]},
+  {"name": "xarray",        "repo": "https://github.com/pydata/xarray",                    "src": "xarray",            "tests": "xarray/tests", "install": "pytest numpy pandas -e .", "do_not_mutate": ["xarray/tests/*"]},
+  {"name": "pydantic",      "repo": "https://github.com/pydantic/pydantic",                "src": "pydantic",          "tests": "tests", "install": "pytest -e ."},
+  {"name": "sqlalchemy",    "repo": "https://github.com/sqlalchemy/sqlalchemy",            "src": "lib/sqlalchemy",    "tests": "test", "install": "pytest -e ."},
+  {"name": "django",        "repo": "https://github.com/django/django",                    "src": "django",            "tests": "tests", "install": "pytest -e .", "do_not_mutate": ["django/test/*", "django/**/tests/*"]},
+  {"name": "fastapi",       "repo": "https://github.com/fastapi/fastapi",                  "src": "fastapi",           "tests": "tests", "install": "pytest httpx -e ."},
+  {"name": "starlette",     "repo": "https://github.com/encode/starlette",                 "src": "starlette",         "tests": "tests", "install": "pytest httpx anyio trio -e ."},
+  {"name": "httpx",         "repo": "https://github.com/encode/httpx",                     "src": "httpx",             "tests": "tests", "install": "pytest -e ."},
+  {"name": "requests",      "repo": "https://github.com/psf/requests",                     "src": "src/requests",      "tests": "tests", "install": "pytest trustme -e ."},
+  {"name": "rich",          "repo": "https://github.com/Textualize/rich",                  "src": "rich",              "tests": "tests", "install": "pytest -e ."},
+  {"name": "celery",        "repo": "https://github.com/celery/celery",                    "src": "celery",            "tests": "t/unit", "install": "pytest -e '.[pytest]'"},
+  {"name": "sympy",         "repo": "https://github.com/sympy/sympy",                      "src": "sympy",             "tests": "sympy", "install": "pytest mpmath -e .", "do_not_mutate": ["sympy/**/tests/*"]},
+  {"name": "networkx",      "repo": "https://github.com/networkx/networkx",                "src": "networkx",          "tests": "networkx", "install": "pytest numpy scipy -e .", "do_not_mutate": ["networkx/**/tests/*"]}
 ]
