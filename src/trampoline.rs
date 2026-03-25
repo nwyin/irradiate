@@ -96,7 +96,6 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
         &lookup_prefix,
         fm.is_async,
         fm.is_generator,
-        &fm.return_annotation,
     );
 
     let decorator_prefix = match fm.descriptor_decorator {
@@ -124,7 +123,6 @@ fn generate_wrapper_function(
     lookup_prefix: &str,
     is_async: bool,
     is_generator: bool,
-    return_annotation: &str,
 ) -> String {
     let async_prefix = if is_async && !is_generator { "async " } else { "" };
 
@@ -175,7 +173,12 @@ fn generate_wrapper_function(
         (false, false) => format!("    return {trampoline_call}"),
     };
 
-    format!("{async_prefix}def {original_name}({params_source}){return_annotation}:\n{body}")
+    // Strip type annotations from the wrapper def line.  The wrapper is a pure
+    // dispatcher — annotations serve no purpose and can cause NameError when
+    // forward-referenced types aren't in the trampolined module's namespace (#26).
+    // The _orig function retains the full annotated signature.
+    let bare_params = strip_annotations_from_params(params_source);
+    format!("{async_prefix}def {original_name}({bare_params}):\n{body}")
 }
 
 /// Strip inline comments from a params source string (line by line).
@@ -266,6 +269,79 @@ fn split_params(s: &str) -> Vec<String> {
     }
 
     parts
+}
+
+/// Find the first occurrence of `sep` at bracket depth 0.
+/// Returns `(before, Some(after))` or `(whole_string, None)`.
+fn split_at_depth0(s: &str, sep: char) -> (&str, Option<&str>) {
+    let mut depth: i32 = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                return (&s[..i], Some(&s[i + ch.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+    (s, None)
+}
+
+/// Strip type annotations from a parameter list, preserving names and defaults.
+/// The wrapper function is just a dispatcher — annotations only cause NameErrors
+/// when forward-referenced types aren't in scope (issue #26).
+///
+/// Examples:
+///   "x: int, y: str = 'hi'"          → "x, y='hi'"
+///   "self, x: Dict[str, int] = {}"   → "self, x={}"
+///   "*, key: str = 'a', **kw: Any"   → "*, key='a', **kw"
+///   "*args: int"                      → "*args"
+fn strip_annotations_from_params(params_source: &str) -> String {
+    let stripped = strip_inline_comments(params_source);
+    let parts = split_params(&stripped);
+    let mut result = Vec::new();
+
+    for part in &parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Keep separators as-is
+        if part == "*" || part == "/" {
+            result.push(part.to_string());
+            continue;
+        }
+
+        // **kwargs or *args: strip annotation after name
+        if part.starts_with("**") || part.starts_with('*') {
+            let prefix = if part.starts_with("**") { "**" } else { "*" };
+            let rest = &part[prefix.len()..];
+            let (name_part, _) = split_at_depth0(rest, ':');
+            result.push(format!("{}{}", prefix, name_part.trim()));
+            continue;
+        }
+
+        // Regular param: strip `: annotation`, keep `= default`
+        let (name_part, after_colon) = split_at_depth0(part, ':');
+        let name = name_part.trim();
+
+        if let Some(after) = after_colon {
+            // Has annotation — look for default after it
+            let (_, default_part) = split_at_depth0(after, '=');
+            if let Some(default) = default_part {
+                result.push(format!("{}={}", name, default.trim()));
+            } else {
+                result.push(name.to_string());
+            }
+        } else {
+            // No annotation — keep as-is (may have = default)
+            result.push(part.to_string());
+        }
+    }
+
+    result.join(", ")
 }
 
 /// Parse parameter names from a params source string.
@@ -564,7 +640,6 @@ mod tests {
             "",
             false,
             false,
-            "",
         );
         // kwargs must be spread into the call_kwargs dict
         assert!(
@@ -577,9 +652,9 @@ mod tests {
         );
     }
 
-    // INV-1: Return type annotation is included in wrapper def line.
+    // INV-1: Wrapper strips type annotations from def line (#26).
     #[test]
-    fn test_wrapper_return_annotation_preserved() {
+    fn test_wrapper_strips_annotations() {
         let wrapper = generate_wrapper_function(
             "some_func",
             "x_some_func",
@@ -589,37 +664,133 @@ mod tests {
             "",
             false,
             false,
-            " -> int | None",
         );
         assert!(
-            wrapper.starts_with("def some_func(a, b: str = \"111\") -> int | None:"),
-            "wrapper must include return annotation: {wrapper}"
+            wrapper.starts_with("def some_func(a, b=\"111\"):"),
+            "wrapper must strip annotations: {wrapper}"
         );
     }
 
-    // INV-3: Wrapper without return annotation or kwargs still correct.
+    // INV-2: Wrapper does not include return annotation (#26).
+    #[test]
+    fn test_wrapper_strips_return_annotation() {
+        let wrapper = generate_wrapper_function(
+            "some_func",
+            "x_some_func",
+            "a: int, b: str = \"111\"",
+            "None",
+            false,
+            "",
+            false,
+            false,
+        );
+        assert!(
+            !wrapper.contains("->"),
+            "wrapper must not include return annotation: {wrapper}"
+        );
+        assert!(
+            wrapper.starts_with("def some_func(a, b=\"111\"):"),
+            "wrapper def line: {wrapper}"
+        );
+    }
+
+    // INV-3: Wrapper without annotations or kwargs still correct.
     #[test]
     fn test_wrapper_no_annotation_no_kwargs() {
         let wrapper =
-            generate_wrapper_function("add", "x_add", "a, b", "None", false, "", false, false, "");
+            generate_wrapper_function("add", "x_add", "a, b", "None", false, "", false, false);
         assert!(
             wrapper.starts_with("def add(a, b):"),
             "wrapper def line must be clean: {wrapper}"
         );
     }
 
-    // INV: generate_trampoline produces a wrapper with return annotation from function source.
+    // INV: generate_trampoline strips annotations from wrapper (#26).
     #[test]
-    fn test_generate_trampoline_return_annotation() {
+    fn test_generate_trampoline_strips_annotations() {
         let source =
             "def some_func(a, b: str = \"111\", c: int = 0) -> int | None:\n    return a + c\n";
         let fms = collect_file_mutations(source);
         assert!(!fms.is_empty(), "should find mutations in some_func");
         let output = generate_trampoline(&fms[0], "my_lib");
         assert!(
-            output.wrapper_code.contains("-> int | None"),
-            "trampoline wrapper must preserve return annotation: {}",
+            !output.wrapper_code.contains("-> int | None"),
+            "wrapper must NOT include return annotation: {}",
             output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains("def some_func(a, b=\"111\", c=0):"),
+            "wrapper must strip param annotations: {}",
+            output.wrapper_code
+        );
+    }
+
+    // --- strip_annotations_from_params unit tests ---
+
+    #[test]
+    fn test_strip_annotations_simple() {
+        assert_eq!(strip_annotations_from_params("x: int, y: str"), "x, y");
+    }
+
+    #[test]
+    fn test_strip_annotations_with_defaults() {
+        assert_eq!(
+            strip_annotations_from_params("x: int = 5, y: str = \"hi\""),
+            "x=5, y=\"hi\""
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_no_annotations() {
+        assert_eq!(strip_annotations_from_params("a, b, c"), "a, b, c");
+    }
+
+    #[test]
+    fn test_strip_annotations_self_and_typed() {
+        assert_eq!(
+            strip_annotations_from_params("self, x: Dict[str, int] = {}"),
+            "self, x={}"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_nested_generics() {
+        assert_eq!(
+            strip_annotations_from_params("x: Dict[str, List[int]], y: Tuple[int, ...]"),
+            "x, y"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_star_separator() {
+        assert_eq!(
+            strip_annotations_from_params("x: int, /, y: str, *, key: str = \"a\""),
+            "x, /, y, *, key=\"a\""
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_args_kwargs() {
+        assert_eq!(
+            strip_annotations_from_params("*args: Any, **kwargs: Any"),
+            "*args, **kwargs"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_forward_ref() {
+        // This is the tinygrad case — uint32_t is a forward reference
+        assert_eq!(
+            strip_annotations_from_params("self, x: uint32_t, y: uint32_t = 0"),
+            "self, x, y=0"
+        );
+    }
+
+    #[test]
+    fn test_strip_annotations_callable() {
+        assert_eq!(
+            strip_annotations_from_params("fn: Callable[[int, str], bool], x: int"),
+            "fn, x"
         );
     }
 

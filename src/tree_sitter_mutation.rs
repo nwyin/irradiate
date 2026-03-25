@@ -11,13 +11,14 @@ use crate::mutation::{DescriptorDecorator, FunctionMutations, Mutation};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Functions that are never mutated (whole function skipped).
-/// - Trampoline-incompatible dunders: __getattribute__, __setattr__, __new__
+/// - Trampoline-incompatible dunders: __getattribute__, __setattr__, __new__, __init_subclass__
 /// - Display-only dunders: __repr__, __str__, __format__ (rarely assertion-tested)
 /// - Hash contract: __hash__ (tied to __eq__, mutating alone is misleading)
 const NEVER_MUTATE_FUNCTIONS: &[&str] = &[
     "__getattribute__",
     "__setattr__",
     "__new__",
+    "__init_subclass__",
     "__repr__",
     "__str__",
     "__format__",
@@ -340,6 +341,13 @@ fn collect_function_mutations(
     let fn_start = function_node.start_byte();
     let fn_end = function_node.end_byte();
     let func_source = &source[fn_start..fn_end];
+
+    // Skip functions that inspect the call stack via sys._getframe().
+    // The trampoline wrapper inserts extra frames, breaking frame-relative
+    // lookups like `sys._getframe().f_back.f_globals` (tinygrad's `record()` pattern).
+    if func_source.contains("_getframe") {
+        return None;
+    }
     let params_source = function_node
         .child_by_field_name("parameters")
         .map(|node| {
@@ -2160,6 +2168,24 @@ mod tests {
         let source = "def f():\n    nonlocal x\n    return x + 1\n";
         let fms = collect_file_mutations(source);
         assert!(fms.is_empty());
+    }
+
+    // --- _getframe skipping ---
+
+    #[test]
+    fn tree_sitter_skips_getframe_function() {
+        // Functions using sys._getframe() break under trampoline (extra frames)
+        let source = "def record(cls):\n    ns = sys._getframe().f_back.f_globals\n    return cls\n";
+        let fms = collect_file_mutations(source);
+        assert!(fms.is_empty(), "_getframe function should be skipped");
+    }
+
+    #[test]
+    fn tree_sitter_does_not_skip_unrelated_function() {
+        // Regular function should not be affected by _getframe skip
+        let source = "def add(a, b):\n    return a + b\n";
+        let fms = collect_file_mutations(source);
+        assert!(!fms.is_empty());
     }
 
     // --- NEVER_MUTATE_FUNCTIONS (display/hash dunders) ---
