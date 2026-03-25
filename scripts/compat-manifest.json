@@ -52,5 +52,6 @@
   {"name": "rich",          "repo": "https://github.com/Textualize/rich",                  "src": "rich",              "tests": "tests", "install": "pytest -e ."},
   {"name": "celery",        "repo": "https://github.com/celery/celery",                    "src": "celery",            "tests": "t/unit", "install": "pytest -e '.[pytest]'"},
   {"name": "sympy",         "repo": "https://github.com/sympy/sympy",                      "src": "sympy",             "tests": "sympy", "install": "pytest mpmath -e .", "do_not_mutate": ["sympy/**/tests/*"]},
-  {"name": "networkx",      "repo": "https://github.com/networkx/networkx",                "src": "networkx",          "tests": "networkx", "install": "pytest numpy scipy -e .", "do_not_mutate": ["networkx/**/tests/*"]}
+  {"name": "networkx",      "repo": "https://github.com/networkx/networkx",                "src": "networkx",          "tests": "networkx", "install": "pytest numpy scipy -e .", "do_not_mutate": ["networkx/**/tests/*"]},
+  {"name": "tinygrad",      "repo": "https://github.com/tinygrad/tinygrad",                "src": "tinygrad",          "tests": "test", "install": "pytest numpy -e ."}
 ]
