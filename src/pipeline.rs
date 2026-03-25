@@ -57,6 +57,8 @@ pub struct RunConfig {
     pub sample_seed: u64,
     /// Ignore cached results — re-run all mutants from scratch.
     pub no_cache: bool,
+    /// Timeout in seconds for stats collection. Default 300.
+    pub stats_timeout: u64,
     /// Extra arguments appended to every pytest invocation.
     /// Sourced from `pytest_add_cli_args` in pyproject.toml and/or `--pytest-args` CLI flag.
     pub pytest_add_cli_args: Vec<String>,
@@ -320,6 +322,7 @@ async fn phase_stats(
             let s = stats::collect_stats(
                 &config.python, &ctx.project_dir, &ctx.pythonpath,
                 &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+                config.stats_timeout,
             ).context("Stats collection failed")?;
             stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
             ctx.trace.phase("stats_collection", phase_start, None);
@@ -2668,6 +2671,7 @@ index 000..abc
             report: None,
             report_output: None,
             no_cache: false,
+            stats_timeout: crate::stats::DEFAULT_STATS_TIMEOUT_SECS,
             sample: None,
             sample_seed: 0,
             pytest_add_cli_args: vec![],

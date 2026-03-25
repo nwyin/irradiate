@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Default timeout for the stats collection subprocess (seconds).
-const STATS_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_STATS_TIMEOUT_SECS: u64 = 300;
 
 /// Stats collected from running the test suite with `active_mutant = "stats"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,6 +202,7 @@ pub fn collect_stats(
     mutants_dir: &Path,
     tests_dir: &str,
     extra_pytest_args: &[String],
+    timeout_secs: u64,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
     let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
@@ -240,7 +241,7 @@ pub fn collect_stats(
         })
     });
 
-    let timeout = Duration::from_secs(STATS_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
     let start = Instant::now();
     loop {
         match child.try_wait()? {
@@ -249,8 +250,9 @@ pub fn collect_stats(
                 let _ = child.kill();
                 let _ = child.wait();
                 anyhow::bail!(
-                    "Stats collection timed out after {}s — the test suite may be too slow under the trampoline",
-                    STATS_TIMEOUT_SECS
+                    "Stats collection timed out after {}s — the test suite may be too slow under the trampoline. \
+                     Use --stats-timeout to increase (e.g. --stats-timeout 600)",
+                    timeout_secs
                 );
             }
             None => std::thread::sleep(Duration::from_millis(200)),

@@ -29,18 +29,40 @@ class MutantFinder(importlib.abc.MetaPathFinder):
     def __init__(self, mutants_dir):
         self.mutants_dir = Path(mutants_dir).resolve()
         self._cache = {}  # fullname -> ("module"|"package", Path) | False
+        # Top-level package names present in mutants/ for fast prefix rejection
+        self._top_level_names = set()
+        # Cached original search locations per package
+        self._original_locations = {}
+        self._prescan()
+
+    def _prescan(self):  # pragma: no mutate
+        """Walk mutants/ once at init to build top-level prefix set and
+        pre-populate _cache with all known mutated modules."""
+        if not self.mutants_dir.is_dir():
+            return
+        for py_file in self.mutants_dir.rglob("*.py"):
+            rel = py_file.relative_to(self.mutants_dir)
+            parts = list(rel.parts)
+            if parts[-1] == "__init__.py":
+                fullname = ".".join(parts[:-1])
+                if fullname:
+                    self._cache[fullname] = ("package", py_file)
+            else:
+                parts[-1] = parts[-1].removesuffix(".py")
+                fullname = ".".join(parts)
+                self._cache[fullname] = ("module", py_file)
+        for fullname in self._cache:
+            self._top_level_names.add(fullname.split(".")[0])
 
     def find_spec(self, fullname, path, target=None):  # pragma: no mutate
         # Never intercept the harness itself — circular import risk
         if fullname == "irradiate_harness" or fullname.startswith("irradiate_harness."):
             return None
 
-        # Fast exit for test framework internals we never mutate
-        if fullname.startswith(("_pytest.", "pytest.", "pluggy.")):
-            return None
-
-        # pytest discovers conftest by filesystem walk, not the import system
-        if fullname == "conftest":
+        # Fast prefix rejection: if the top-level package isn't in mutants/,
+        # skip immediately. Covers stdlib, test frameworks, third-party deps.
+        top = fullname.split(".", 1)[0]
+        if top not in self._top_level_names:
             return None
 
         result = self._resolve(fullname)
@@ -76,24 +98,33 @@ class MutantFinder(importlib.abc.MetaPathFinder):
 
     def _find_original_search_locations(self, fullname):
         """Find the original package's search locations by temporarily
-        removing ourselves from sys.meta_path and re-resolving."""
+        removing ourselves from sys.meta_path and re-resolving.
+        Results are cached per package name."""
+        if fullname in self._original_locations:
+            return self._original_locations[fullname]
+
         idx = None
         for i, finder in enumerate(sys.meta_path):
             if finder is self:
                 idx = i
                 break
         if idx is None:
+            self._original_locations[fullname] = None
             return None
 
         sys.meta_path.pop(idx)
         try:
             spec = importlib.util.find_spec(fullname)
             if spec and spec.submodule_search_locations:
-                return list(spec.submodule_search_locations)
+                result = list(spec.submodule_search_locations)
+                self._original_locations[fullname] = result
+                return result
         except (ModuleNotFoundError, ValueError):
             pass
         finally:
             sys.meta_path.insert(idx, self)
+
+        self._original_locations[fullname] = None
         return None
 
     def _resolve(self, fullname):

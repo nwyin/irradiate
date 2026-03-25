@@ -115,6 +115,11 @@ enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// Timeout in seconds for stats collection (default: 300).
+        /// Increase for large test suites (e.g., 600 for 10K+ tests).
+        #[arg(long, default_value_t = 300)]
+        stats_timeout: u64,
+
         /// Extra arguments to pass to every pytest invocation (appended after config file values).
         /// Example: --pytest-args=-v --pytest-args=--tb=short
         #[arg(long = "pytest-args")]
@@ -187,6 +192,7 @@ async fn main() -> Result<()> {
             report,
             output,
             no_cache,
+            stats_timeout,
             sample,
             sample_seed,
             pytest_args,
@@ -234,6 +240,7 @@ async fn main() -> Result<()> {
                 no_cache,
                 sample,
                 sample_seed,
+                stats_timeout,
                 pytest_add_cli_args,
             })
             .await

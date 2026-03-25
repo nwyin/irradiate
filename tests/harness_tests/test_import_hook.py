@@ -262,8 +262,10 @@ def test_missing_mutants_dir_returns_none():
     assert finder.find_spec("anything", None) is None
 
 
-def test_missing_mutants_dir_caches_negative_result():
-    """Hook should cache the negative result when mutants_dir does not exist."""
+def test_missing_mutants_dir_prescan_finds_nothing():
+    """Hook should prescan to an empty state when mutants_dir does not exist."""
     finder = MutantFinder("/nonexistent/path/mutants")
-    finder.find_spec("anything", None)
-    assert finder._cache.get("anything") is False
+    assert finder._cache == {}
+    assert finder._top_level_names == set()
+    # find_spec returns None without populating cache (fast prefix rejection)
+    assert finder.find_spec("anything", None) is None
