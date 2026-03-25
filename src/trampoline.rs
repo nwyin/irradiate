@@ -72,10 +72,18 @@ pub fn generate_trampoline(fm: &FunctionMutations, module_name: &str) -> Trampol
     //   - @staticmethod:            pass None; look up via ClassName.
     //   - @property:                pass self; look up via _type(self). (same as instance method)
     //   - Top-level function:       pass None; bare names in module scope.
+    // Extract the actual first parameter name (handles mcs, cls, self, etc.)
+    let first_param_name = extract_first_param_name(&fm.params_source);
     let (self_arg, has_self, lookup_prefix) = match (fm.class_name.as_deref(), fm.descriptor_decorator) {
-        (Some(_), Some(DescriptorDecorator::ClassMethod)) => ("cls", true, "cls.".to_string()),
+        (Some(_), Some(DescriptorDecorator::ClassMethod)) => {
+            let name = first_param_name.as_deref().unwrap_or("cls");
+            (name, true, format!("{name}."))
+        }
         (Some(cls), Some(DescriptorDecorator::StaticMethod)) => ("None", false, format!("{cls}.")),
-        (Some(_), _) => ("self", true, "_type(self).".to_string()), // instance method or @property
+        (Some(_), _) => {
+            let name = first_param_name.as_deref().unwrap_or("self");
+            (name, true, format!("_type({name})."))
+        }
         (None, _) => ("None", false, String::new()), // top-level function
     };
     let params_text = &fm.params_source;
@@ -173,6 +181,30 @@ fn generate_wrapper_function(
 /// Strip inline comments from a params source string (line by line).
 /// This handles `# type: ignore[override]` and similar annotations.
 /// Must be string-aware: `fill_char: str = "#"` is NOT a comment.
+/// Extract the first parameter name from a Python parameter list string.
+/// Handles type annotations and defaults: "mcs, klass: type" → Some("mcs").
+fn extract_first_param_name(params_source: &str) -> Option<String> {
+    let trimmed = params_source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Take text before first comma or end, then strip annotation/default
+    let first = trimmed.split(',').next().unwrap_or(trimmed).trim();
+    // Skip positional-only separator
+    if first == "/" {
+        return None;
+    }
+    let name = first
+        .split(':')
+        .next()
+        .unwrap_or(first)
+        .split('=')
+        .next()
+        .unwrap_or(first)
+        .trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
 fn strip_inline_comments(s: &str) -> String {
     s.lines()
         .map(|line| {
@@ -899,6 +931,25 @@ mod tests {
             output.wrapper_code
         );
         assert_eq!(output.decorator_prefix, "@classmethod\n");
+    }
+
+    // INV-3a2: @classmethod with non-standard first param (e.g. mcs for metaclasses)
+    #[test]
+    fn test_classmethod_wrapper_uses_actual_first_param_name() {
+        let source = "class Meta:\n    @classmethod\n    def resolve(mcs, klass):\n        return klass\n";
+        let fms = collect_file_mutations(source);
+        let fm = fms.iter().find(|f| f.name == "resolve").expect("should find resolve");
+        let output = generate_trampoline(fm, "mod");
+        assert!(
+            output.wrapper_code.contains("mcs."),
+            "@classmethod with mcs param must use mcs. prefix; got:\n{}",
+            output.wrapper_code
+        );
+        assert!(
+            output.wrapper_code.contains(", mcs)"),
+            "@classmethod with mcs param must pass mcs to trampoline; got:\n{}",
+            output.wrapper_code
+        );
     }
 
     // INV-3b: @staticmethod wrapper uses ClassName. prefix and passes None.
