@@ -1,14 +1,6 @@
 # Architecture
 
-This document describes irradiate's architecture and execution model. It's useful for contributors and anyone curious about how mutation testing works under the hood.
-
----
-
-# irradiate
-
-Mutation testing for Python, written in Rust. A spiritual successor to [mutmut](https://github.com/boxed/mutmut).
-
-> This document describes the architecture and design direction. Remaining work is tracked in GitHub issues.
+irradiate's architecture and execution model. Useful for contributors and anyone curious about how mutation testing works under the hood.
 
 ## Why
 
@@ -343,39 +335,9 @@ Certain patterns should never be mutated:
 
 ## The trampoline
 
-The trampoline is Python code injected into every mutated source file. For each function with mutations, irradiate generates:
+Every mutated function gets a thin wrapper that checks a module global (`irradiate_harness.active_mutant`) to decide whether to run the original code, a mutated variant, or a special mode (stats collection, forced failure). The dispatch is a single dict lookup per call. When no mutation is active, the overhead is one falsy check (~100ns).
 
-1. The **original function**, renamed to `x_func__irradiate_orig`
-2. **N mutated variants**, named `x_func__irradiate_1` through `x_func__irradiate_N`
-3. A **mutant lookup dict** mapping variant names to function references
-4. A **trampoline wrapper** with the original function name that dispatches at runtime
-
-```python
-import irradiate_harness as _ih
-
-def _irradiate_trampoline(orig, mutants, call_args, call_kwargs, self_arg=None):
-    active = _ih.active_mutant          # fast global lookup, no syscall
-    if not active:                       # hot path: no mutation active
-        return orig(*call_args, **call_kwargs)
-    if active == 'fail':
-        raise _ih.ProgrammaticFailException()
-    if active == 'stats':
-        _ih.record_hit(orig.__module__ + '.' + orig.__name__)
-        return orig(*call_args, **call_kwargs)
-    prefix = orig.__module__ + '.' + orig.__name__ + '__irradiate_'
-    if not active.startswith(prefix):    # not our function
-        return orig(*call_args, **call_kwargs)
-    variant = active.rpartition('.')[-1]
-    if self_arg is not None:
-        return mutants[variant](self_arg, *call_args, **call_kwargs)
-    return mutants[variant](*call_args, **call_kwargs)
-```
-
-Key properties:
-- Reads a module global (`_ih.active_mutant`) instead of `os.environ`, avoiding a syscall on every instrumented function call
-- The hot path (no mutation active) is a single falsy check
-- Dispatch is a dict lookup (single hash probe, no if-chain)
-- Compatible with mutmut's naming convention (`__irradiate_N` suffixes, `ǁ` class separator)
+This is what enables the worker pool: switching mutants is just flipping a global variable, not restarting pytest. For the full code listing, naming conventions, special modes, and descriptor handling, see [The Trampoline](trampoline.md).
 
 ## Execution phases
 
