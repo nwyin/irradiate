@@ -48,6 +48,8 @@ pub fn mutate_file(
         .map(|fm| generate_trampoline(fm, module_name))
         .collect();
 
+    let indent_char = detect_indent_char(source);
+
     let mut output = String::new();
     let mut all_mutant_names: Vec<String> = trampolines
         .iter()
@@ -174,26 +176,15 @@ pub fn mutate_file(
                 let func_indent = indent;
 
                 // Count open parens on the `def` line to detect multi-line signatures.
+                // String-aware: parens inside string literals don't count (e.g. `bounds="[)"`).
                 let mut paren_depth: i32 = 0;
-                for ch in line.chars() {
-                    match ch {
-                        '(' => paren_depth += 1,
-                        ')' => paren_depth -= 1,
-                        _ => {}
-                    }
-                }
+                count_parens_string_aware(line, &mut paren_depth);
 
                 // If paren_depth > 0, the signature continues on the following lines.
                 // Advance past all continuation lines until the signature is closed.
                 i += 1;
                 while i < lines.len() && paren_depth > 0 {
-                    for ch in lines[i].chars() {
-                        match ch {
-                            '(' => paren_depth += 1,
-                            ')' => paren_depth -= 1,
-                            _ => {}
-                        }
-                    }
+                    count_parens_string_aware(lines[i], &mut paren_depth);
                     i += 1;
                 }
 
@@ -237,14 +228,14 @@ pub fn mutate_file(
                 if class_key.is_some() {
                     let dec_prefix = &trampolines[idx].decorator_prefix;
                     if !dec_prefix.is_empty() {
-                        output.push_str(&indent_code(dec_prefix.trim_end(), func_indent));
+                        output.push_str(&indent_code(dec_prefix.trim_end(), func_indent, indent_char));
                         output.push('\n');
                     }
                     let wrapper = &trampolines[idx].wrapper_code;
-                    let indented = indent_code(wrapper, func_indent);
+                    let indented = indent_code(wrapper, func_indent, indent_char);
                     output.push_str(&indented);
                     output.push('\n');
-                    let indented_module = indent_code(&trampolines[idx].module_code, func_indent);
+                    let indented_module = indent_code(&trampolines[idx].module_code, func_indent, indent_char);
                     output.push_str(&indented_module);
                     output.push('\n');
                 } else {
@@ -354,10 +345,74 @@ fn extract_func_name(line: &str) -> &str {
     after_def.split('(').next().unwrap_or("")
 }
 
-/// Indent every line of `code` by `indent` spaces.
+/// Count parentheses in a line, skipping those inside string literals.
+/// Handles single-quoted, double-quoted, and triple-quoted strings.
+fn count_parens_string_aware(line: &str, depth: &mut i32) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let ch = chars[i];
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if ch == '\\' && (in_single || in_double) {
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            // Check for triple quotes
+            if ch == '\'' && i + 2 < len && chars[i + 1] == '\'' && chars[i + 2] == '\'' {
+                in_single = true;
+                i += 3;
+                continue;
+            }
+            if ch == '"' && i + 2 < len && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                in_double = true;
+                i += 3;
+                continue;
+            }
+            match ch {
+                '\'' => { in_single = true; }
+                '"' => { in_double = true; }
+                '(' => { *depth += 1; }
+                ')' => { *depth -= 1; }
+                '#' => { return; } // Rest of line is a comment
+                _ => {}
+            }
+        } else if in_single {
+            if ch == '\'' && i + 2 < len && chars[i + 1] == '\'' && chars[i + 2] == '\'' {
+                in_single = false;
+                i += 3;
+                continue;
+            }
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if ch == '"' && i + 2 < len && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                in_double = false;
+                i += 3;
+                continue;
+            }
+            if ch == '"' {
+                in_double = false;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Indent every line of `code` by `indent` units using `indent_char`.
 /// Empty/whitespace-only lines are left blank (no trailing spaces).
-fn indent_code(code: &str, indent: usize) -> String {
-    let prefix = " ".repeat(indent);
+fn indent_code(code: &str, indent: usize, indent_char: char) -> String {
+    let prefix: String = std::iter::repeat_n(indent_char, indent).collect();
     code.lines()
         .map(|line| {
             if line.trim().is_empty() {
@@ -368,6 +423,17 @@ fn indent_code(code: &str, indent: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Detect whether a source file uses tabs for indentation.
+/// Returns '\t' if any indented line starts with a tab, ' ' otherwise.
+fn detect_indent_char(source: &str) -> char {
+    for line in source.lines() {
+        if line.starts_with('\t') {
+            return '\t';
+        }
+    }
+    ' '
 }
 
 #[cfg(test)]
@@ -979,6 +1045,34 @@ class Markup:
             .expect("wrapper def format_map( should exist");
         let indent_len = wrapper_line.len() - wrapper_line.trim_start().len();
         assert!(indent_len > 0, "wrapper must be indented inside class body");
+    }
+
+    #[test]
+    fn test_multiline_signature_with_return_annotation_no_orphan() {
+        // Arrow pattern: multi-line class method with `) -> Type:` on closing line
+        // and a default value containing `)` inside a string (e.g. `bounds="[)"`).
+        let source = "\
+class Arrow:
+    def span(
+        self,
+        frame,
+        count=1,
+        bounds=\"[)\",
+    ) -> int:
+        return 1 + 2
+";
+        let result = mutate_file(source, "arrow", None).unwrap();
+        // Every `) -> int:` should be inside a `def` block (preceded by a def line).
+        // An orphan would be `) -> int:` NOT preceded by a function parameter.
+        assert!(
+            python3_available(),
+            "Python 3 needed for syntax check"
+        );
+        assert!(
+            is_valid_python(&result.source),
+            "Generated code must be valid Python:\n{}",
+            result.source
+        );
     }
 
     #[test]

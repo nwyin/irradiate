@@ -1129,6 +1129,12 @@ fn add_ternary_swap_mutation(
     if body_text.contains(":=") || alternative_text.contains(":=") {
         return;
     }
+    // Ternary inside a `with` clause: `with X if cond else Y as name:`.
+    // Swapping puts the `as` binding after the alternative, which Python
+    // parses as `with (swapped_body as name) if cond else ...` → SyntaxError.
+    if node.parent().is_some_and(|p| p.kind() == "with_clause" || p.kind() == "with_item") {
+        return;
+    }
     let full_text = node_text(source, node);
     // Reconstruct swapped ternary: alternative if condition else body.
     // Find the positions of `if` and `else` keywords in the original text.
@@ -2596,6 +2602,26 @@ mod tests {
             let mutated = apply_mutation(&fm.source, m);
             assert!(parse_python(&mutated).is_some(), "slice_index_removal with walrus must produce parseable Python:\n{mutated}");
         }
+    }
+
+    // --- Ternary in with-statement skip ---
+
+    #[test]
+    fn ternary_swap_skipped_in_with_clause() {
+        // `with X if cond else Y as name:` — swapping produces SyntaxError
+        // because `as name` binds differently after the swap.
+        let source = "def f(outfile):\n    with sys.stdout if outfile == \"-\" else open(outfile, \"w\") as out:\n        pass\n";
+        let fms = collect_file_mutations(source);
+        let ternary_swaps: Vec<_> = fms[0]
+            .mutations
+            .iter()
+            .filter(|m| m.operator == "ternary_swap")
+            .collect();
+        assert!(
+            ternary_swaps.is_empty(),
+            "ternary_swap inside with clause should be skipped, found {} mutations",
+            ternary_swaps.len()
+        );
     }
 
     // --- Line span tests ---
