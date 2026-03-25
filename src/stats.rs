@@ -224,12 +224,22 @@ pub fn collect_stats(
         .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
         .env("IRRADIATE_STATS_OUTPUT", &stats_output)
         .current_dir(project_dir)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start pytest for stats collection")?;
 
-    // Wait with timeout to avoid hanging on projects with slow trampoline overhead.
+    // Wait with timeout. Stdout goes to /dev/null (stats are written to a JSON file,
+    // not stdout). Stderr is piped for error reporting but drained in a background
+    // thread to avoid pipe-buffer deadlock when pytest produces large output.
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stderr, &mut buf).ok();
+            buf
+        })
+    });
+
     let timeout = Duration::from_secs(STATS_TIMEOUT_SECS);
     let start = Instant::now();
     loop {
@@ -247,20 +257,21 @@ pub fn collect_stats(
         }
     }
 
-    let output = child.wait_with_output()
-        .context("Failed to collect pytest output after stats run")?;
+    let status = child.wait()?;
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     // The stats plugin writes exit_status, test_count, and fail_validated into
     // the stats JSON. Pipeline reads those fields for validation. We only bail
     // here if pytest couldn't even start (no output file at all).
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = status.code().unwrap_or(-1);
     if exit_code > 1 {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         // pytest_sessionfinish may still have written the file — check before bailing
         if !stats_output.exists() {
             anyhow::bail!(
-                "Stats collection failed (exit code {exit_code}):\nstdout: {stdout}\nstderr: {stderr}",
+                "Stats collection failed (exit code {exit_code}):\nstderr: {stderr}",
             );
         }
         info!("Stats run exited with code {exit_code} — details in stats.json");
