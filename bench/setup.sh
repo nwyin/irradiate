@@ -60,8 +60,41 @@ echo "[5/7] Setting up bench/.venv (mutmut==$MUTMUT_VERSION for benchmark compar
 if [ ! -d bench/.venv ]; then
     uv venv bench/.venv --python python3.12 --seed
 fi
-uv pip install --python bench/.venv/bin/python "mutmut==$MUTMUT_VERSION" pytest hatchling
+uv pip install --python bench/.venv/bin/python "mutmut==$MUTMUT_VERSION" pytest hatchling simplejson
 uv pip install --python bench/.venv/bin/python -e bench/targets/synth
+# Install benchmark corpora into mutmut venv so mutmut can run their tests
+if [ -d bench/corpora/marshmallow ]; then
+    uv pip install --python bench/.venv/bin/python -e "bench/corpora/marshmallow[tests]" 2>/dev/null || true
+fi
+if [ -d bench/corpora/toolz ]; then
+    uv pip install --python bench/.venv/bin/python -e bench/corpora/toolz 2>/dev/null || true
+fi
+
+# Inject [tool.mutmut] config into corpora that lack it (corpora are gitignored shallow clones)
+inject_mutmut_config() {
+    local pyproject="$1" paths="$2" tests="$3"
+    if [ -f "$pyproject" ] && ! grep -q 'tool.mutmut' "$pyproject"; then
+        printf '\n[tool.mutmut]\npaths_to_mutate = "%s"\ntests_dir = "%s"\n' "$paths" "$tests" >> "$pyproject"
+        echo "  Injected [tool.mutmut] into $pyproject"
+    fi
+}
+inject_mutmut_config bench/corpora/marshmallow/pyproject.toml "src/marshmallow" "tests"
+inject_mutmut_config bench/corpora/toolz/pyproject.toml       "toolz"           "toolz/tests"
+
+# toolz has tests inside the source package; exclude them from mutation
+inject_irradiate_config() {
+    local pyproject="$1"
+    shift
+    if [ -f "$pyproject" ] && ! grep -q 'tool.irradiate' "$pyproject"; then
+        printf '\n[tool.irradiate]\n' >> "$pyproject"
+        for line in "$@"; do
+            printf '%s\n' "$line" >> "$pyproject"
+        done
+        echo "  Injected [tool.irradiate] into $pyproject"
+    fi
+}
+inject_irradiate_config bench/corpora/toolz/pyproject.toml \
+    'do_not_mutate = ["toolz/tests/*", "toolz/sandbox/*"]'
 echo
 
 # ── 6. Bootstrap vendor corpora ───────────────────────────────────────────
@@ -91,9 +124,11 @@ setup_vendor_venv() {
     fi
 }
 
-setup_vendor_venv markupsafe "pytest -e ."
-setup_vendor_venv click      "pytest -e '.[testing]'"
-setup_vendor_venv httpx      "pytest -e ."
+setup_vendor_venv markupsafe  "pytest -e ."
+setup_vendor_venv click       "pytest -e '.[testing]'"
+setup_vendor_venv httpx       "pytest -e ."
+setup_vendor_venv marshmallow "pytest simplejson -e '.[tests]'"
+setup_vendor_venv toolz       "pytest -e ."
 echo
 
 echo "=== Setup complete ==="

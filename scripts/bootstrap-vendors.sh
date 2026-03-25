@@ -28,7 +28,9 @@ clone_if_missing() {
 }
 
 echo "=== Bootstrapping vendor corpora ==="
-clone_if_missing markupsafe "https://github.com/pallets/markupsafe" || true
-clone_if_missing click      "https://github.com/pallets/click"      || true
-clone_if_missing httpx      "https://github.com/encode/httpx"       || true
+clone_if_missing markupsafe  "https://github.com/pallets/markupsafe"          || true
+clone_if_missing click       "https://github.com/pallets/click"               || true
+clone_if_missing httpx       "https://github.com/encode/httpx"                || true
+clone_if_missing marshmallow "https://github.com/marshmallow-code/marshmallow" || true
+clone_if_missing toolz       "https://github.com/pytoolz/toolz"               || true
 echo "=== Done ==="
