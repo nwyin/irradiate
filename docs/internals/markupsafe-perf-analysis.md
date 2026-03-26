@@ -108,7 +108,7 @@ py-spy requires root on macOS. Run manually:
 ```bash
 sudo py-spy record --subprocesses --format speedscope \
   -o /tmp/irradiate-markupsafe.speedscope.json \
-  -- irradiate run --paths-to-mutate src/markupsafe --tests-dir tests --python .venv/bin/python3
+  -- irradiate run src/markupsafe --tests-dir tests --python .venv/bin/python3
 ```
 
 Open the resulting file at [speedscope.app](https://speedscope.app).

@@ -27,7 +27,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 EXAMPLE_OUTPUT = """\
-$ irradiate run --paths-to-mutate src/mylib --tests-dir tests/
+$ irradiate run src/mylib --tests-dir tests/
 
 Generating mutants...  87 mutants across 3 files
 Running mutation tests (8 workers)...
@@ -210,7 +210,7 @@ def _hero_html() -> str:
     <h2>Get started</h2>
     <pre class="code-block"><span class="prompt">$</span> git clone https://github.com/tau/irradiate &amp;&amp; cd irradiate
 <span class="prompt">$</span> cargo build --release
-<span class="prompt">$</span> irradiate run --paths-to-mutate src/mylib --tests-dir tests/</pre>
+<span class="prompt">$</span> irradiate run src/mylib --tests-dir tests/</pre>
   </div>
 
   <div class="section" id="example">

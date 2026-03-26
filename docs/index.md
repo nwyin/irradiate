@@ -15,7 +15,7 @@ The parser uses tree-sitter with 27 mutation operator categories and runs in par
 ```bash
 pip install irradiate
 
-irradiate run --paths-to-mutate src/
+irradiate run src/
 irradiate results
 irradiate show mymodule.x_my_function__irradiate_1
 ```

@@ -17,20 +17,21 @@ irradiate [OPTIONS] <COMMAND>
 Run mutation testing.
 
 ```bash
-irradiate run [OPTIONS] [MUTANT_NAMES]...
+irradiate run [OPTIONS] [PATHS]...
 ```
 
 ### Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `[MUTANT_NAMES]...` | Specific mutant names to test. If omitted, all mutants are tested. |
+| `[PATHS]...` | Source paths to mutate. If omitted, defaults to `src`. |
 
 ### Options
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--paths-to-mutate` | path | `"src"` | Source directory to mutate |
+| `--paths-to-mutate` | path | `"src"` | Source directory to mutate (alias for positional `PATHS`) |
+| `--mutant` | string | -- | Specific mutant names to test (repeatable). If omitted, all mutants are tested. |
 | `--tests-dir` | path | `"tests"` | Test directory |
 | `--workers` | int | CPU count | Number of worker processes |
 | `--timeout-multiplier` | float | `10.0` | Per-mutant timeout as multiple of baseline duration |
@@ -53,14 +54,15 @@ irradiate run [OPTIONS] [MUTANT_NAMES]...
 ### Examples
 
 ```bash
-irradiate run                                    # basic run
+irradiate run                                    # basic run (auto-detects src/)
+irradiate run src/mylib                          # mutate a specific path
 irradiate run --diff main                        # incremental: changed functions only
 irradiate run --fail-under 80                    # CI gate
 irradiate run --report html -o report.html       # HTML report
 irradiate run --isolate                          # full subprocess isolation
 irradiate run --verify-survivors                 # re-check survivors after warm run
 irradiate run --python .venv/bin/python          # specific interpreter
-irradiate run mylib.x_add__irradiate_3           # test one specific mutant
+irradiate run --mutant mylib.x_add__irradiate_3  # test one specific mutant
 irradiate run --workers 4 --covered-only         # tuning
 irradiate run --sample 0.1                       # test 10% of mutants (fast CI)
 irradiate run --sample 50 --sample-seed 42       # test exactly 50, reproducible

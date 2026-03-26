@@ -97,7 +97,7 @@ do_not_mutate = ["**/generated/*", "**/vendor/*"]
 pytest_add_cli_args = ["-x", "--tb=short"]
 ```
 
-All settings can be overridden via CLI flags. Run `irradiate run --help` for the full list.
+Source paths can also be passed as positional arguments: `irradiate run src/mylib`. All settings can be overridden via CLI flags. Run `irradiate run --help` for the full list.
 
 ## Features
 

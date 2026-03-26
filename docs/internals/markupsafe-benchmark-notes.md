@@ -88,7 +88,7 @@ samply record -s --unstable-presymbolicate \
   -- python3 -c 'import subprocess; subprocess.run(
     ["/Users/tau/projects/irradiate/target/release/irradiate",
      "run",
-     "--paths-to-mutate", "src/markupsafe",
+     "src/markupsafe",
      "--tests-dir", "tests",
      "--workers", "1",
      "--python", ".venv/bin/python3"],

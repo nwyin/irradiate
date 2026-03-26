@@ -1,6 +1,6 @@
 # Configuration
 
-irradiate reads configuration from `pyproject.toml` under `[tool.irradiate]`. All settings are optional — CLI flags override config values.
+irradiate reads configuration from `pyproject.toml` under `[tool.irradiate]`. All settings are optional, and CLI flags override config values.
 
 ## pyproject.toml
 
@@ -15,15 +15,15 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 
 ### Settings
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `paths_to_mutate` | string | `"src"` | Source directory to mutate |
-| `tests_dir` | string | `"tests"` | Test directory |
-| `do_not_mutate` | list of strings | `[]` | Glob patterns for files to skip |
-| `also_copy` | list of strings | `[]` | Extra directories to copy into the mutants tree |
-| `pytest_add_cli_args` | list of strings | `[]` | Extra arguments passed to every pytest invocation |
+| Key                   | Type            | Default   | Description                                       |
+| --------------------- | --------------- | --------- | ------------------------------------------------- |
+| `paths_to_mutate`     | string          | `"src"`   | Source directory to mutate                        |
+| `tests_dir`           | string          | `"tests"` | Test directory                                    |
+| `do_not_mutate`       | list of strings | `[]`      | Glob patterns for files to skip                   |
+| `also_copy`           | list of strings | `[]`      | Extra directories to copy into the mutants tree   |
+| `pytest_add_cli_args` | list of strings | `[]`      | Extra arguments passed to every pytest invocation |
 
-### Backward compatibility
+### `mutmut` compatibility
 
 `[tool.mutmut]` is accepted with a deprecation warning. Rename to `[tool.irradiate]`.
 
@@ -34,7 +34,8 @@ All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 ### Source and tests
 
 ```
---paths-to-mutate <PATH>    Source directory to mutate (overrides config)
+[PATHS]...                  Source paths to mutate (positional, overrides config)
+--paths-to-mutate <PATH>    Alias for positional PATHS (backward-compatible)
 --tests-dir <DIR>           Test directory (overrides config)
 --python <PATH>             Python interpreter [default: python3]
 --pytest-args <ARGS>        Extra pytest arguments (appends to config)
@@ -82,5 +83,5 @@ pytest_add_cli_args = ["-x", "--timeout=30"]
 ```
 
 ```bash
-irradiate run --workers 4 --diff main --fail-under 80 --report json
+irradiate run src/mylib --workers 4 --diff main --fail-under 80 --report json
 ```
