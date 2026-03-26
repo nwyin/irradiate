@@ -4,13 +4,13 @@
 
 Every mutant gets one of these outcomes:
 
-| Status | Meaning |
-|--------|---------|
-| **Killed** | Tests caught the mutation |
-| **Survived** | Tests missed the mutation — investigate |
-| **Timeout** | Tests ran too long (usually an infinite loop mutant) |
-| **No tests** | No tests cover this function |
-| **Error** | Worker crashed (segfault, import error, etc.) |
+| Status       | Meaning                                              |
+| ------------ | ---------------------------------------------------- |
+| **Killed**   | Tests caught the mutation                            |
+| **Survived** | Tests missed the mutation — investigate              |
+| **Timeout**  | Tests ran too long (usually an infinite loop mutant) |
+| **No tests** | No tests cover this function                         |
+| **Error**    | Worker crashed (segfault, import error, etc.)        |
 
 ## Killed mutants
 

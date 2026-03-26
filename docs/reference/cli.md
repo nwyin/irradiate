@@ -49,7 +49,7 @@ irradiate run [OPTIONS] [PATHS]...
 | `--sample-seed` | int | `0` | RNG seed for `--sample` (deterministic by default) |
 | `--no-cache` | flag | -- | Ignore cached results; re-test all mutants from scratch |
 | `--stats-timeout` | int | `300` | Timeout in seconds for stats collection. Increase for large test suites. |
-| `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation |
+| `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc. |
 
 ### Examples
 
@@ -67,6 +67,7 @@ irradiate run --workers 4 --covered-only         # tuning
 irradiate run --sample 0.1                       # test 10% of mutants (fast CI)
 irradiate run --sample 50 --sample-seed 42       # test exactly 50, reproducible
 irradiate run --no-cache                         # ignore cache, re-test everything
+irradiate run --pytest-args "--ignore=tests/e2e" # skip a test directory
 ```
 
 

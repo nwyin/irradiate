@@ -23,6 +23,19 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 | `also_copy`           | list of strings | `[]`      | Extra directories to copy into the mutants tree   |
 | `pytest_add_cli_args` | list of strings | `[]`      | Extra arguments passed to every pytest invocation |
 
+These arguments are forwarded to **all** pytest invocations — stats collection, validation, and per-mutant test runs. This is useful for ignoring test directories that fail collection, setting timeouts, or enabling plugins:
+
+```toml
+[tool.irradiate]
+pytest_add_cli_args = ["--ignore=tests/integration", "--timeout=30"]
+```
+
+The same arguments can be passed from the CLI with `--pytest-args`:
+
+```bash
+irradiate run src --pytest-args "--ignore=tests/integration"
+```
+
 ### `mutmut` compatibility
 
 `[tool.mutmut]` is accepted with a deprecation warning. Rename to `[tool.irradiate]`.

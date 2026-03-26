@@ -2,22 +2,37 @@
 
 Fast mutation testing for Python, written in Rust.
 
-irradiate finds gaps in your test suite by modifying your code and checking whether your tests catch the changes. A test suite that passes with mutated code has a surviving mutant, a blind spot where bugs can hide.
+## What mutation testing catches
 
-## Why irradiate?
+Your code has `if n < 0`. Your tests pass. But what if it were `if n <= 0`? Would any test fail?
 
-Mutation testing is slow because most tools invoke `pytest` from scratch for every mutant. Hundreds of cold starts, hundreds of seconds of overhead. irradiate keeps a pool of pre-warmed pytest workers alive and forks a child for each mutant. Pytest starts once. Tests run many times.
+```diff
+ def clamp(n, floor=0):
+-    if n < floor:
++    if n <= floor:
+         return floor
+     return n
+```
 
-The parser uses tree-sitter with 27 mutation operator categories and runs in parallel via rayon. Results are cached with SHA-256 content addressing, so they survive rebases and branch switches. Incremental mode (`--diff main`) restricts testing to changed functions. Reports come in JSON (Stryker schema v2), HTML, and GitHub Actions annotations.
+Mutation testing answers this by making small changes to your code — swapping operators, removing arguments, negating conditions — and checking whether your tests notice. A mutation that survives means your tests have a blind spot.
+
+100% line coverage doesn't mean your tests are thorough. Mutation testing tells you where the gaps are.
 
 ## Quick start
 
 ```bash
 pip install irradiate
 
-irradiate run src/
-irradiate results
-irradiate show mymodule.x_my_function__irradiate_1
+irradiate run src
 ```
 
 For a complete walkthrough, see the [Quick Start guide](getting-started/quickstart.md).
+
+## Features
+
+- **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
+- **27 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, and more.
+- **Incremental** — `--diff main` tests only functions changed since a git ref.
+- **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
+- **CI-ready** — `--fail-under 80` for gating, GitHub Actions annotations, JSON and HTML reports.
+- **Drop-in** — works with any pytest project. `pip install irradiate && irradiate run src`.

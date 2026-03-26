@@ -54,40 +54,40 @@ jobs:
 
 ### Action inputs
 
-| Input | Description | Default |
-|-------|-------------|---------|
-| `version` | irradiate version to install | latest |
-| `paths-to-mutate` | Source paths (space-separated) | from pyproject.toml |
-| `tests-dir` | Test directory | from pyproject.toml |
-| `diff` | Git ref for incremental mode (e.g. `origin/main`) | disabled |
-| `fail-under` | Minimum mutation score (0-100) | no threshold |
-| `sample` | Random sample fraction (0.1) or count (100) | all mutants |
-| `report` | Report format (`json` or `html`) | none |
-| `report-output` | Report output path | auto |
-| `workers` | Number of parallel workers | CPU count |
-| `python-version` | Python version | 3.12 |
-| `extra-args` | Additional `irradiate run` arguments | none |
+| Input             | Description                                       | Default             |
+| ----------------- | ------------------------------------------------- | ------------------- |
+| `version`         | irradiate version to install                      | latest              |
+| `paths-to-mutate` | Source paths (space-separated)                    | from pyproject.toml |
+| `tests-dir`       | Test directory                                    | from pyproject.toml |
+| `diff`            | Git ref for incremental mode (e.g. `origin/main`) | disabled            |
+| `fail-under`      | Minimum mutation score (0-100)                    | no threshold        |
+| `sample`          | Random sample fraction (0.1) or count (100)       | all mutants         |
+| `report`          | Report format (`json` or `html`)                  | none                |
+| `report-output`   | Report output path                                | auto                |
+| `workers`         | Number of parallel workers                        | CPU count           |
+| `python-version`  | Python version                                    | 3.12                |
+| `extra-args`      | Additional `irradiate run` arguments              | none                |
 
 ### Action outputs
 
-| Output | Description | Example |
-|--------|-------------|---------|
-| `score` | Mutation score percentage | `85.7` |
-| `killed` | Killed mutant count | `120` |
-| `survived` | Survived mutant count | `21` |
-| `total` | Total tested mutants | `141` |
+| Output     | Description               | Example |
+| ---------- | ------------------------- | ------- |
+| `score`    | Mutation score percentage | `85.7`  |
+| `killed`   | Killed mutant count       | `120`   |
+| `survived` | Survived mutant count     | `21`    |
+| `total`    | Total tested mutants      | `141`   |
 
 ### Caching results
 
 Cache irradiate's content-addressable result store between runs:
 
 ```yaml
-      - name: Cache irradiate results
-        uses: actions/cache@v4
-        with:
-          path: .irradiate/cache/
-          key: irradiate-${{ runner.os }}-${{ hashFiles('src/**/*.py') }}
-          restore-keys: irradiate-${{ runner.os }}-
+- name: Cache irradiate results
+  uses: actions/cache@v4
+  with:
+    path: .irradiate/cache/
+    key: irradiate-${{ runner.os }}-${{ hashFiles('src/**/*.py') }}
+    restore-keys: irradiate-${{ runner.os }}-
 ```
 
 ### Full run (scheduled)
@@ -95,15 +95,15 @@ Cache irradiate's content-addressable result store between runs:
 For nightly or release-branch checks, run against all code:
 
 ```yaml
-      - uses: nwyin/irradiate@v0
-        with:
-          fail-under: "70"
-          report: html
+- uses: nwyin/irradiate@v0
+  with:
+    fail-under: "70"
+    report: html
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mutation-report
-          path: irradiate-report.html
+- uses: actions/upload-artifact@v4
+  with:
+    name: mutation-report
+    path: irradiate-report.html
 ```
 
 ### Manual setup (without the action)
@@ -111,21 +111,21 @@ For nightly or release-branch checks, run against all code:
 If you prefer not to use the composite action:
 
 ```yaml
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.12"
 
-      - run: pip install pytest irradiate
+- run: pip install pytest irradiate
 
-      - run: irradiate run --diff origin/main --fail-under 80 --report json
+- run: irradiate run --diff origin/main --fail-under 80 --report json
 ```
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Run completed, score above `--fail-under` (or no threshold set) |
-| 1 | Score below `--fail-under` threshold |
+| Code | Meaning                                                         |
+| ---- | --------------------------------------------------------------- |
+| 0    | Run completed, score above `--fail-under` (or no threshold set) |
+| 1    | Score below `--fail-under` threshold                            |
 
 ## What to gate on
 

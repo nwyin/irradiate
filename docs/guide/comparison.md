@@ -2,21 +2,21 @@
 
 ## irradiate vs mutmut
 
-mutmut is irradiate's direct ancestor. They share trampoline architecture, naming conventions, and config format. The differences are in execution model and feature set.
+irradiate is heavily inspired by mutmut and shares its trampoline architecture, naming conventions, and config format. The main differences are in execution model and feature set.
 
-| | mutmut | irradiate |
-|---|---|---|
-| **Execution** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant inside pre-warmed workers |
-| **Parser** | LibCST (Python, sequential) | tree-sitter (Rust, parallel via rayon) |
-| **Operators** | ~20 categories | 27 categories |
-| **Cache** | mtime-based (breaks on rebase, `touch`) | Content-addressable (SHA-256) |
-| **Orchestration** | Python multiprocessing | Rust + tokio async |
-| **Incremental** | -- | `--diff` with merge-base resolution |
-| **Reports** | Terminal only | JSON (Stryker v2), HTML, GitHub Actions annotations |
-| **Decorator support** | Skip all | @property/@classmethod/@staticmethod handled |
-| **CI integration** | Manual | `--fail-under`, inline annotations, step summary |
-| **Isolation** | Fork only | Warm-session + `--isolate` + `--verify-survivors` |
-| **Config** | `[tool.mutmut]` | `[tool.irradiate]` (mutmut section accepted with deprecation warning) |
+|                       | mutmut                                   | irradiate                                                             |
+| --------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
+| **Execution**         | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant inside pre-warmed workers                             |
+| **Parser**            | LibCST (Python, sequential)              | tree-sitter (Rust, parallel via rayon)                                |
+| **Operators**         | ~20 categories                           | 27 categories                                                         |
+| **Cache**             | mtime-based (breaks on rebase, `touch`)  | Content-addressable (SHA-256)                                         |
+| **Orchestration**     | Python multiprocessing                   | Rust + tokio async                                                    |
+| **Incremental**       | --                                       | `--diff` with merge-base resolution                                   |
+| **Reports**           | Terminal only                            | JSON (Stryker v2), HTML, GitHub Actions annotations                   |
+| **Decorator support** | Skip all                                 | @property/@classmethod/@staticmethod handled                          |
+| **CI integration**    | Manual                                   | `--fail-under`, inline annotations, step summary                      |
+| **Isolation**         | Fork only                                | Warm-session + `--isolate` + `--verify-survivors`                     |
+| **Config**            | `[tool.mutmut]`                          | `[tool.irradiate]` (mutmut section accepted with deprecation warning) |
 
 The speedup depends on pytest startup overhead. For projects where pytest takes 200ms+ to start, irradiate is typically 10-50x faster.
 
