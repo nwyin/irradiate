@@ -40,12 +40,6 @@ pub struct PoolConfig {
     /// Format: harness_dir:source_parent. mutants_dir is passed as
     /// IRRADIATE_MUTANTS_DIR env var and handled by the MutantFinder import hook.
     pub pythonpath: String,
-    /// Respawn workers after this many mutants to prevent pytest state accumulation.
-    /// `None` = auto-tune: defaults to 100, but reduced to 20 if session-scoped fixtures
-    /// are detected (to limit state leakage).
-    /// `Some(0)` = disable recycling entirely.
-    /// `Some(n)` = explicit user override, always respected regardless of fixture detection.
-    pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
     /// Extra arguments appended to every pytest invocation within the worker pool.
@@ -64,7 +58,6 @@ impl Default for PoolConfig {
             timeout_multiplier: 10.0,
             default_timeout: Duration::from_secs(30),
             pythonpath: String::new(),
-            worker_recycle_after: None,
             max_worker_memory_mb: 0,
             pytest_add_cli_args: Vec::new(),
         }
@@ -423,29 +416,6 @@ fn check_rss_native(_pid: u32) -> Option<usize> {
     None
 }
 
-/// Determine the effective recycling interval given user configuration and fixture detection.
-///
-/// - `configured = None`: auto-tune mode. Default 100, reduced to 20 if session fixtures found.
-/// - `configured = Some(n)`: explicit user override; always returned as-is.
-pub(crate) fn determine_recycle_after(
-    configured: Option<usize>,
-    has_session_fixtures: bool,
-    session_fixture_count: usize,
-) -> usize {
-    match configured {
-        Some(explicit) => explicit,
-        None => {
-            const DEFAULT: usize = 100;
-            const SESSION_FIXTURE_REDUCED: usize = 20;
-            if has_session_fixtures && session_fixture_count > 0 {
-                DEFAULT.min(SESSION_FIXTURE_REDUCED)
-            } else {
-                DEFAULT
-            }
-        }
-    }
-}
-
 /// Mutable state for the dispatch loop, extracted from the monolithic `dispatch_work` function.
 struct DispatchState<'a> {
     // Core state
@@ -459,12 +429,7 @@ struct DispatchState<'a> {
     active_mutants: HashMap<usize, String>,
     next_worker_id: usize,
 
-    // Recycling
-    worker_recycle_counts: HashMap<usize, usize>,
-    recycled_worker_ids: HashSet<usize>,
     pending_accepts: usize,
-    recycle_after: usize,
-    session_detection_done: bool,
 
     // Memory monitoring
     worker_pids: HashMap<usize, u32>,
@@ -515,11 +480,7 @@ impl<'a> DispatchState<'a> {
             idle_workers: Vec::new(),
             active_mutants: HashMap::new(),
             next_worker_id: 0,
-            worker_recycle_counts: HashMap::new(),
-            recycled_worker_ids: HashSet::new(),
             pending_accepts,
-            recycle_after: config.worker_recycle_after.unwrap_or(100),
-            session_detection_done: false,
             worker_pids: HashMap::new(),
             workers_pending_memory_recycle: HashSet::new(),
             spawn_times,
@@ -707,41 +668,8 @@ impl<'a> DispatchState<'a> {
             }
             Ok(Ok(_)) => {
                 match serde_json::from_str::<WorkerMessage>(line.trim()) {
-                    Ok(WorkerMessage::Ready {
-                        pid,
-                        has_session_fixtures,
-                        session_fixture_count,
-                        ..
-                    }) => {
+                    Ok(WorkerMessage::Ready { pid, .. }) => {
                         info!("Worker {worker_id} (pid {pid}) connected and ready");
-
-                        // Auto-tune recycling interval on first worker connection.
-                        if !self.session_detection_done {
-                            self.session_detection_done = true;
-                            let new_recycle = determine_recycle_after(
-                                self.config.worker_recycle_after,
-                                has_session_fixtures,
-                                session_fixture_count,
-                            );
-                            if has_session_fixtures && self.config.worker_recycle_after.is_none() {
-                                warn!(
-                                    "Session-scoped fixtures detected ({session_fixture_count}); \
-                                     reducing worker recycle interval to {new_recycle} for correctness. \
-                                     Use --worker-recycle-after to override."
-                                );
-                                info!(
-                                    "Auto-tuning worker recycle interval: {} → {new_recycle}",
-                                    self.recycle_after
-                                );
-                                self.recycle_after = new_recycle;
-                            } else if has_session_fixtures {
-                                info!(
-                                    "Session-scoped fixtures detected ({session_fixture_count}); \
-                                     respecting explicit --worker-recycle-after={}",
-                                    self.recycle_after
-                                );
-                            }
-                        }
 
                         // Trace: worker startup span
                         if let Some(&spawn_us) = self.spawn_times.get(&worker_id) {
@@ -857,48 +785,28 @@ impl<'a> DispatchState<'a> {
         }
         self.results.push(result);
 
-        let count = self.worker_recycle_counts.entry(worker_id).or_insert(0);
-        *count += 1;
-
         let memory_recycle = self.workers_pending_memory_recycle.remove(&worker_id);
-        let count_recycle = self.recycle_after > 0 && *count >= self.recycle_after;
 
-        // Skip count-based recycling when the queue is nearly drained:
-        // spawning a replacement takes ~500ms and won't pay for itself
-        // if there are only a few mutants left. Memory-based recycling
-        // is always honored (OOM is a correctness concern).
-        let active_count = self.active_mutants.len();
-        let worth_recycling = memory_recycle
-            || (count_recycle
-                && self.work_queue.len() > active_count + self.pending_accepts);
-
-        if worth_recycling && !self.work_queue.is_empty() {
-            if memory_recycle {
-                info!("Worker {worker_id}: recycling due to memory limit exceeded");
-            } else {
-                info!(
-                    "Worker {worker_id}: recycling after {count} mutants (queue: {})",
-                    self.work_queue.len()
-                );
-            }
+        if memory_recycle && !self.work_queue.is_empty() {
+            info!("Worker {worker_id}: recycling due to memory limit exceeded");
             if let Some(sender) = self.worker_senders.remove(&worker_id) {
                 let _ = sender.send(OrchestratorMessage::Shutdown).await;
             }
-            self.worker_recycle_counts.remove(&worker_id);
             self.worker_pids.remove(&worker_id);
-            self.recycled_worker_ids.insert(worker_id);
             self.respawn_worker();
         } else {
             self.idle_workers.push(worker_id);
         }
     }
 
-    /// Handle a worker disconnect (expected from recycling, or unexpected crash).
+    /// Handle a worker disconnect (expected from memory recycling, or unexpected crash).
     async fn handle_disconnect(&mut self, worker_id: usize) {
         self.worker_pids.remove(&worker_id);
         self.workers_pending_memory_recycle.remove(&worker_id);
-        if self.recycled_worker_ids.remove(&worker_id) {
-            debug!("Worker {worker_id}: recycled cleanly");
+        // If the worker was already removed from worker_senders (by handle_result
+        // during memory recycling), this is an expected disconnect.
+        if !self.worker_senders.contains_key(&worker_id) && !self.active_mutants.contains_key(&worker_id) {
+            debug!("Worker {worker_id}: disconnected cleanly");
         } else {
             warn!(
                 "Worker {worker_id} crashed. \
@@ -1098,54 +1006,6 @@ mod tests {
         assert_eq!(ordered.len(), 2);
     }
 
-    // --- determine_recycle_after tests (INV-1, INV-2, INV-4) ---
-
-    /// INV-1: Auto-mode with session fixtures → reduced interval.
-    #[test]
-    fn test_determine_recycle_after_auto_with_session_fixtures() {
-        let result = determine_recycle_after(None, true, 3);
-        assert_eq!(result, 20, "session fixtures detected in auto mode → 20");
-    }
-
-    /// INV-2: Explicit user override is always respected, even with session fixtures.
-    #[test]
-    fn test_determine_recycle_after_explicit_with_session_fixtures() {
-        let result = determine_recycle_after(Some(50), true, 3);
-        assert_eq!(result, 50, "explicit setting must override auto-tune");
-    }
-
-    /// INV-2: Explicit 0 (disabled) is respected even with session fixtures.
-    #[test]
-    fn test_determine_recycle_after_explicit_zero_with_session_fixtures() {
-        let result = determine_recycle_after(Some(0), true, 5);
-        assert_eq!(result, 0, "explicit 0 (disabled) must be respected");
-    }
-
-    /// INV-4: Auto-mode without session fixtures → default interval.
-    #[test]
-    fn test_determine_recycle_after_auto_no_session_fixtures() {
-        let result = determine_recycle_after(None, false, 0);
-        assert_eq!(result, 100, "no session fixtures → default 100");
-    }
-
-    /// Auto-mode, has_session_fixtures=true but count=0 → no reduction (shouldn't happen
-    /// in practice, but guards against inconsistent Python-side behavior).
-    #[test]
-    fn test_determine_recycle_after_auto_fixture_flag_true_count_zero() {
-        let result = determine_recycle_after(None, true, 0);
-        assert_eq!(
-            result, 100,
-            "count=0 prevents reduction even if flag is true"
-        );
-    }
-
-    /// Explicit 1 means recycle after every mutant — common in tests.
-    #[test]
-    fn test_determine_recycle_after_explicit_one() {
-        let result = determine_recycle_after(Some(1), false, 0);
-        assert_eq!(result, 1);
-    }
-
     // --- check_rss tests (INV-1) ---
 
     /// INV-1: check_rss returns nonzero RSS for the current process.
@@ -1176,47 +1036,26 @@ mod tests {
         );
     }
 
-    // --- recycle decision logic tests (INV-2) ---
-    //
-    // These tests directly exercise the `(count_recycle || memory_recycle) && work_remaining`
-    // boolean condition in dispatch_work. Each test targets a specific cargo-mutant survivor:
-    // - test_recycle_decision_memory_without_count: kills the `||` → `&&` mutation
-    // - test_recycle_decision_no_flags_no_recycle: kills the inversion of either flag
-    // - test_recycle_decision_no_work_remaining: kills removal of `&& work_remaining`
+    // --- memory recycle decision tests ---
 
-    /// INV-2: memory_recycle alone (count threshold not reached) still triggers recycling.
-    /// Kills the `||` → `&&` mutation in dispatch_work.
+    /// Memory recycling triggers when RSS exceeded and work remains.
     #[test]
-    fn test_recycle_decision_memory_without_count_threshold() {
-        let count_recycle = false; // count threshold not reached
-        let memory_recycle = true; // RSS exceeded limit
-        let work_remaining = true;
-        assert!(
-            (count_recycle || memory_recycle) && work_remaining,
-            "memory_recycle alone must trigger recycling when work remains"
-        );
-    }
-
-    /// INV-2: neither count nor memory flag → no recycling.
-    #[test]
-    fn test_recycle_decision_no_flags_no_recycle() {
-        let count_recycle = false;
-        let memory_recycle = false;
-        let work_remaining = true;
-        assert!(
-            !((count_recycle || memory_recycle) && work_remaining),
-            "without either flag, recycling must not occur"
-        );
-    }
-
-    /// INV-2: memory_recycle set but work queue empty → no recycling (nothing to dispatch).
-    #[test]
-    fn test_recycle_decision_no_work_remaining() {
-        let count_recycle = false;
+    fn test_recycle_decision_memory_with_work_remaining() {
         let memory_recycle = true;
-        let work_remaining = false; // queue drained
+        let work_remaining = true;
         assert!(
-            !((count_recycle || memory_recycle) && work_remaining),
+            memory_recycle && work_remaining,
+            "memory_recycle must trigger recycling when work remains"
+        );
+    }
+
+    /// Memory recycling does not trigger when work queue is empty.
+    #[test]
+    fn test_recycle_decision_memory_no_work_remaining() {
+        let memory_recycle = true;
+        let work_remaining = false;
+        assert!(
+            !(memory_recycle && work_remaining),
             "recycling must not occur when no work remains"
         );
     }

@@ -23,10 +23,6 @@ pub struct RunConfig {
     pub covered_only: bool,
     pub python: PathBuf,
     pub mutant_filter: Option<Vec<String>>,
-    /// Respawn workers after this many mutants.
-    /// `None` = auto-tune (default 100, reduced to 20 if session fixtures detected).
-    /// `Some(0)` = disabled. `Some(n)` = explicit user override.
-    pub worker_recycle_after: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = unlimited.
     pub max_worker_memory_mb: usize,
     /// Run each mutant in a fresh subprocess instead of the worker pool.
@@ -722,7 +718,6 @@ fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
         tests_dir: PathBuf::from(&config.tests_dir),
         timeout_multiplier: config.timeout_multiplier,
         pythonpath: ctx.pythonpath.clone(),
-        worker_recycle_after: config.worker_recycle_after,
         max_worker_memory_mb: config.max_worker_memory_mb,
         pytest_add_cli_args: config.pytest_add_cli_args.clone(),
         ..Default::default()
@@ -2788,7 +2783,6 @@ index 000..abc
             covered_only: false,
             python,
             mutant_filter: None,
-            worker_recycle_after: None,
             max_worker_memory_mb: 0,
             isolate: false,
             verify_survivors: false,

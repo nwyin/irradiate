@@ -54,41 +54,12 @@ class MutationWorkerPlugin:
         self.current_item_nodeid = None
         self.current_run_reports = []
         self._source_module_names = []  # modules loaded via MutantFinder
-        self.session_fixture_names = []  # populated by pytest_collection_finish
-
-    def _detect_session_fixtures(self, session):
-        """Check if any collected tests use session-scoped fixtures.
-
-        Uses pytest's internal _fixturemanager and _arg2fixturedefs.
-        These are underscore-prefixed but stable across pytest versions
-        and used by major plugins (pytest-xdist, pytest-cov).
-        Falls back gracefully if the attribute is unavailable (old pytest).
-        """
-        session_fixture_names = []
-        fm = session.config.pluginmanager.get_plugin("funcmanage")
-        if fm is None:
-            fm = getattr(session, "_fixturemanager", None)
-        if fm is not None:
-            arg2fixturedefs = getattr(fm, "_arg2fixturedefs", None)
-            if arg2fixturedefs is not None:
-                for name, fixturedefs in arg2fixturedefs.items():
-                    for fdef in fixturedefs:
-                        if getattr(fdef, "scope", None) == "session":
-                            session_fixture_names.append(name)
-                            break  # one match per name is enough
-        return session_fixture_names
 
     def pytest_collection_finish(self, session):
         for index, item in enumerate(session.items):
             self.items[item.nodeid] = item
             self.item_order[item.nodeid] = index
         self._identify_source_modules()
-        self.session_fixture_names = self._detect_session_fixtures(session)
-        if self.session_fixture_names:
-            print(
-                f"[irradiate] Session-scoped fixtures detected: {', '.join(self.session_fixture_names)}",
-                file=sys.stderr,
-            )
 
     def _identify_source_modules(self):
         """Detect which sys.modules entries were loaded via the MutantFinder import hook."""
@@ -231,15 +202,13 @@ class MutationWorkerPlugin:
         if not self.items:
             print("WARNING: No tests collected", file=sys.stderr)
 
-        # Send ready with collected test IDs and session fixture metadata
+        # Send ready with collected test IDs
         send_message(
             self.sock,
             {
                 "type": "ready",
                 "pid": os.getpid(),
                 "tests": list(self.items.keys()),
-                "has_session_fixtures": bool(self.session_fixture_names),
-                "session_fixture_count": len(self.session_fixture_names),
             },
         )
 

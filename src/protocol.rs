@@ -24,14 +24,6 @@ pub enum WorkerMessage {
         pid: u32,
         #[serde(default)]
         tests: Vec<String>,
-        /// True if the collected tests use any session-scoped fixtures.
-        /// Session fixtures persist for the worker lifetime and can cause state leakage
-        /// across mutant runs; the orchestrator uses this to auto-tune recycling.
-        #[serde(default)]
-        has_session_fixtures: bool,
-        /// Number of distinct session-scoped fixture names detected.
-        #[serde(default)]
-        session_fixture_count: usize,
     },
     Result {
         mutant: String,
@@ -168,54 +160,6 @@ mod tests {
                 assert!((duration - 0.042).abs() < 0.001);
             }
             _ => panic!("expected Result"),
-        }
-    }
-
-    /// INV-3: Ready message without fixture fields (old worker format) deserializes
-    /// with has_session_fixtures=false and session_fixture_count=0 via #[serde(default)].
-    #[test]
-    fn test_ready_message_backwards_compat_no_fixture_fields() {
-        let old_json = r#"{"type":"ready","pid":12345,"tests":["tests/test_foo.py::test_bar"]}"#;
-        let msg: WorkerMessage = serde_json::from_str(old_json).unwrap();
-        match msg {
-            WorkerMessage::Ready {
-                pid,
-                tests,
-                has_session_fixtures,
-                session_fixture_count,
-            } => {
-                assert_eq!(pid, 12345);
-                assert_eq!(tests.len(), 1);
-                assert!(
-                    !has_session_fixtures,
-                    "missing field should default to false"
-                );
-                assert_eq!(
-                    session_fixture_count, 0,
-                    "missing field should default to 0"
-                );
-            }
-            _ => panic!("expected Ready"),
-        }
-    }
-
-    /// New workers send fixture metadata; verify all fields round-trip correctly.
-    #[test]
-    fn test_ready_message_with_fixture_metadata() {
-        let json = r#"{"type":"ready","pid":999,"tests":[],"has_session_fixtures":true,"session_fixture_count":3}"#;
-        let msg: WorkerMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            WorkerMessage::Ready {
-                pid,
-                has_session_fixtures,
-                session_fixture_count,
-                ..
-            } => {
-                assert_eq!(pid, 999);
-                assert!(has_session_fixtures);
-                assert_eq!(session_fixture_count, 3);
-            }
-            _ => panic!("expected Ready"),
         }
     }
 

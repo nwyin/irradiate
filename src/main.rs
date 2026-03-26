@@ -66,11 +66,6 @@ enum Commands {
         #[arg(long, default_value = "python3")]
         python: String,
 
-        /// Respawn workers after N mutants to prevent pytest state accumulation (0 to disable).
-        /// Default: auto-tune (100 normally, reduced to 20 when session-scoped fixtures detected).
-        #[arg(long)]
-        worker_recycle_after: Option<usize>,
-
         /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
         #[arg(long, default_value_t = 0)]
         max_worker_memory: usize,
@@ -183,7 +178,6 @@ async fn main() -> Result<()> {
             no_stats,
             covered_only,
             python,
-            worker_recycle_after,
             max_worker_memory,
             isolate,
             verify_survivors,
@@ -228,7 +222,6 @@ async fn main() -> Result<()> {
                 } else {
                     Some(mutant_names)
                 },
-                worker_recycle_after,
                 max_worker_memory_mb: max_worker_memory,
                 isolate,
                 verify_survivors,
