@@ -34,11 +34,16 @@ struct Cli {
 enum Commands {
     /// Run mutation testing
     Run {
-        /// Specific mutant names to test (default: all)
-        mutant_names: Vec<String>,
-
         /// Path(s) to source code to mutate (default: "src", overrides pyproject.toml).
-        /// Can be specified multiple times: --paths-to-mutate src/a.py --paths-to-mutate src/b.py
+        /// Example: irradiate run src/mylib
+        paths: Vec<String>,
+
+        /// Filter to specific mutant names (advanced — test only these mutants)
+        #[arg(long)]
+        mutant: Vec<String>,
+
+        /// Alias for positional paths, for backward compatibility.
+        /// Prefer positional: `irradiate run src/` instead of `--paths-to-mutate src/`
         #[arg(long)]
         paths_to_mutate: Vec<String>,
 
@@ -170,7 +175,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Run {
-            mutant_names,
+            paths,
+            mutant,
             paths_to_mutate,
             tests_dir,
             workers,
@@ -198,10 +204,14 @@ async fn main() -> Result<()> {
             let mut pytest_add_cli_args = file_config.pytest_add_cli_args.unwrap_or_default();
             pytest_add_cli_args.extend(pytest_args);
 
+            // Merge positional paths and --paths-to-mutate (positional takes priority)
+            let mut all_paths = paths;
+            all_paths.extend(paths_to_mutate);
+
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
                 paths_to_mutate: {
-                    let raw = if !paths_to_mutate.is_empty() {
-                        paths_to_mutate
+                    let raw = if !all_paths.is_empty() {
+                        all_paths
                     } else {
                         file_config
                             .paths_to_mutate
@@ -217,10 +227,10 @@ async fn main() -> Result<()> {
                 no_stats,
                 covered_only,
                 python: PathBuf::from(python),
-                mutant_filter: if mutant_names.is_empty() {
+                mutant_filter: if mutant.is_empty() {
                     None
                 } else {
-                    Some(mutant_names)
+                    Some(mutant)
                 },
                 max_worker_memory_mb: max_worker_memory,
                 isolate,
