@@ -318,21 +318,49 @@ async fn phase_stats(
             ctx.trace.phase("stats_cache_hit", phase_start, None);
             cached
         } else {
-            eprintln!("Running stats + validation...");
-            let s = stats::collect_stats(
-                &config.python, &ctx.project_dir, &ctx.pythonpath,
-                &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
-                config.stats_timeout,
-            ).context("Stats collection failed")?;
-            stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
-            ctx.trace.phase("stats_collection", phase_start, None);
-            eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
-            s
+            // Use fast stats (sys.monitoring / sys.settrace) on Python 3.10+,
+            // fall back to trampoline-based stats on older Pythons.
+            let use_fast_stats = stats::python_version(&config.python)
+                .is_some_and(|(major, minor)| major >= 3 && minor >= 10);
+
+            if use_fast_stats {
+                eprintln!("Running stats collection...");
+                let fast_pythonpath = build_pythonpath_fast_stats(&ctx.harness_dir, &config.paths_to_mutate);
+                let s = stats::collect_stats_fast(
+                    &config.python, &ctx.project_dir, &fast_pythonpath,
+                    &config.tests_dir, &config.pytest_add_cli_args,
+                    config.stats_timeout,
+                ).context("Fast stats collection failed")?;
+                stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
+                ctx.trace.phase("stats_collection_fast", phase_start, None);
+                eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
+
+                // Fast stats doesn't validate the trampoline — do it separately.
+                eprintln!("Running trampoline validation...");
+                let val_start = Instant::now();
+                validate_fail_run(
+                    &config.python, &ctx.project_dir, &ctx.pythonpath,
+                    &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+                ).await?;
+                eprintln!("  done in {:.0}ms", val_start.elapsed().as_millis());
+                s
+            } else {
+                eprintln!("Running stats + validation...");
+                let s = stats::collect_stats(
+                    &config.python, &ctx.project_dir, &ctx.pythonpath,
+                    &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+                    config.stats_timeout,
+                ).context("Stats collection failed")?;
+                stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
+                ctx.trace.phase("stats_collection", phase_start, None);
+                eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
+                s
+            }
         };
 
         if let Some(exit_code) = s.exit_status {
             if exit_code > 1 {
-                bail!("Stats run failed (exit code {exit_code}) — tests could not run with trampolined code");
+                bail!("Stats run failed (exit code {exit_code}) — tests could not run under tracing/trampoline");
             }
             if exit_code == 1 {
                 eprintln!("Warning: some tests failed during stats run (pre-existing failures)");
@@ -342,7 +370,7 @@ async fn phase_stats(
             bail!("Trampoline fail path not wired — in-process fail probe did not raise ProgrammaticFailException");
         }
         if s.tests_by_function.is_empty() && has_mutants {
-            bail!("No functions were hit during stats collection, but mutants exist — trampoline may not be loading");
+            bail!("No functions were hit during stats collection, but mutants exist — check that source paths are correct");
         }
 
         Some(s)
@@ -842,6 +870,34 @@ pub fn build_pythonpath(harness_dir: &Path, paths_to_mutate: &[PathBuf]) -> Stri
     parts.join(":")
 }
 
+/// Build PYTHONPATH for fast stats collection (no import hook).
+///
+/// Uses the same parent-based logic as `build_pythonpath` (so `tqdm/asyncio.py`
+/// doesn't shadow stdlib `asyncio`). Additionally includes the path itself when
+/// it's a non-package directory (e.g. `src/` containing subpackages), so that
+/// `from math_ops import add` works when `math_ops` is at `src/math_ops/`.
+pub fn build_pythonpath_fast_stats(harness_dir: &Path, paths_to_mutate: &[PathBuf]) -> String {
+    let mut parts = vec![harness_dir.display().to_string()];
+    let mut seen = std::collections::HashSet::new();
+    for p in paths_to_mutate {
+        // Parent: always include (same as trampoline path).
+        let parent = p.parent().unwrap_or(p);
+        let ps = parent.display().to_string();
+        if seen.insert(ps.clone()) {
+            parts.push(ps);
+        }
+        // Include the path itself only if it's a directory without __init__.py
+        // (i.e., a source root like `src/`, not a package like `tqdm/`).
+        if p.is_dir() && !p.join("__init__.py").exists() {
+            let s = p.display().to_string();
+            if seen.insert(s.clone()) {
+                parts.push(s);
+            }
+        }
+    }
+    parts.join(":")
+}
+
 /// Returns true if `path` matches the glob `pattern`.
 ///
 /// Supported wildcards:
@@ -1010,7 +1066,8 @@ fn generate_mutants(
 
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
-    type MutantEntry = Option<(String, Vec<String>, Vec<MutantCacheDescriptor>)>;
+    // (module_name, mutant_names, descriptors, function_map_entries)
+    type MutantEntry = Option<(String, Vec<String>, Vec<MutantCacheDescriptor>, Vec<(String, String)>)>;
     let results: Vec<Result<MutantEntry>> = file_entries
         .par_iter()
         .map(|(py_file, strip_base)| -> Result<MutantEntry> {
@@ -1076,6 +1133,7 @@ fn generate_mutants(
                     module_name,
                     mutated.mutant_names,
                     mutated.descriptors,
+                    mutated.function_map,
                 )))
             } else {
                 // No mutations found, but copy the original file verbatim so
@@ -1093,13 +1151,31 @@ fn generate_mutants(
     // Merge results into HashMap (sequential — avoids mutex on hot path)
     let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
     let mut descriptors_by_name: HashMap<String, MutantCacheDescriptor> = HashMap::new();
+    let mut function_map: HashMap<String, HashMap<String, String>> = HashMap::new();
     for result in results {
-        if let Some((module, names, descriptors)) = result? {
+        if let Some((module, names, descriptors, func_map_entries)) = result? {
             for descriptor in descriptors {
                 descriptors_by_name.insert(descriptor.mutant_name.clone(), descriptor);
             }
+            if !func_map_entries.is_empty() {
+                let module_map = function_map.entry(module.clone()).or_default();
+                for (qualname, func_key) in func_map_entries {
+                    module_map.insert(qualname, func_key);
+                }
+            }
             all_names.insert(module, names);
         }
+    }
+
+    // Write the function map for the fast stats plugin (sys.monitoring / sys.settrace).
+    // The map lives in .irradiate/ alongside stats.json and is keyed by module name,
+    // then by Python qualname (co_qualname), mapping to irradiate func_key.
+    if !function_map.is_empty() {
+        let project_dir = mutants_dir.parent().unwrap_or(mutants_dir);
+        let irradiate_dir = project_dir.join(".irradiate");
+        std::fs::create_dir_all(&irradiate_dir)?;
+        let map_path = irradiate_dir.join("mutated_functions.json");
+        std::fs::write(&map_path, serde_json::to_string(&function_map)?)?;
     }
 
     // Copy non-Python data files (e.g. .txt, .json, .grammar) from source directories

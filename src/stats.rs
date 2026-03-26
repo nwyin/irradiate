@@ -295,6 +295,117 @@ pub fn collect_stats(
     }
 }
 
+/// Detect the Python interpreter's major.minor version.
+pub fn python_version(python: &Path) -> Option<(u32, u32)> {
+    let output = Command::new(python)
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let parts: Vec<&str> = s.trim().split('.').collect();
+    if parts.len() >= 2 {
+        Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
+    } else {
+        None
+    }
+}
+
+/// Collect stats using the fast plugin (sys.monitoring / sys.settrace).
+///
+/// Unlike `collect_stats`, this does NOT set `IRRADIATE_MUTANTS_DIR`, so the
+/// import hook never activates. Tests run against original unmodified source.
+/// The fast stats plugin reads `.irradiate/mutated_functions.json` to map
+/// function calls to irradiate func_keys.
+pub fn collect_stats_fast(
+    python: &Path,
+    project_dir: &Path,
+    pythonpath: &str,
+    tests_dir: &str,
+    extra_pytest_args: &[String],
+    timeout_secs: u64,
+) -> Result<TestStats> {
+    let stats_output = project_dir.join(".irradiate").join("stats.json");
+    let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let function_map_path = project_dir.join(".irradiate").join("mutated_functions.json");
+
+    info!("Collecting stats (fast) with PYTHONPATH={pythonpath}");
+
+    let mut child = Command::new(python)
+        .arg("-m")
+        .arg("pytest")
+        .arg("--irradiate-fast-stats")
+        .arg("-p")
+        .arg("irradiate_harness.fast_stats_plugin")
+        .arg("-q")
+        .arg(tests_dir)
+        .args(extra_pytest_args)
+        .env("PYTHONPATH", pythonpath)
+        .env("IRRADIATE_STATS_OUTPUT", &stats_output)
+        .env("IRRADIATE_FUNCTION_MAP", &function_map_path)
+        // Note: no IRRADIATE_MUTANTS_DIR — import hook does not activate
+        .current_dir(project_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to start pytest for fast stats collection")?;
+
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stderr, &mut buf).ok();
+            buf
+        })
+    });
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "Fast stats collection timed out after {}s. \
+                     Use --stats-timeout to increase (e.g. --stats-timeout 600)",
+                    timeout_secs
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+
+    let status = child.wait()?;
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code > 1 {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        if !stats_output.exists() {
+            anyhow::bail!(
+                "Fast stats collection failed (exit code {exit_code}):\nstderr: {stderr}",
+            );
+        }
+        info!("Fast stats run exited with code {exit_code} — details in stats.json");
+    }
+    if exit_code == 1 {
+        info!("Fast stats collection completed with some test failures (exit code 1) — this is OK");
+    }
+
+    if stats_output.exists() {
+        TestStats::load(&stats_output)
+    } else {
+        Ok(TestStats::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

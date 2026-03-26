@@ -25,12 +25,15 @@ rm -rf "$FIXTURE/mutants" "$FIXTURE/.irradiate"
 RUN_OUTPUT=$( cd "$FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
 echo "$RUN_OUTPUT"
 
-# Verify stats + validation ran (consolidates clean + fail into one subprocess)
-if ! echo "$RUN_OUTPUT" | grep -q "stats + validation"; then
-    echo "FAIL: Expected 'stats + validation' in pipeline output"
+# Verify stats ran (either fast stats or trampoline-based)
+if echo "$RUN_OUTPUT" | grep -q "stats collection"; then
+    echo "  stats collection (fast): OK"
+elif echo "$RUN_OUTPUT" | grep -q "stats + validation"; then
+    echo "  stats + validation (trampoline): OK"
+else
+    echo "FAIL: Expected stats collection output in pipeline"
     exit 1
 fi
-echo "  stats + validation: OK"
 
 # Verify results
 echo ""
@@ -376,9 +379,9 @@ rm -rf "$REGEX_FIXTURE/mutants" "$REGEX_FIXTURE/.irradiate"
 REGEX_OUTPUT=$( cd "$REGEX_FIXTURE" && "$BINARY" run --python .venv/bin/python3 2>&1 )
 echo "$REGEX_OUTPUT"
 
-# Verify pipeline completed
-if ! echo "$REGEX_OUTPUT" | grep -q "stats + validation"; then
-    echo "FAIL: regex_project did not complete stats + validation"
+# Verify pipeline completed (either fast stats or trampoline-based)
+if ! echo "$REGEX_OUTPUT" | grep -qE "stats collection|stats \+ validation"; then
+    echo "FAIL: regex_project did not complete stats collection"
     exit 1
 fi
 echo "  regex_project completed: OK"

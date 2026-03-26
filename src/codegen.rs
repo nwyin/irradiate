@@ -16,6 +16,10 @@ pub struct MutatedFile {
     pub mutant_names: Vec<String>,
     /// Rich descriptors for each generated mutant.
     pub descriptors: Vec<MutantCacheDescriptor>,
+    /// Map from Python qualname (e.g., "add" or "MyClass.method") to irradiate
+    /// func_key (e.g., "module.x_add"). Used by the fast stats plugin to map
+    /// sys.monitoring / sys.settrace call events to irradiate function keys.
+    pub function_map: Vec<(String, String)>,
 }
 
 /// Generate the mutated version of a Python source file.
@@ -309,10 +313,31 @@ pub fn mutate_file(
         })
         .collect();
 
+    // Build qualname → func_key map for the fast stats plugin.
+    // Dedup by using a set — multiple mutations on the same function share one map entry.
+    let mut seen_qualnames = std::collections::HashSet::new();
+    let function_map: Vec<(String, String)> = function_mutations
+        .iter()
+        .filter_map(|fm| {
+            let qualname = match &fm.class_name {
+                Some(cls) => format!("{cls}.{}", fm.name),
+                None => fm.name.clone(),
+            };
+            if seen_qualnames.insert(qualname.clone()) {
+                let mangled = crate::trampoline::mangle_name(&fm.name, fm.class_name.as_deref());
+                let func_key = format!("{module_name}.{mangled}");
+                Some((qualname, func_key))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     Some(MutatedFile {
         source: output,
         mutant_names: all_mutant_names,
         descriptors,
+        function_map,
     })
 }
 
@@ -561,6 +586,11 @@ mod tests {
         assert_eq!(
             result.descriptors[0].mutant_name, result.mutant_names[0],
             "Descriptor keys must align with generated mutant names"
+        );
+        assert_eq!(
+            result.function_map,
+            vec![("add".to_string(), "simple_lib.x_add".to_string())],
+            "function_map should map qualname to func_key"
         );
         // tree-sitter collects return_statement mutations before recursing into binary_operator,
         // so the first descriptor may be return_value or statement_deletion rather than binop_swap.
