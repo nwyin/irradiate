@@ -349,11 +349,19 @@ pub fn collect_stats_fast(
         .env("IRRADIATE_FUNCTION_MAP", &function_map_path)
         // Note: no IRRADIATE_MUTANTS_DIR — import hook does not activate
         .current_dir(project_dir)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to start pytest for fast stats collection")?;
 
+    // Drain stdout and stderr in background threads to avoid pipe-buffer deadlock.
+    let stdout_handle = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stdout, &mut buf).ok();
+            buf
+        })
+    });
     let stderr_handle = child.stderr.take().map(|mut stderr| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -381,16 +389,30 @@ pub fn collect_stats_fast(
     }
 
     let status = child.wait()?;
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     let stderr_bytes = stderr_handle
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
 
     let exit_code = status.code().unwrap_or(-1);
     if exit_code > 1 {
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let stderr = String::from_utf8_lossy(&stderr_bytes);
         if !stats_output.exists() {
+            // pytest exited before writing stats — surface both streams so the
+            // user sees the actual collection errors (missing deps, import failures, etc.).
+            let mut detail = String::new();
+            if !stdout.trim().is_empty() {
+                detail.push_str(&stdout);
+            }
+            if !stderr.trim().is_empty() {
+                if !detail.is_empty() { detail.push('\n'); }
+                detail.push_str(&stderr);
+            }
             anyhow::bail!(
-                "Fast stats collection failed (exit code {exit_code}):\nstderr: {stderr}",
+                "Stats collection failed (pytest exit code {exit_code}):\n{detail}",
             );
         }
         info!("Fast stats run exited with code {exit_code} — details in stats.json");

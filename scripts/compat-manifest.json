@@ -81,7 +81,7 @@
   {"name": "httpx",         "repo": "https://github.com/encode/httpx",                     "src": "httpx",             "tests": "tests", "install": "pytest -e ."},
   {"name": "requests",      "repo": "https://github.com/psf/requests",                     "src": "src/requests",      "tests": "tests", "install": "pytest trustme -e ."},
   {"name": "rich",          "repo": "https://github.com/Textualize/rich",                  "src": "rich",              "tests": "tests", "install": "pytest attrs -e ."},
-  {"name": "celery",        "repo": "https://github.com/celery/celery",                    "src": "celery",            "tests": "t/unit", "install": "pytest -e '.[pytest]'"},
+  {"name": "celery",        "repo": "https://github.com/celery/celery",                    "src": "celery",            "tests": "t/unit", "install": "pytest cryptography pydantic moto 'boto3>=1.26' dnspython 'azure-storage-blob>=12' 'google-cloud-storage>=2' -e '.[pytest]'"},
   {"name": "sympy",         "repo": "https://github.com/sympy/sympy",                      "src": "sympy",             "tests": "sympy", "install": "pytest mpmath hypothesis -e .", "do_not_mutate": ["sympy/**/tests/*"]},
   {"name": "networkx",      "repo": "https://github.com/networkx/networkx",                "src": "networkx",          "tests": "networkx", "install": "pytest numpy scipy -e .", "do_not_mutate": ["networkx/**/tests/*"]},
   {"name": "tinygrad",      "repo": "https://github.com/tinygrad/tinygrad",                "src": "tinygrad",          "tests": "test", "install": "pytest numpy -e ."}

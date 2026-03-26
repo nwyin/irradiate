@@ -359,8 +359,16 @@ async fn phase_stats(
         };
 
         if let Some(exit_code) = s.exit_status {
-            if exit_code > 1 {
-                bail!("Stats run failed (exit code {exit_code}) — tests could not run under tracing/trampoline");
+            if exit_code == 2 {
+                bail!(
+                    "Stats run failed (exit code 2) — pytest reported collection errors.\n\
+                     This usually means test dependencies are missing or test files have import errors.\n\
+                     Run `pytest --co {tests_dir}` to see the specific errors.",
+                    tests_dir = config.tests_dir,
+                );
+            }
+            if exit_code > 2 {
+                bail!("Stats run failed (exit code {exit_code}) — pytest could not run the test suite");
             }
             if exit_code == 1 {
                 eprintln!("Warning: some tests failed during stats run (pre-existing failures)");
