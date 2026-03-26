@@ -330,7 +330,10 @@ async fn phase_stats(
                     &config.python, &ctx.project_dir, &fast_pythonpath,
                     &config.tests_dir, &config.pytest_add_cli_args,
                     config.stats_timeout,
-                ).context("Fast stats collection failed")?;
+                ).with_context(|| format!(
+                    "Fast stats collection failed (python: {}, tests: {})",
+                    config.python.display(), config.tests_dir
+                ))?;
                 stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
                 ctx.trace.phase("stats_collection_fast", phase_start, None);
                 eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
@@ -350,7 +353,10 @@ async fn phase_stats(
                     &config.python, &ctx.project_dir, &ctx.pythonpath,
                     &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
                     config.stats_timeout,
-                ).context("Stats collection failed")?;
+                ).with_context(|| format!(
+                    "Stats collection failed (python: {}, tests: {})",
+                    config.python.display(), config.tests_dir
+                ))?;
                 stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
                 ctx.trace.phase("stats_collection", phase_start, None);
                 eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
@@ -368,17 +374,32 @@ async fn phase_stats(
                 );
             }
             if exit_code > 2 {
-                bail!("Stats run failed (exit code {exit_code}) — pytest could not run the test suite");
+                bail!(
+                    "Stats run failed (exit code {exit_code}).\n\
+                     Exit codes: 3=internal error, 4=usage error, 5=no tests collected.\n\
+                     Run pytest manually to debug: {} -m pytest {}",
+                    config.python.display(), config.tests_dir
+                );
             }
             if exit_code == 1 {
                 eprintln!("Warning: some tests failed during stats run (pre-existing failures)");
             }
         }
         if s.fail_validated == Some(false) {
-            bail!("Trampoline fail path not wired — in-process fail probe did not raise ProgrammaticFailException");
+            bail!(
+                "Mutation harness validation failed: the failure-injection mechanism is not working.\n\
+                 This usually means the irradiate harness plugin failed to load.\n\
+                 Debug: IRRADIATE_ACTIVE_MUTANT=fail {} -m pytest {} -x",
+                config.python.display(), config.tests_dir
+            );
         }
         if s.tests_by_function.is_empty() && has_mutants {
-            bail!("No functions were hit during stats collection, but mutants exist — check that source paths are correct");
+            bail!(
+                "No test coverage detected for the mutated functions.\n\
+                 Your tests don't appear to call any functions in --paths-to-mutate.\n\
+                 Check: (1) tests import from the paths you specified, \
+                 (2) --paths-to-mutate and --tests-dir point to the right directories"
+            );
         }
 
         Some(s)
@@ -680,7 +701,10 @@ fn phase_results(
         if tested > 0 {
             let score = killed as f64 / tested as f64 * 100.0;
             if score < threshold {
-                bail!("Mutation score {score:.1}% is below threshold {threshold:.1}%");
+                bail!(
+                    "Mutation score {score:.1}% is below the required threshold {threshold:.1}%.\n\
+                     Your tests did not detect enough code mutations. Review surviving mutants with: irradiate results"
+                );
             }
         }
     }
@@ -1338,10 +1362,17 @@ async fn run_subprocess(
 
     let status = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(e)) => bail!("{description} subprocess error: {e}"),
+        Ok(Err(e)) => bail!(
+            "{description} failed: {e}\n\
+             Check that the Python interpreter is valid and pytest is installed."
+        ),
         Err(_) => {
             let _ = child.kill().await;
-            bail!("{description} timed out after {timeout_secs}s — pytest may be hung");
+            bail!(
+                "{description} timed out after {timeout_secs}s.\n\
+                 If tests are slow, increase with --stats-timeout (e.g. --stats-timeout 600).\n\
+                 If a test is hanging, run pytest manually to identify it."
+            );
         }
     };
 
@@ -1383,7 +1414,11 @@ async fn validate_clean_run(
     if output.exit_code > 1 {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Clean test run failed:\n{stdout}\n{stderr}");
+        bail!(
+            "Your test suite fails before any mutations are applied (baseline check).\n\
+             Fix these test failures first, then re-run irradiate.\n\n\
+             pytest output:\n{stdout}\n{stderr}"
+        );
     }
     if output.exit_code == 1 {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1426,14 +1461,18 @@ async fn validate_fail_run(
     let stderr = String::from_utf8_lossy(&output.stderr);
     match output.exit_code {
         0 => bail!(
-            "Forced-fail validation failed: tests passed when they should have failed.\n\
-             The trampoline may not be wired correctly.\n\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
+            "Mutation harness validation failed: tests passed when they should have failed.\n\
+             The failure-injection mechanism is not working correctly.\n\
+             Debug: IRRADIATE_ACTIVE_MUTANT=fail {python} -m pytest {tests_dir} -x\n\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}",
+            python = python.display(), tests_dir = tests_dir
         ),
         5 => bail!(
-            "Forced-fail validation failed: no tests were collected (exit code 5).\n\
-             This does not confirm the trampoline is wired — the test suite may be empty or misconfigured.\n\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
+            "Validation failed: pytest collected no tests (exit code 5).\n\
+             Check: (1) --tests-dir contains test_*.py files, \
+             (2) `{python} -m pytest --collect-only {tests_dir}` finds tests.\n\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}",
+            python = python.display(), tests_dir = tests_dir
         ),
         _ => Ok(()), // 1, 2, etc. — tests failed, which is what we want
     }

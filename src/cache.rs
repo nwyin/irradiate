@@ -63,7 +63,7 @@ pub fn load_entry(project_dir: &Path, key: &str) -> Result<Option<CacheEntry>> {
     let content =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     let entry =
-        serde_json::from_str(&content).with_context(|| format!("Invalid {}", path.display()))?;
+        serde_json::from_str(&content).with_context(|| format!("Corrupted cache entry at {}. Clear with: irradiate cache clean", path.display()))?;
     Ok(Some(entry))
 }
 

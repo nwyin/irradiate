@@ -273,7 +273,10 @@ pub fn collect_stats(
         // pytest_sessionfinish may still have written the file — check before bailing
         if !stats_output.exists() {
             anyhow::bail!(
-                "Stats collection failed (exit code {exit_code}):\nstderr: {stderr}",
+                "Stats collection failed (pytest exit code {exit_code}).\n\
+                 Run pytest manually to debug: {} -m pytest {tests_dir}\n\n\
+                 stderr:\n{stderr}",
+                python.display(),
             );
         }
         info!("Stats run exited with code {exit_code} — details in stats.json");
@@ -412,7 +415,10 @@ pub fn collect_stats_fast(
                 detail.push_str(&stderr);
             }
             anyhow::bail!(
-                "Stats collection failed (pytest exit code {exit_code}):\n{detail}",
+                "Stats collection failed (pytest exit code {exit_code}).\n\
+                 Run pytest manually to debug: {} -m pytest {tests_dir}\n\n\
+                 {detail}",
+                python.display(),
             );
         }
         info!("Fast stats run exited with code {exit_code} — details in stats.json");

@@ -642,7 +642,7 @@ pub fn show(mutant_name: &str) -> Result<()> {
     let source_file = candidates
         .iter()
         .find(|p| p.exists())
-        .ok_or_else(|| anyhow::anyhow!("Cannot find source file for module '{module}'"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cannot find source file for module '{module}' in mutants/. Regenerate with: irradiate run"))?;
 
     let content = std::fs::read_to_string(source_file)?;
 
@@ -661,7 +661,8 @@ pub fn show(mutant_name: &str) -> Result<()> {
         }
         _ => {
             bail!(
-                "Could not extract functions for '{mutant_name}' from {}",
+                "Could not extract functions for '{mutant_name}' from {}. \
+                 The mutants directory may be stale — regenerate with: irradiate run",
                 source_file.display()
             );
         }

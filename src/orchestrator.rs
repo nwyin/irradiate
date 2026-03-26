@@ -271,7 +271,7 @@ fn spawn_worker_task(
                             if let OrchestratorMessage::Run { timeout_secs: Some(secs), .. } = &msg {
                                 current_timeout = Duration::from_secs_f64(*secs);
                             }
-                            let json = serde_json::to_string(&msg).context("failed to serialize IPC message")? + "\n";
+                            let json = serde_json::to_string(&msg).context("internal error: failed to serialize worker message — please report this as a bug")? + "\n";
                             if write_tx.send(json).await.is_err() {
                                 let _ = event_tx.send(WorkerEvent::Disconnected { worker_id }).await;
                                 break;
@@ -901,8 +901,8 @@ impl<'a> DispatchState<'a> {
             debug!("Worker {worker_id}: recycled cleanly");
         } else {
             warn!(
-                "Worker {worker_id} disconnected unexpectedly — \
-                 the worker process may have crashed"
+                "Worker {worker_id} crashed. \
+                 If this keeps happening, try reducing parallelism with --workers."
             );
             self.record_worker_error(worker_id);
             self.worker_senders.remove(&worker_id);

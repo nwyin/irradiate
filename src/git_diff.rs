@@ -128,9 +128,10 @@ pub fn parse_git_diff(diff_ref: &str, repo_root: &Path) -> Result<DiffFilter> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "git diff {} failed: {}",
+            "git diff '{}' failed: {}\nVerify the ref exists: git rev-parse --verify {}",
             diff_ref,
-            stderr.trim()
+            stderr.trim(),
+            diff_ref
         );
     }
 

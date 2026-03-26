@@ -180,7 +180,7 @@ pub fn load_config(project_dir: &Path) -> Result<IrradiateConfig> {
     }
     let content = std::fs::read_to_string(&pyproject).context("Failed to read pyproject.toml")?;
     let config: ProjectConfig =
-        toml::from_str(&content).context("Failed to parse pyproject.toml")?;
+        toml::from_str(&content).context("Failed to parse pyproject.toml. Check your [tool.irradiate] section syntax.")?;
     if let Some(cfg) = config.tool.irradiate {
         return Ok(cfg);
     }
