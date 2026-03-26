@@ -1394,7 +1394,11 @@ async fn validate_fail_run(
     extra_pytest_args: &[String],
 ) -> Result<()> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
-    let mut args: Vec<&str> = vec!["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir];
+    // --tb=no suppresses traceback formatting which is expensive when every
+    // trampolined function raises ProgrammaticFailException. Without it,
+    // projects with many subtests (e.g. tomli: 744 subtests) spend minutes
+    // formatting tracebacks that we never read.
+    let mut args: Vec<&str> = vec!["-m", "pytest", "-x", "-q", "--tb=no", "-p", "irradiate_harness", tests_dir];
     args.extend(extra_pytest_args.iter().map(String::as_str));
     let output = run_subprocess(
         python,
