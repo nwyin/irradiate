@@ -35,7 +35,7 @@
   {"name": "bottle",         "repo": "https://github.com/bottlepy/bottle",                 "src": "bottle.py",         "tests": "test", "install": "pytest mako jinja2 -e ."},
   {"name": "arrow",          "repo": "https://github.com/arrow-py/arrow",                  "src": "arrow",             "tests": "tests", "install": "pytest python-dateutil simplejson -e '.[test]'", "do_not_mutate": ["arrow/locales.py"]},
   {"name": "parso",          "repo": "https://github.com/davidhalter/parso",               "src": "parso",             "tests": "test", "install": "pytest -e ."},
-  {"name": "isort",          "repo": "https://github.com/PyCQA/isort",                     "src": "isort",             "tests": "tests", "install": "pytest hypothesis black libcst hypothesmith -e ."},
+  {"name": "isort",          "repo": "https://github.com/PyCQA/isort",                     "src": "isort",             "tests": "tests", "install": "pytest hypothesis black libcst hypothesmith colorama -e ."},
   {"name": "prettytable",    "repo": "https://github.com/jazzband/prettytable",            "src": "src/prettytable",    "tests": "tests", "install": "pytest -e '.[tests]'"},
   {"name": "environs",       "repo": "https://github.com/sloria/environs",                 "src": "src/environs",      "tests": "tests", "install": "pytest marshmallow -e '.[dev]'"},
 
