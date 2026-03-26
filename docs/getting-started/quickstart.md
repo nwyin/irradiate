@@ -4,15 +4,15 @@ Run irradiate on a Python project with an existing pytest test suite.
 
 ## Step 1: Run mutation testing
 
-From the project root:
+From the project root, pass the source directory to mutate:
 
 ```bash
-irradiate run
+irradiate run src
 ```
 
 irradiate will:
 
-1. Parse all `.py` files under `src/` and generate mutants
+1. Parse all `.py` files under the given path and generate mutants
 2. Run one pytest session to map which tests cover which functions
 3. Fork a child process per mutant inside pre-warmed workers
 4. Print a summary
