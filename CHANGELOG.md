@@ -2,7 +2,7 @@
 
 All notable changes to irradiate are documented here.
 
-## 0.3.0 — 2026-03-26 (unreleased)
+## 0.3.0 — 2026-03-26
 
 ### Features
 
