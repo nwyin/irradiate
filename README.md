@@ -13,7 +13,7 @@ irradiate keeps a pool of pre-warmed pytest workers. Pytest starts once, collect
 
 ## How it works
 
-1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (28+ mutation operator categories including regex patterns)
+1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (40 mutation operator categories including regex patterns)
 2. Generate trampolined mutants: each function gets an original, N mutated variants, and a runtime dispatcher
 3. Collect test coverage and timing in a single pytest run
 4. Fork a child process per mutant inside pre-warmed workers (no pytest restart)
@@ -101,7 +101,7 @@ All settings can be overridden via CLI flags. Run `irradiate run --help` for the
 
 ## Features
 
-### Mutation operators (28+ categories)
+### Mutation operators (40 categories)
 
 Arithmetic, comparison, boolean, augmented assignment, unary, string mutation/emptying, number literals, constant replacement, lambda bodies, return values, assignments, default arguments, argument removal, method swaps, dict kwargs, exception types, match/case removal, condition negation, condition replacement, statement deletion, keyword swap, loop mutation, ternary swap, slice index removal, regex pattern mutations (11 operators: anchor removal, charclass negation, shorthand negation, quantifier removal/change, lookaround negation, alternation removal, and more).
 
@@ -152,7 +152,7 @@ Auto-detects GitHub Actions and emits inline `::warning` annotations on survived
 
 ### Performance tuning
 
-Parallelism defaults to CPU count (`--workers N` to override). Workers are recycled automatically to limit memory growth, tunable with `--worker-recycle-after N` and `--max-worker-memory N`. `--covered-only` skips mutants with no test coverage. `--no-stats` skips coverage collection when you want to test all mutants against all tests. Per-mutant timeout defaults to 10x baseline (`--timeout-multiplier N`).
+Parallelism defaults to CPU count (`--workers N` to override). Workers are recycled when RSS exceeds `--max-worker-memory N` MB. `--covered-only` skips mutants with no test coverage. `--no-stats` skips coverage collection when you want to test all mutants against all tests. Per-mutant timeout defaults to 10x baseline (`--timeout-multiplier N`).
 
 ## How it compares to mutmut
 
@@ -160,7 +160,7 @@ Parallelism defaults to CPU count (`--workers N` to override). Workers are recyc
 |---|---|---|
 | **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant, pytest starts once |
 | **Parser** | LibCST (Python) | tree-sitter (Rust, parallel) |
-| **Operators** | ~20 categories | 28+ categories (incl. regex) |
+| **Operators** | ~20 categories | 40 categories (incl. 13 regex) |
 | **Cache** | mtime-based | Content-addressable (SHA-256) |
 | **Orchestration** | Python multiprocessing | Rust + tokio async |
 | **Incremental** | no | `--diff` with merge-base |

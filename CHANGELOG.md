@@ -2,6 +2,39 @@
 
 All notable changes to irradiate are documented here.
 
+## 0.3.0 — 2026-03-26 (unreleased)
+
+### Features
+
+- **Trampoline-free stats collection** — `sys.monitoring` (Python 3.12+) or `sys.settrace` (3.10-3.11) replaces the trampoline-based stats plugin. Tests run against original unmodified source during coverage collection, eliminating import hook overhead and trampoline artifacts. Faster, more reliable, and compatible with more projects.
+- **Regex mutation operators** — 11 new operators targeting regex patterns: anchor removal, character class negation, quantifier boundary changes, group simplification, alternation removal, escape removal, lookahead removal, dot-to-literal, and more.
+- **`constant_replacement` operator** — replaces numeric constants with 0 and their negation (`n → 0`, `n → -n`).
+- **Per-operator kill rates** — terminal summary now shows mutation score broken down by operator category, making it easy to see which operators produce the most survivors.
+- **`--no-cache` flag** — bypass the result cache for a clean run.
+- **`--stats-timeout` flag** — configurable timeout for stats collection (default 300s), useful for large test suites.
+- **Grouped survivor output** — survived mutants are grouped by operator in terminal output for easier triage.
+
+### Performance
+
+- **Removed count-based worker recycling** — under the fork-per-mutant model, workers never execute test code, so state leakage is impossible. Removing recycling eliminates ~500ms respawn overhead that previously triggered every 20 mutants when session-scoped fixtures were detected. On real-world projects: throughput on slow mutants improved from ~6.5/s to ~15-16/s.
+- **Prescan import hook** — reduces per-import overhead by pre-scanning which modules have mutated files.
+
+### Compatibility
+
+Ran irradiate against 87 open-source Python projects via a new compatibility sweep. Fixed 20+ issues discovered:
+
+- Preserve `@property` setters when getter is trampolined.
+- Skip regex mutations on f-strings to avoid SyntaxError.
+- Handle ternary expressions in `with` clauses and walrus operator contexts.
+- String-aware parameter splitting for functions with default string arguments containing commas/parens.
+- Copy non-Python data files (`.txt`, `.json`, `.grammar`) to mutants directory for packages that locate data via `__file__`.
+- Filter comment nodes from ternary children to prevent garbled mutations.
+- Drain stderr in background thread to prevent pipe-buffer deadlock on large pytest output.
+- Preserve lambda defaults during annotation stripping.
+- Tab-indent support for projects not using spaces.
+- Strip annotations from wrapper functions, skip `_getframe` and `__init_subclass__`.
+- Surface pytest collection errors with actionable messages instead of silent hangs.
+
 ## 0.2.0 — 2026-03-23
 
 ### Features

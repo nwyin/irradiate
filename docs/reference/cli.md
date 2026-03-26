@@ -37,7 +37,6 @@ irradiate run [OPTIONS] [MUTANT_NAMES]...
 | `--no-stats` | flag | -- | Skip coverage collection; test all mutants against all tests |
 | `--covered-only` | flag | -- | Skip mutants with no test coverage |
 | `--python` | path | `"python3"` | Python interpreter |
-| `--worker-recycle-after` | int | auto | Respawn workers after N mutants (0 to disable) |
 | `--max-worker-memory` | int | `0` | Recycle workers exceeding this RSS in MB (0 = off) |
 | `--isolate` | flag | -- | Fresh subprocess per mutant (slower, fully isolated) |
 | `--verify-survivors` | flag | -- | Re-test survivors in isolate mode after main run |
@@ -48,6 +47,7 @@ irradiate run [OPTIONS] [MUTANT_NAMES]...
 | `--sample` | float | -- | Random mutant sample. 0.0-1.0 = fraction, >1 = count |
 | `--sample-seed` | int | `0` | RNG seed for `--sample` (deterministic by default) |
 | `--no-cache` | flag | -- | Ignore cached results; re-test all mutants from scratch |
+| `--stats-timeout` | int | `300` | Timeout in seconds for stats collection. Increase for large test suites. |
 | `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation |
 
 ### Examples
@@ -80,6 +80,8 @@ irradiate results [OPTIONS]
 |------|-------------|
 | `--all` | Show all mutants (default: survived only) |
 | `--json` | Output as JSON |
+| `--report` | Generate report: `json` or `html` |
+| `-o, --output` | Report output path |
 
 
 ## `irradiate show`
