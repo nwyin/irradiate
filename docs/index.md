@@ -28,7 +28,7 @@ For a complete walkthrough, see the [Quick Start guide](getting-started/quicksta
 ## Features
 
 - **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
-- **27 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, and more.
+- **38 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, and more.
 - **Incremental** — `--diff main` tests only functions changed since a git ref.
 - **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
 - **CI-ready** — `--fail-under 80` for gating, GitHub Actions annotations, JSON and HTML reports.

@@ -2,22 +2,24 @@
 
 [![PyPI](https://img.shields.io/pypi/v/irradiate)](https://pypi.org/project/irradiate/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-nwyin.github.io%2Firradiate-blue)](https://nwyin.github.io/irradiate/)
 
 Fast mutation testing for Python, written in Rust.
 
-## Why
+## What mutation testing catches
 
-Mutation testing is slow. The bottleneck isn't generating mutants, it's running the test suite once per mutant. A typical pytest startup costs 200-500ms, and with hundreds of mutants that adds up to minutes of pure overhead.
+[Mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) works by making small, deliberate changes to your code — like flipping a `<` to `<=`, swapping `True` for `False`, or replacing `+` with `-` — and then running your tests against each change. If a test fails, great: your tests caught the bug. If every test still passes, that's a gap — you have code that can break without any test noticing.
 
-irradiate keeps a pool of pre-warmed pytest workers. Pytest starts once, collects tests once, then forks a child process for each mutant. 30-60 mutants/sec on real codebases.
+Code coverage tells you which lines ran. Mutation testing tells you which lines are actually *tested*. A function can have 100% line coverage but still have mutants that survive, meaning your tests execute the code without meaningfully checking what it does.
 
-## How it works
+## Highlights
 
-1. Parse Python source with [tree-sitter](https://tree-sitter.github.io/) (40 mutation operator categories including regex patterns)
-2. Generate trampolined mutants: each function gets an original, N mutated variants, and a runtime dispatcher
-3. Collect test coverage and timing in a single pytest run
-4. Fork a child process per mutant inside pre-warmed workers (no pytest restart)
-5. Report results as terminal output, JSON (Stryker schema v2), HTML, or GitHub Actions annotations
+- **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
+- **38 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, and more.
+- **Incremental** — `--diff main` tests only functions changed since a git ref.
+- **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
+- **CI-ready** — `--fail-under 80` for gating, GitHub Actions annotations, JSON and HTML reports.
+- **Drop-in** — works with any pytest project. `pip install irradiate && irradiate run src`.
 
 ## Install
 
@@ -101,7 +103,7 @@ Source paths can also be passed as positional arguments: `irradiate run src/myli
 
 ## Features
 
-### Mutation operators (40 categories)
+### Mutation operators (38 categories)
 
 Arithmetic, comparison, boolean, augmented assignment, unary, string mutation/emptying, number literals, constant replacement, lambda bodies, return values, assignments, default arguments, argument removal, method swaps, dict kwargs, exception types, match/case removal, condition negation, condition replacement, statement deletion, keyword swap, loop mutation, ternary swap, slice index removal, regex pattern mutations (11 operators: anchor removal, charclass negation, shorthand negation, quantifier removal/change, lookaround negation, alternation removal, and more).
 
@@ -160,7 +162,7 @@ Parallelism defaults to CPU count (`--workers N` to override). Workers are recyc
 |---|---|---|
 | **Speed** | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant, pytest starts once |
 | **Parser** | LibCST (Python) | tree-sitter (Rust, parallel) |
-| **Operators** | ~20 categories | 40 categories (incl. 13 regex) |
+| **Operators** | ~20 categories | 38 categories (incl. 11 regex) |
 | **Cache** | mtime-based | Content-addressable (SHA-256) |
 | **Orchestration** | Python multiprocessing | Rust + tokio async |
 | **Incremental** | no | `--diff` with merge-base |

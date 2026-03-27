@@ -4,7 +4,7 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ## irradiate (current)
 
-28 operator categories, ~160+ distinct mutations. Python-specific, operates on tree-sitter CST.
+38 operator categories (27 tree-sitter + 11 regex), ~160+ distinct mutations. Python-specific, operates on tree-sitter CST.
 
 ### Operators implemented
 

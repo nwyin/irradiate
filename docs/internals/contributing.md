@@ -65,7 +65,7 @@ irradiate/
 │   ├── lib.rs                # library root
 │   ├── pipeline.rs           # pipeline conductor (phases 1-5)
 │   ├── mutation.rs           # shared types (Mutation, FunctionMutations)
-│   ├── tree_sitter_mutation.rs # mutation engine (28+ operators)
+│   ├── tree_sitter_mutation.rs # mutation engine (27 operators)
 │   ├── regex_mutation.rs     # regex pattern mutation operators
 │   ├── codegen.rs            # trampolined source file generation
 │   ├── trampoline.rs         # trampoline code generation

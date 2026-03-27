@@ -8,7 +8,7 @@ irradiate is heavily inspired by mutmut and shares its trampoline architecture, 
 | --------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
 | **Execution**         | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant inside pre-warmed workers                             |
 | **Parser**            | LibCST (Python, sequential)              | tree-sitter (Rust, parallel via rayon)                                |
-| **Operators**         | ~20 categories                           | 27 categories                                                         |
+| **Operators**         | ~20 categories                           | 38 categories                                                         |
 | **Cache**             | mtime-based (breaks on rebase, `touch`)  | Content-addressable (SHA-256)                                         |
 | **Orchestration**     | Python multiprocessing                   | Rust + tokio async                                                    |
 | **Incremental**       | --                                       | `--diff` with merge-base resolution                                   |

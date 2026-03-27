@@ -179,7 +179,7 @@ irradiate (Rust binary)
 ├── CLI (clap)
 ├── Mutation Engine
 │   ├── Python parser (tree-sitter + tree-sitter-python)
-│   ├── 28+ mutation operator categories
+│   ├── 38 mutation operator categories (27 tree-sitter + 11 regex)
 │   ├── Regex pattern mutation (regex-syntax crate)
 │   ├── Trampoline code generation (descriptor-aware)
 │   └── Parallel file processing (rayon)
