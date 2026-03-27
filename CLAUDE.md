@@ -46,7 +46,6 @@ The hook runs `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo tes
 - `docs/internals/architecture.md` — module dependency graph, execution pipeline, design rationale
 - `docs/internals/contributing.md` — project structure, layering, pre-release checklist, analysis tools
 - `docs/internals/mutation-operators.md` — cross-framework operator catalog
-- `docs/internals/regex-mutation-plan.md` — regex mutation implementation plan
 - `docs/mutation-pruning.md` — mutation pruning strategies with academic citations
 
 ## Module layering
