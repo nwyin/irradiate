@@ -88,13 +88,13 @@ if [ ! -x "$IRRADIATE_BIN" ]; then
 fi
 
 # ── Result directory ──────────────────────────────────────────────────────
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="${BENCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="$BENCH_DIR/results/${TIMESTAMP}/${TARGET}"
 mkdir -p "$RESULT_DIR"
 echo "Results:       $RESULT_DIR"
 echo
 
-NCPU="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+NCPU="${BENCH_NCPU:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 
 # ── Helper: clean slate ───────────────────────────────────────────────────
 clean_slate() {
@@ -119,6 +119,9 @@ run_config() {
     # /usr/bin/time writes timing info to stderr; -l is macOS, -v is Linux
     local time_flag="-l"
     if /usr/bin/time -v true 2>/dev/null; then time_flag="-v"; fi
+
+    # Brief pause between runs to let OS reclaim memory
+    sleep 2
     {
         /usr/bin/time "$time_flag" "$@" \
             > >(tee "$out") \
@@ -158,6 +161,8 @@ for i in $(seq 1 "$RUNS"); do
                 --python "$PYTHON"
     )
 done
+# Export Stryker JSON report from the last run's cache
+(cd "$PROJECT_DIR" && "$IRRADIATE_BIN" results --report json -o "$RESULT_DIR/${CONFIG}_report.json" 2>/dev/null) || true
 echo
 
 # ── Run irradiate pool (1 worker) ─────────────────────────────────────────
@@ -181,6 +186,7 @@ for i in $(seq 1 "$RUNS"); do
                 --python "$PYTHON"
     )
 done
+(cd "$PROJECT_DIR" && "$IRRADIATE_BIN" results --report json -o "$RESULT_DIR/${CONFIG}_report.json" 2>/dev/null) || true
 echo
 
 # ── Run irradiate isolate ─────────────────────────────────────────────────
@@ -209,29 +215,51 @@ else
                     --python "$PYTHON"
         )
     done
+    (cd "$PROJECT_DIR" && "$IRRADIATE_BIN" results --report json -o "$RESULT_DIR/${CONFIG}_report.json" 2>/dev/null) || true
     echo
 fi
 
-# ── Run mutmut (1 child) ──────────────────────────────────────────────────
-# Skip on CI by default; set BENCH_MUTMUT=1 to force.
-MUTMUT_PYTHON="$BENCH_DIR/.venv/bin/python"
+# ── Run mutmut (N children) ───────────────────────────────────────────
+# Uses `mutmut` entry point (not `python -m mutmut`) to avoid set_start_method bug (#466).
+MUTMUT_BIN="$BENCH_DIR/.venv/bin/mutmut"
 MUTMUT_PATH="$BENCH_DIR/.venv/bin:$PATH"
 BENCH_MUTMUT="${BENCH_MUTMUT:-}"
 if [ -n "${CI:-}" ] && [ "$BENCH_MUTMUT" != "1" ]; then
-    echo "--- mutmut_1c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
-elif [ ! -x "$MUTMUT_PYTHON" ]; then
-    echo "Warning: $MUTMUT_PYTHON not found — skipping mutmut benchmarks." >&2
+    echo "--- mutmut_${NCPU}c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
+elif [ ! -x "$MUTMUT_BIN" ]; then
+    echo "Warning: $MUTMUT_BIN not found — skipping mutmut benchmarks." >&2
     echo "  Run: bash bench/setup.sh" >&2
 else
-    CONFIG="mutmut_1c"
-    echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION)"
-    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_PYTHON" -m mutmut run --max-children 1 )
+    CONFIG="mutmut_${NCPU}c"
+    echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION, $NCPU children)"
+    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_BIN" run --max-children "$NCPU" )
 
     for i in $(seq 1 "$RUNS"); do
         (
             cd "$PROJECT_DIR"
             PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
-                "$MUTMUT_PYTHON" -m mutmut run --max-children 1
+                "$MUTMUT_BIN" run --max-children "$NCPU"
+        )
+    done
+    echo
+fi
+
+# ── Run mutmut (1 child) ─────────────────────────────────────────────
+if [ -n "${CI:-}" ] && [ "$BENCH_MUTMUT" != "1" ]; then
+    echo "--- mutmut_1c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
+elif [ ! -x "$MUTMUT_BIN" ]; then
+    echo "Warning: $MUTMUT_BIN not found — skipping mutmut benchmarks." >&2
+    echo "  Run: bash bench/setup.sh" >&2
+else
+    CONFIG="mutmut_1c"
+    echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION, 1 child)"
+    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_BIN" run --max-children 1 )
+
+    for i in $(seq 1 "$RUNS"); do
+        (
+            cd "$PROJECT_DIR"
+            PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
+                "$MUTMUT_BIN" run --max-children 1
         )
     done
     echo

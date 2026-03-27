@@ -69,17 +69,35 @@ fi
 if [ -d bench/corpora/toolz ]; then
     uv pip install --python bench/.venv/bin/python -e bench/corpora/toolz 2>/dev/null || true
 fi
+if [ -d bench/corpora/click ]; then
+    uv pip install --python bench/.venv/bin/python -e "bench/corpora/click[testing]" 2>/dev/null || true
+fi
+if [ -d bench/corpora/markupsafe ]; then
+    uv pip install --python bench/.venv/bin/python -e bench/corpora/markupsafe 2>/dev/null || true
+fi
+if [ -d bench/corpora/itsdangerous ]; then
+    uv pip install --python bench/.venv/bin/python -e bench/corpora/itsdangerous 2>/dev/null || true
+fi
+if [ -d bench/corpora/more-itertools ]; then
+    uv pip install --python bench/.venv/bin/python -e bench/corpora/more-itertools 2>/dev/null || true
+fi
 
 # Inject [tool.mutmut] config into corpora that lack it (corpora are gitignored shallow clones)
 inject_mutmut_config() {
-    local pyproject="$1" paths="$2" tests="$3"
+    local dir="$1" paths="$2" tests="$3"
+    local pyproject="$dir/pyproject.toml"
+    # mutmut 3.x requires TOML arrays for paths_to_mutate and tests_dir.
     if [ -f "$pyproject" ] && ! grep -q 'tool.mutmut' "$pyproject"; then
-        printf '\n[tool.mutmut]\npaths_to_mutate = "%s"\ntests_dir = "%s"\n' "$paths" "$tests" >> "$pyproject"
+        printf '\n[tool.mutmut]\npaths_to_mutate = ["%s"]\ntests_dir = ["%s"]\n' "$paths" "$tests" >> "$pyproject"
         echo "  Injected [tool.mutmut] into $pyproject"
     fi
 }
-inject_mutmut_config bench/corpora/marshmallow/pyproject.toml "src/marshmallow" "tests"
-inject_mutmut_config bench/corpora/toolz/pyproject.toml       "toolz"           "toolz/tests"
+inject_mutmut_config bench/corpora/marshmallow     "src/marshmallow"    "tests"
+inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests"
+inject_mutmut_config bench/corpora/markupsafe      "src/markupsafe"     "tests"
+inject_mutmut_config bench/corpora/click           "src/click"          "tests"
+inject_mutmut_config bench/corpora/itsdangerous    "src/itsdangerous"   "tests"
+inject_mutmut_config bench/corpora/more-itertools  "more_itertools"     "tests"
 
 # toolz has tests inside the source package; exclude them from mutation
 inject_irradiate_config() {
@@ -127,8 +145,10 @@ setup_vendor_venv() {
 setup_vendor_venv markupsafe  "pytest -e ."
 setup_vendor_venv click       "pytest -e '.[testing]'"
 setup_vendor_venv httpx       "pytest -e ."
-setup_vendor_venv marshmallow "pytest simplejson -e '.[tests]'"
-setup_vendor_venv toolz       "pytest -e ."
+setup_vendor_venv marshmallow     "pytest simplejson -e '.[tests]'"
+setup_vendor_venv toolz           "pytest -e ."
+setup_vendor_venv itsdangerous    "pytest -e ."
+setup_vendor_venv more-itertools  "pytest -e ."
 echo
 
 echo "=== Setup complete ==="

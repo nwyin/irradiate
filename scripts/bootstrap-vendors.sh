@@ -32,5 +32,7 @@ clone_if_missing markupsafe  "https://github.com/pallets/markupsafe"          ||
 clone_if_missing click       "https://github.com/pallets/click"               || true
 clone_if_missing httpx       "https://github.com/encode/httpx"                || true
 clone_if_missing marshmallow "https://github.com/marshmallow-code/marshmallow" || true
-clone_if_missing toolz       "https://github.com/pytoolz/toolz"               || true
+clone_if_missing toolz          "https://github.com/pytoolz/toolz"               || true
+clone_if_missing itsdangerous   "https://github.com/pallets/itsdangerous"        || true
+clone_if_missing more-itertools "https://github.com/more-itertools/more-itertools" || true
 echo "=== Done ==="
