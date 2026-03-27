@@ -35,6 +35,8 @@ irradiate show mylib.x_validate__irradiate_1
 
 For each survivor, decide what to do. If the mutation represents a real bug your tests should catch, write a test. If the mutation is semantically equivalent in your context, add `# pragma: no mutate` to suppress it. Some survivors (e.g., `n` to `n+1` in a non-critical index) may not warrant a test at all.
 
+See [Surviving Mutants](surviving-mutants.md) for detailed guidance on each operator category.
+
 ## Timeouts
 
 A timeout means the mutation created a non-terminating condition, like `while cond:` mutated to `while True:`. Timeouts count as killed because the mutation broke the program.
