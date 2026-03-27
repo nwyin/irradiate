@@ -15,8 +15,8 @@ set -euo pipefail
 
 VM_NAME="irradiate-bench"
 VM_CPUS=4
-VM_MEMORY="8GiB"
-VM_DISK="30GiB"
+VM_MEMORY=8
+VM_DISK=30
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
