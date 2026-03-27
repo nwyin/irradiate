@@ -48,10 +48,10 @@ jobs:
 
       # --- Docs ---
       - name: Install docs dependencies
-        run: uv pip install --system -r requirements-docs.txt
+        run: uv pip install --system -r docs/requirements.txt
 
       - name: Build docs
-        run: mkdocs build --strict || mkdocs build  # --strict may fail until all pages exist
+        run: mkdocs build -f docs/mkdocs.yml --strict || mkdocs build -f docs/mkdocs.yml  # --strict may fail until all pages exist
 
       # --- Report ---
       - name: Set up fixture venv
