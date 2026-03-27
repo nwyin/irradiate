@@ -6,11 +6,10 @@
 irradiate [OPTIONS] <COMMAND>
 ```
 
-| Flag | Description |
-|------|-------------|
+| Flag        | Description   |
+| ----------- | ------------- |
 | `--version` | Print version |
-| `--help` | Print help |
-
+| `--help`    | Print help    |
 
 ## `irradiate run`
 
@@ -22,35 +21,35 @@ irradiate run [OPTIONS] [PATHS]...
 
 ### Arguments
 
-| Argument | Description |
-|----------|-------------|
+| Argument     | Description                                            |
+| ------------ | ------------------------------------------------------ |
 | `[PATHS]...` | Source paths to mutate. If omitted, defaults to `src`. |
 
 ### Options
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--paths-to-mutate` | path | `"src"` | Source directory to mutate (alias for positional `PATHS`) |
-| `--mutant` | string | -- | Specific mutant names to test (repeatable). If omitted, all mutants are tested. |
-| `--tests-dir` | path | `"tests"` | Test directory |
-| `--workers` | int | CPU count | Number of worker processes |
-| `--timeout-multiplier` | float | `10.0` | Per-mutant timeout as multiple of baseline duration |
-| `--no-stats` | flag | -- | Skip coverage collection; test all mutants against all tests |
-| `--covered-only` | flag | -- | Skip mutants with no test coverage |
-| `--python` | path | `"python3"` | Python interpreter |
-| `--max-worker-memory` | int | `0` | Recycle workers exceeding this RSS in MB (0 = off) |
-| `--isolate` | flag | -- | Fresh subprocess per mutant (slower, fully isolated) |
-| `--verify-survivors` | flag | -- | Re-test survivors in isolate mode after main run |
-| `--diff` | string | -- | Only mutate functions changed since this git ref |
-| `--fail-under` | float | -- | Exit 1 if mutation score below this threshold (0-100) |
-| `--report` | string | -- | Generate report: `json` or `html` |
-| `-o, --output` | path | auto | Report output path |
-| `--sample` | float | -- | Random mutant sample. 0.0-1.0 = fraction, >1 = count |
-| `--sample-seed` | int | `0` | RNG seed for `--sample` (deterministic by default) |
-| `--no-cache` | flag | -- | Ignore cached results; re-test all mutants from scratch |
-| `--stats-timeout` | int | `300` | Timeout in seconds for stats collection. Increase for large test suites. |
-| `--worker-timeout` | int | `30` | Timeout in seconds for workers to complete test collection. Increase for projects with slow imports (e.g. `--worker-timeout 120` for tinygrad/torch). |
-| `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc. |
+| Flag                   | Type   | Default     | Description                                                                                                                                           |
+| ---------------------- | ------ | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--paths-to-mutate`    | path   | `"src"`     | Source directory to mutate (alias for positional `PATHS`)                                                                                             |
+| `--mutant`             | string | --          | Specific mutant names to test (repeatable). If omitted, all mutants are tested.                                                                       |
+| `--tests-dir`          | path   | `"tests"`   | Test directory                                                                                                                                        |
+| `--workers`            | int    | CPU count   | Number of worker processes                                                                                                                            |
+| `--timeout-multiplier` | float  | `10.0`      | Per-mutant timeout as multiple of baseline duration                                                                                                   |
+| `--no-stats`           | flag   | --          | Skip coverage collection; test all mutants against all tests                                                                                          |
+| `--covered-only`       | flag   | --          | Skip mutants with no test coverage                                                                                                                    |
+| `--python`             | path   | `"python3"` | Python interpreter                                                                                                                                    |
+| `--max-worker-memory`  | int    | `0`         | Recycle workers exceeding this RSS in MB (0 = off)                                                                                                    |
+| `--isolate`            | flag   | --          | Fresh subprocess per mutant (slower, fully isolated)                                                                                                  |
+| `--verify-survivors`   | flag   | --          | Re-test survivors in isolate mode after main run                                                                                                      |
+| `--diff`               | string | --          | Only mutate functions changed since this git ref                                                                                                      |
+| `--fail-under`         | float  | --          | Exit 1 if mutation score below this threshold (0-100)                                                                                                 |
+| `--report`             | string | --          | Generate report: `json` or `html`                                                                                                                     |
+| `-o, --output`         | path   | auto        | Report output path                                                                                                                                    |
+| `--sample`             | float  | --          | Random mutant sample. 0.0-1.0 = fraction, >1 = count                                                                                                  |
+| `--sample-seed`        | int    | `0`         | RNG seed for `--sample` (deterministic by default)                                                                                                    |
+| `--no-cache`           | flag   | --          | Ignore cached results; re-test all mutants from scratch                                                                                               |
+| `--stats-timeout`      | int    | `300`       | Timeout in seconds for stats collection. Increase for large test suites.                                                                              |
+| `--worker-timeout`     | int    | `30`        | Timeout in seconds for workers to complete test collection. Increase for projects with slow imports (e.g. `--worker-timeout 120` for tinygrad/torch). |
+| `--pytest-args`        | string | --          | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc.                     |
 
 ### Examples
 
@@ -71,7 +70,6 @@ irradiate run --no-cache                         # ignore cache, re-test everyth
 irradiate run --pytest-args "--ignore=tests/e2e" # skip a test directory
 ```
 
-
 ## `irradiate results`
 
 Display results from a previous run.
@@ -80,13 +78,12 @@ Display results from a previous run.
 irradiate results [OPTIONS]
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--all` | Show all mutants (default: survived only) |
-| `--json` | Output as JSON |
-| `--report` | Generate report: `json` or `html` |
-| `-o, --output` | Report output path |
-
+| Flag           | Description                               |
+| -------------- | ----------------------------------------- |
+| `--all`        | Show all mutants (default: survived only) |
+| `--json`       | Output as JSON                            |
+| `--report`     | Generate report: `json` or `html`         |
+| `-o, --output` | Report output path                        |
 
 ## `irradiate show`
 
@@ -96,10 +93,9 @@ Show the diff for a specific mutant.
 irradiate show <MUTANT_NAME>
 ```
 
-| Argument | Description |
-|----------|-------------|
+| Argument        | Description                      |
+| --------------- | -------------------------------- |
 | `<MUTANT_NAME>` | e.g. `mylib.x_func__irradiate_1` |
-
 
 ## `irradiate cache clean`
 
@@ -109,16 +105,15 @@ Remove the local result cache.
 irradiate cache clean
 ```
 
-
 ## Configuration
 
 `run` options can also be set in `pyproject.toml` under `[tool.irradiate]`. CLI flags override config. See [Configuration](../getting-started/configuration.md).
 
 ## Mutant name format
 
-| Python source | Mutant name |
-|--------|-------------|
-| `def add()` in `mylib` | `mylib.x_add__irradiate_1` |
+| Python source              | Mutant name                    |
+| -------------------------- | ------------------------------ |
+| `def add()` in `mylib`     | `mylib.x_add__irradiate_1`     |
 | `class Foo` method `bar()` | `mylib.xǁFooǁbar__irradiate_1` |
 
 The `x_` prefix avoids collisions. The `ǁ` (U+01C1) separator encodes class membership.
