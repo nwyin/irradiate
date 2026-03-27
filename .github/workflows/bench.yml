@@ -52,20 +52,33 @@ jobs:
           BENCH_TARGETS: ${{ inputs.targets }}
           BENCH_MUTMUT: ${{ inputs.mutmut && '1' || '' }}
           BENCH_ISOLATE: ${{ inputs.isolate && '1' || '' }}
+          # Cap parallelism — ubuntu-latest has 4 vCPUs but only 7 GB RAM.
+          # mutmut forks N children that each dirty CoW pages; 2 keeps peak RSS safe.
+          BENCH_NCPU: "2"
         run: bash bench/run_all.sh
 
       - name: Find results directory
+        if: always()
         id: results
         run: |
-          dir=$(ls -td bench/results/*/ | head -1)
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          dir=$(ls -td bench/results/*/ 2>/dev/null | head -1)
+          echo "dir=${dir:-.}" >> "$GITHUB_OUTPUT"
 
       - name: Post summary
-        run: cat "${{ steps.results.outputs.dir }}/aggregate.md" >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+        run: |
+          agg="${{ steps.results.outputs.dir }}/aggregate.md"
+          if [ -f "$agg" ]; then
+            cat "$agg" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Benchmark incomplete" >> "$GITHUB_STEP_SUMMARY"
+            echo "Some targets may have failed. Check artifacts for partial results." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: ${{ steps.results.outputs.dir }}
+          path: bench/results/
           retention-days: 90
