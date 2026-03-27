@@ -84,7 +84,7 @@
   {"name": "celery",        "repo": "https://github.com/celery/celery",                    "src": "celery",            "tests": "t/unit", "install": "pytest cryptography pydantic moto 'boto3>=1.26' dnspython 'azure-storage-blob>=12' 'google-cloud-storage>=2' -e '.[pytest]'"},
   {"name": "sympy",         "repo": "https://github.com/sympy/sympy",                      "src": "sympy",             "tests": "sympy", "install": "pytest mpmath hypothesis -e .", "do_not_mutate": ["sympy/**/tests/*"]},
   {"name": "networkx",      "repo": "https://github.com/networkx/networkx",                "src": "networkx",          "tests": "networkx", "install": "pytest numpy scipy -e .", "do_not_mutate": ["networkx/**/tests/*"]},
-  {"name": "tinygrad",      "repo": "https://github.com/tinygrad/tinygrad",                "src": "tinygrad",          "tests": "test", "install": "pytest numpy -e ."},
+  {"name": "tinygrad",      "repo": "https://github.com/tinygrad/tinygrad",                "src": "tinygrad",          "tests": "test/unit", "install": "pytest numpy -e .", "do_not_mutate": ["tinygrad/runtime/autogen/**"]},
 
   {"name": "pygments",         "repo": "https://github.com/pygments/pygments",                "src": "pygments",           "tests": "tests",            "install": "pytest -e ."},
   {"name": "platformdirs",     "repo": "https://github.com/tox-dev/platformdirs",             "src": "src/platformdirs",   "tests": "tests",            "install": "pytest pytest-mock appdirs -e ."},

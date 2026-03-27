@@ -49,6 +49,7 @@ irradiate run [OPTIONS] [PATHS]...
 | `--sample-seed` | int | `0` | RNG seed for `--sample` (deterministic by default) |
 | `--no-cache` | flag | -- | Ignore cached results; re-test all mutants from scratch |
 | `--stats-timeout` | int | `300` | Timeout in seconds for stats collection. Increase for large test suites. |
+| `--worker-timeout` | int | `30` | Timeout in seconds for workers to complete test collection. Increase for projects with slow imports (e.g. `--worker-timeout 120` for tinygrad/torch). |
 | `--pytest-args` | string | -- | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc. |
 
 ### Examples

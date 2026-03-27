@@ -58,6 +58,9 @@ pub struct RunConfig {
     /// Extra arguments appended to every pytest invocation.
     /// Sourced from `pytest_add_cli_args` in pyproject.toml and/or `--pytest-args` CLI flag.
     pub pytest_add_cli_args: Vec<String>,
+    /// Timeout in seconds for workers to complete test collection and send the ready message.
+    /// Default 30. Increase for projects with slow imports.
+    pub worker_ready_timeout: u64,
 }
 
 #[derive(Debug)]
@@ -365,7 +368,8 @@ async fn phase_stats(
                 bail!(
                     "Stats run failed (exit code 2) — pytest reported collection errors.\n\
                      This usually means test dependencies are missing or test files have import errors.\n\
-                     Run `pytest --co {tests_dir}` to see the specific errors.",
+                     Run `pytest --co {tests_dir}` to see the specific errors.\n\
+                     To skip problematic test files, use: --pytest-args \"--ignore=path/to/broken\"",
                     tests_dir = config.tests_dir,
                 );
             }
@@ -720,6 +724,7 @@ fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
         pythonpath: ctx.pythonpath.clone(),
         max_worker_memory_mb: config.max_worker_memory_mb,
         pytest_add_cli_args: config.pytest_add_cli_args.clone(),
+        worker_ready_timeout: config.worker_ready_timeout,
         ..Default::default()
     }
 }
@@ -2796,6 +2801,7 @@ index 000..abc
             sample: None,
             sample_seed: 0,
             pytest_add_cli_args: vec![],
+            worker_ready_timeout: 30,
         }
     }
 

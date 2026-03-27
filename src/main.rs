@@ -124,6 +124,11 @@ enum Commands {
         /// Example: --pytest-args=-v --pytest-args=--tb=short
         #[arg(long = "pytest-args")]
         pytest_args: Vec<String>,
+
+        /// Timeout in seconds for workers to complete test collection (default: 30).
+        /// Increase for projects with slow imports (e.g. --worker-timeout 120 for tinygrad/torch).
+        #[arg(long, default_value_t = 30)]
+        worker_timeout: u64,
     },
 
     /// Display mutation testing results
@@ -196,6 +201,7 @@ async fn main() -> Result<()> {
             sample,
             sample_seed,
             pytest_args,
+            worker_timeout,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -245,6 +251,7 @@ async fn main() -> Result<()> {
                 sample_seed,
                 stats_timeout,
                 pytest_add_cli_args,
+                worker_ready_timeout: worker_timeout,
             })
             .await
         }

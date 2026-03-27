@@ -45,6 +45,9 @@ pub struct PoolConfig {
     /// Extra arguments appended to every pytest invocation within the worker pool.
     /// Passed to worker processes via the `IRRADIATE_PYTEST_ARGS` env var (JSON array).
     pub pytest_add_cli_args: Vec<String>,
+    /// Timeout in seconds for workers to complete test collection and send the ready message.
+    /// Default 30s. Increase for projects with slow imports (e.g. tinygrad, torch).
+    pub worker_ready_timeout: u64,
 }
 
 impl Default for PoolConfig {
@@ -60,6 +63,7 @@ impl Default for PoolConfig {
             pythonpath: String::new(),
             max_worker_memory_mb: 0,
             pytest_add_cli_args: Vec::new(),
+            worker_ready_timeout: 30,
         }
     }
 }
@@ -658,7 +662,8 @@ impl<'a> DispatchState<'a> {
         let mut buf_reader = BufReader::new(reader);
 
         let mut line = String::new();
-        match timeout(Duration::from_secs(10), buf_reader.read_line(&mut line)).await {
+        let ready_timeout = Duration::from_secs(self.config.worker_ready_timeout);
+        match timeout(ready_timeout, buf_reader.read_line(&mut line)).await {
             Ok(Ok(0)) => {
                 error!(
                     "Worker {worker_id}: disconnected before sending ready message. \
@@ -709,8 +714,10 @@ impl<'a> DispatchState<'a> {
             }
             Err(_) => {
                 error!(
-                    "Worker {worker_id}: timeout reading ready message (10s). \
-                     This usually means test collection is very slow or the worker is stuck."
+                    "Worker {worker_id}: timeout reading ready message ({}s). \
+                     This usually means test collection is very slow or the worker is stuck. \
+                     Try increasing with --worker-timeout (e.g. --worker-timeout 120).",
+                    self.config.worker_ready_timeout,
                 );
             }
         }
