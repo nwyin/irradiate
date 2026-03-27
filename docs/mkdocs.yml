@@ -68,11 +68,11 @@ nav:
     - Comparison: guide/comparison.md
   - Reference:
     - CLI: reference/cli.md
+    - Contributing: internals/contributing.md
   - Internals:
     - Architecture: internals/architecture.md
     - The Trampoline: internals/trampoline.md
     - Mutation Operators: internals/mutation-operators.md
     - Import Hook: internals/import-hook.md
     - Decorators: internals/decorators.md
-    - Contributing: internals/contributing.md
     - Mutation Pruning: internals/mutation-pruning.md
