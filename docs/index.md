@@ -4,19 +4,16 @@ Fast mutation testing for Python, written in Rust.
 
 ## What mutation testing catches
 
-Your code has `if n < 0`. Your tests pass. But what if it were `if n <= 0`? Would any test fail?
+[Mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) works by making small, deliberate changes to your code — like flipping a `<` to `<=`, swapping `True` for `False`, or replacing `+` with `-` — and then running your tests against each change. If a test fails, great: your tests caught the bug. If every test still passes, that's a gap — you have code that can break without any test noticing.
 
-```diff
- def clamp(n, floor=0):
--    if n < floor:
-+    if n <= floor:
-         return floor
-     return n
-```
+Code coverage tells you which lines ran. Mutation testing tells you which lines are actually *tested*. A function can have 100% line coverage but still have mutants that survive, meaning your tests execute the code without meaningfully checking what it does.
 
-Mutation testing answers this by making small changes to your code — swapping operators, removing arguments, negating conditions — and checking whether your tests notice. A mutation that survives means your tests have a blind spot.
+`irradiate` lets you: 
 
-100% line coverage doesn't mean your tests are thorough. Mutation testing tells you where the gaps are.
+- **Add tests where they matter** — surviving mutants point to exact lines and conditions your tests don't verify, so you know precisely where to write the next test.
+- **Tighten weak assertions** — a test that runs the code but only checks `assert result is not None` will let most mutants through. Surviving mutants reveal where you need stricter checks.
+- **Remove tests that aren't pulling their weight** — if a test kills zero mutants that other tests don't already catch, it's redundant. Cut it or replace it with something sharper.
+- **Find code that isn't reachable** — if every mutant in a block survives and no test even exercises it, that code may be dead. Delete it or question why it exists.
 
 ## Quick start
 
