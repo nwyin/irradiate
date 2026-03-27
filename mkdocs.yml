@@ -1,7 +1,7 @@
 site_name: irradiate
 site_description: Mutation testing for Python, written in Rust
-site_url: https://irradiate.dev
-repo_url: https://github.com/tau/irradiate
+site_url: https://nwyin.github.io/irradiate 
+repo_url: https://github.com/nwyin/irradiate
 repo_name: irradiate
 
 theme:
@@ -74,6 +74,8 @@ nav:
     - Understanding Results: guide/understanding-results.md
     - CI Integration: guide/ci-integration.md
     - Comparison: guide/comparison.md
+  - Reference:
+    - CLI: reference/cli.md
   - Internals:
     - Architecture: internals/architecture.md
     - The Trampoline: internals/trampoline.md
@@ -81,7 +83,5 @@ nav:
     - Import Hook: internals/import-hook.md
     - Decorators: internals/decorators.md
     - Contributing: internals/contributing.md
-  - Mutation Pruning: mutation-pruning.md
-  - Reference:
-    - CLI: reference/cli.md
+    - Mutation Pruning: internals/mutation-pruning.md
   - Blog: blog/index.md

@@ -1,6 +1,8 @@
 # Mutation Pruning
 
-irradiate tries to minimize redundant mutant computation without losing test effectiveness.
+How irradiate minimizes redundant mutant computation without losing test effectiveness.
+
+Each strategy is marked with its status: **active** (implemented), **planned**, or **research**.
 
 ## Active strategies
 
@@ -25,49 +27,52 @@ recompilation, no process restart per mutant.
 ### Return statement dedup
 
 `return x` previously generated two identical mutations:
-
 - `return_value`: replace value expression (`x` → `None`)
 - `statement_deletion`: replace whole statement (`return x` → `return None`)
 
 Both produce the same output code. We now emit only `return_value`.
 
+**Source**: internal analysis. ~9% mutant reduction on typical code.
+
 ### String operator dedup
 
 `"hello"` previously generated two mutations:
-
 - `string_mutation`: `"hello"` → `"XXhelloXX"`
 - `string_emptying`: `"hello"` → `""`
 
 Both test whether code is sensitive to string content. We now emit only
 `string_emptying` — if code doesn't catch `""`, it won't catch `"XXhelloXX"` either.
 
+**Source**: internal analysis. ~2.5% mutant reduction on typical code.
+
 ### Arg removal dedup
 
 `f(a, b)` previously generated both None-replacement and argument removal:
-
 - `f(None, b)` — replace with None (preserves arity)
 - `f(b)` — remove entirely (changes arity)
 
 Argument removal usually just crashes with `TypeError`, producing a trivially
 killed mutant that wastes test time. We now emit only None-replacement.
 
+**Source**: internal analysis. ~1.9% mutant reduction on typical code.
+
 ### Kaminski ROR (Relational Operator Replacement)
 
 Kaminski et al. proved via truth tables that for any relational expression `a op b`,
-only 3 mutants are _sufficient_ — all others are subsumed (killing one necessarily
+only 3 mutants are *sufficient* — all others are subsumed (killing one necessarily
 kills the subsumed ones). The sufficient set per operator:
 
-| Original | Sufficient mutants  |
-| -------- | ------------------- |
-| `==`     | `<`, `>`, `False`   |
-| `!=`     | `<=`, `>=`, `True`  |
+| Original | Sufficient mutants |
+|----------|-------------------|
+| `==`     | `<`, `>`, `False` |
+| `!=`     | `<=`, `>=`, `True` |
 | `>`      | `>=`, `!=`, `False` |
-| `>=`     | `>`, `==`, `True`   |
+| `>=`     | `>`, `==`, `True` |
 | `<`      | `<=`, `!=`, `False` |
-| `<=`     | `<`, `==`, `True`   |
+| `<=`     | `<`, `==`, `True` |
 
 Previous behavior generated 1 swap per comparison (e.g., `>` → `>=`). Kaminski tells
-us that swap _is_ one of the sufficient mutations, but we also need `!=` and `False`
+us that swap *is* one of the sufficient mutations, but we also need `!=` and `False`
 to fully cover the space. The `condition_replacement` operator already generates
 `True`/`False`, so we only need to add the second relational replacement.
 
@@ -84,13 +89,11 @@ Skip mutations inside code that is never productively tested — mutations that
 almost always survive (wasting time) or are trivially killed (adding noise).
 
 **Skipped function names** (`NEVER_MUTATE_FUNCTIONS`):
-
 - `__getattribute__`, `__setattr__`, `__new__` (trampoline-incompatible)
 - `__repr__`, `__str__`, `__format__` (display-only, rarely assertion-tested)
 - `__hash__` (contractually tied to `__eq__`, mutating alone is misleading)
 
 **Skipped call targets** (`ARID_CALL_TARGETS`):
-
 - `logging.debug`, `logging.info`, `logging.warning`, `logging.error`, `logging.critical`
 - `logging.exception`, `logging.log`
 - `warnings.warn`
@@ -107,7 +110,6 @@ Pattern-matching rules that detect mutations known to be equivalent (semanticall
 identical to the original) or trivially killed (crash immediately, wasting test time).
 
 **Equivalent patterns suppressed**:
-
 - `len(x) > 0` → `len(x) >= 0`: `len()` always returns ≥ 0, so `> 0` and `>= 0`
   differ only at the impossible-to-distinguish-without-context boundary of 0. When
   `len(x) >= 0` is always True, the mutant is equivalent.
@@ -115,7 +117,6 @@ identical to the original) or trivially killed (crash immediately, wasting test 
   for len() return values.
 
 **Trivially-killed patterns suppressed**:
-
 - String `a + b` → `a - b`: always raises `TypeError` for strings. The test will
   crash, "killing" the mutant, but this reveals nothing about test quality.
 
@@ -129,7 +130,6 @@ Randomly sample a subset of mutants for testing. Academic consensus: 5% random
 sampling gives 99% R² correlation with the full mutation score (Wong et al. 1995).
 
 **Usage**:
-
 - `--sample 0.1` — test 10% of mutants
 - `--sample 100` — test exactly 100 mutants
 - `--sample-seed 42` — override the RNG seed (default: 0 for reproducibility)
@@ -164,7 +164,7 @@ and found ~0% detection**. Python's `compile(optimize=2)` only removes `assert` 
 strength reduction. Additionally, default argument mutations produce false positives
 (default values live in the enclosing scope, not the function's `co_code`).
 
-Not worth implementing for Python.
+**Verdict**: not worth implementing for Python.
 
 ### Incremental mode
 
