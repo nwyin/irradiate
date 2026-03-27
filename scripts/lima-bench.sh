@@ -57,7 +57,7 @@ if ! limactl list --json | grep -q "\"name\":\"$VM_NAME\""; then
         --disk "$VM_DISK" \
         --mount-writable \
         --tty=false \
-        template://default
+        template:default
     echo
 fi
 
