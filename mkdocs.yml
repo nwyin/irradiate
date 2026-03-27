@@ -53,14 +53,6 @@ markdown_extensions:
 
 plugins:
   - search
-  - blog:
-      blog_dir: blog
-      post_date_format: long
-      post_url_format: "{slug}"
-      categories_allowed:
-        - Mutation Testing
-        - Release Notes
-        - Engineering
   - minify:
       minify_html: true
 
@@ -84,4 +76,3 @@ nav:
     - Decorators: internals/decorators.md
     - Contributing: internals/contributing.md
     - Mutation Pruning: internals/mutation-pruning.md
-  - Blog: blog/index.md
