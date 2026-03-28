@@ -89,7 +89,7 @@ if ! vm bash -c "command -v cargo" &>/dev/null; then
 
     # System packages
     vm sudo apt-get update -qq
-    vm sudo apt-get install -y -qq build-essential pkg-config libssl-dev python3.12 python3.12-venv git
+    vm sudo apt-get install -y -qq build-essential pkg-config libssl-dev python3 python3-venv git
 
     # Rust
     vm bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
