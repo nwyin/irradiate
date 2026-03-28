@@ -101,11 +101,15 @@ class TargetData:
 
 def parse_time_file(path: Path) -> tuple[float | None, float | None]:
     """
-    Parse macOS /usr/bin/time -l output.
+    Parse /usr/bin/time output (macOS -l or Linux -v).
 
-    Relevant lines (approximate):
+    macOS format:
         "       4.21 real         0.82 user         0.21 sys"
-        "      51380224  maximum resident set size"
+        "      51380224  maximum resident set size"          (bytes)
+
+    Linux format:
+        "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:18.04"
+        "Maximum resident set size (kbytes): 7503552"        (kbytes)
 
     Returns (wall_secs, peak_rss_mb).
     """
@@ -116,15 +120,28 @@ def parse_time_file(path: Path) -> tuple[float | None, float | None]:
     wall = None
     rss_mb = None
 
-    # Wall-clock time: "   N.NN real" (may also be "N real" without decimals)
+    # macOS: "   N.NN real"
     m = re.search(r"(\d+(?:\.\d+)?)\s+real", text)
     if m:
         wall = float(m.group(1))
 
-    # Peak RSS in bytes: "   NNNNN  maximum resident set size"
-    m = re.search(r"(\d+)\s+maximum resident set size", text)
+    # Linux: "Elapsed (wall clock) time (h:mm:ss or m:ss): H:MM:SS" or "M:SS.ff"
+    m = re.search(r"Elapsed \(wall clock\) time \([^)]+\):\s*(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text)
+    if m:
+        hours = int(m.group(1)) if m.group(1) else 0
+        minutes = int(m.group(2))
+        seconds = float(m.group(3))
+        wall = hours * 3600 + minutes * 60 + seconds
+
+    # macOS: RSS in bytes
+    m = re.search(r"(\d+)\s+maximum resident set size\b(?!\s*\()", text)
     if m:
         rss_mb = int(m.group(1)) / (1024 * 1024)
+
+    # Linux: RSS in kbytes
+    m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text)
+    if m:
+        rss_mb = int(m.group(1)) / 1024
 
     return wall, rss_mb
 
