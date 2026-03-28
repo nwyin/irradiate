@@ -111,12 +111,7 @@ ENV_VARS="export PATH=\"\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH\""
 
 # Nuke any macOS-native .venvs — they contain ARM binaries that can't run in the Linux VM.
 # setup.sh skips venv creation when .venv/ exists, so stale ones from the host block provisioning.
-CLEAN_VENVS="find '$REPO_DIR' -path '*/bench/corpora/*/.venv' -type d -exec rm -rf {} + 2>/dev/null;
-rm -rf '$REPO_DIR/tests/fixtures/simple_project/.venv' \
-       '$REPO_DIR/bench/targets/synth/.venv' \
-       '$REPO_DIR/bench/.venv' \
-       '$REPO_DIR/vendor/mutmut/e2e_projects/my_lib/.venv' 2>/dev/null;
-true"
+CLEAN_VENVS="find '$REPO_DIR' -path '*/.venv' -type d -exec rm -rf {} + 2>/dev/null; true"
 
 BENCH_CMD="cd '$REPO_DIR' && $CLEAN_VENVS && bash bench/setup.sh && "
 

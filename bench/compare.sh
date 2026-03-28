@@ -267,7 +267,7 @@ fi
 
 # ── Generate summary ──────────────────────────────────────────────────────
 echo "=== Generating summary ==="
-uv run --python 3.12 "$BENCH_DIR/summarize.py" \
+uv run --no-project --python 3.12 "$BENCH_DIR/summarize.py" \
     "$RESULT_DIR" \
     --target "$TARGET" \
     --ncpu "$NCPU" \

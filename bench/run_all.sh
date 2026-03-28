@@ -75,7 +75,7 @@ echo ""
 echo "================================================================"
 echo "  AGGREGATE REPORT"
 echo "================================================================"
-uv run --python 3.12 "$ROOT/bench/summarize.py" \
+uv run --no-project --python 3.12 "$ROOT/bench/summarize.py" \
     "$RESULTS_ROOT" \
     --aggregate
 
