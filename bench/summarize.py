@@ -125,13 +125,15 @@ def parse_time_file(path: Path) -> tuple[float | None, float | None]:
     if m:
         wall = float(m.group(1))
 
-    # Linux: "Elapsed (wall clock) time (h:mm:ss or m:ss): H:MM:SS" or "M:SS.ff"
-    m = re.search(r"Elapsed \(wall clock\) time \([^)]+\):\s*(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text)
+    # Linux: "Elapsed (wall clock) time (h:mm:ss or m:ss): H:MM:SS.ff" or "M:SS.ff"
+    # Examples: "1:23:45.67", "12:34.56", "0:00.02"
+    m = re.search(r"Elapsed \(wall clock\) time \([^)]+\):\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
     if m:
-        hours = int(m.group(1)) if m.group(1) else 0
-        minutes = int(m.group(2))
-        seconds = float(m.group(3))
-        wall = hours * 3600 + minutes * 60 + seconds
+        wall = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    else:
+        m = re.search(r"Elapsed \(wall clock\) time \([^)]+\):\s*(\d+):(\d+(?:\.\d+)?)", text)
+        if m:
+            wall = int(m.group(1)) * 60 + float(m.group(2))
 
     # macOS: RSS in bytes
     m = re.search(r"(\d+)\s+maximum resident set size\b(?!\s*\()", text)

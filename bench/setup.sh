@@ -5,6 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MUTMUT_VERSION="${MUTMUT_VERSION:-3.5.0}"
+# Portable Python: prefer python3.12 but fall back to python3
+BENCH_PYTHON="${BENCH_PYTHON:-$(command -v python3.12 2>/dev/null || command -v python3)}"
 cd "$ROOT"
 
 echo "=== irradiate benchmark setup ==="
@@ -21,7 +23,7 @@ echo
 echo "[2/7] Setting up tests/fixtures/simple_project/.venv..."
 cd tests/fixtures/simple_project
 if [ ! -d .venv ]; then
-    uv venv --python python3.12 --seed
+    uv venv --python "$BENCH_PYTHON" --seed
 fi
 uv pip install --python .venv/bin/python pytest
 cd "$ROOT"
@@ -32,7 +34,7 @@ echo "[3/7] Setting up vendor/mutmut/e2e_projects/my_lib/.venv..."
 if [ -d vendor/mutmut/e2e_projects/my_lib ]; then
     cd vendor/mutmut/e2e_projects/my_lib
     if [ ! -d .venv ]; then
-        uv venv --python python3.12 --seed
+        uv venv --python "$BENCH_PYTHON" --seed
     fi
     uv pip install --python .venv/bin/python pytest pytest-asyncio hatchling
     uv pip install --python .venv/bin/python -e .
@@ -46,7 +48,7 @@ echo
 echo "[4/7] Setting up bench/targets/synth/.venv..."
 cd bench/targets/synth
 if [ ! -d .venv ]; then
-    uv venv --python python3.12 --seed
+    uv venv --python "$BENCH_PYTHON" --seed
 fi
 uv pip install --python .venv/bin/python pytest hatchling
 uv pip install --python .venv/bin/python -e .
@@ -58,7 +60,7 @@ echo
 # This venv also gets the synth package installed so mutmut can run its tests.
 echo "[5/7] Setting up bench/.venv (mutmut==$MUTMUT_VERSION for benchmark comparison)..."
 if [ ! -d bench/.venv ]; then
-    uv venv bench/.venv --python python3.12 --seed
+    uv venv bench/.venv --python "$BENCH_PYTHON" --seed
 fi
 uv pip install --python bench/.venv/bin/python "mutmut==$MUTMUT_VERSION" pytest hatchling simplejson
 uv pip install --python bench/.venv/bin/python -e bench/targets/synth
@@ -125,30 +127,26 @@ echo "[7/7] Setting up venvs for vendor corpora..."
 
 setup_vendor_venv() {
     local name="$1"
-    local install_args="$2"
+    shift
     local vdir="$ROOT/bench/corpora/$name"
     if [ ! -d "$vdir" ]; then
         echo "  $name not found (clone may have failed) — skipping venv"
         return 0
     fi
-    if [ ! -d "$vdir/.venv" ]; then
-        echo "  Setting up $name venv..."
-        (cd "$vdir" && uv venv --python python3.12)
-        # shellcheck disable=SC2086
-        (cd "$vdir" && uv pip install $install_args) \
-            || echo "  WARNING: $name install failed — venv may be incomplete"
-    else
-        echo "  $name .venv already present, skipping"
-    fi
+    echo "  Setting up $name venv..."
+    (cd "$vdir" && uv venv --python "$BENCH_PYTHON")
+    # Pass remaining args directly to uv pip install (no shell expansion issues)
+    (cd "$vdir" && uv pip install "$@") \
+        || echo "  WARNING: $name install failed — venv may be incomplete"
 }
 
-setup_vendor_venv markupsafe  "pytest -e ."
-setup_vendor_venv click       "pytest -e '.[testing]'"
-setup_vendor_venv httpx       "pytest -e ."
-setup_vendor_venv marshmallow     "pytest simplejson -e '.[tests]'"
-setup_vendor_venv toolz           "pytest -e ."
-setup_vendor_venv itsdangerous    "pytest -e ."
-setup_vendor_venv more-itertools  "pytest -e ."
+setup_vendor_venv markupsafe      pytest -e .
+setup_vendor_venv click           pytest -e ".[testing]"
+setup_vendor_venv httpx           pytest -e .
+setup_vendor_venv marshmallow     pytest simplejson -e ".[tests]"
+setup_vendor_venv toolz           pytest -e .
+setup_vendor_venv itsdangerous    pytest freezegun -e .
+setup_vendor_venv more-itertools  pytest -e .
 echo
 
 echo "=== Setup complete ==="
