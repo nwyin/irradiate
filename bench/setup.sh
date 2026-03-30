@@ -135,9 +135,11 @@ setup_vendor_venv() {
     fi
     echo "  Setting up $name venv..."
     (cd "$vdir" && uv venv --python "$BENCH_PYTHON")
-    # Pass remaining args directly to uv pip install (no shell expansion issues)
+    # Install pytest first (always needed), then project deps separately so a
+    # build failure in the project doesn't prevent pytest from being available.
+    (cd "$vdir" && uv pip install pytest)
     (cd "$vdir" && uv pip install "$@") \
-        || echo "  WARNING: $name install failed — venv may be incomplete"
+        || echo "  WARNING: $name project install had errors — tests may still work"
 }
 
 setup_vendor_venv markupsafe      pytest -e .
