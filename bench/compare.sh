@@ -166,35 +166,37 @@ done
 echo
 
 # ── Run irradiate pool (1 worker) ─────────────────────────────────────────
-CONFIG="irradiate_pool_1w"
-echo "--- $CONFIG ---"
-warmup_run "$CONFIG" \
-    "$IRRADIATE_BIN" run \
-        --paths-to-mutate "$PATHS_TO_MUTATE" \
-        --tests-dir "$TESTS_DIR" \
-        --workers 1 \
-        --python "$PYTHON"
+# Skipped by default — slow ablation config. Set BENCH_1W=1 to enable.
+if [ "${BENCH_1W:-}" = "1" ]; then
+    CONFIG="irradiate_pool_1w"
+    echo "--- $CONFIG ---"
+    warmup_run "$CONFIG" \
+        "$IRRADIATE_BIN" run \
+            --paths-to-mutate "$PATHS_TO_MUTATE" \
+            --tests-dir "$TESTS_DIR" \
+            --workers 1 \
+            --python "$PYTHON"
 
-for i in $(seq 1 "$RUNS"); do
-    (
-        cd "$PROJECT_DIR"
-        run_config "$CONFIG" "$i" \
-            "$IRRADIATE_BIN" run \
-                --paths-to-mutate "$PATHS_TO_MUTATE" \
-                --tests-dir "$TESTS_DIR" \
-                --workers 1 \
-                --python "$PYTHON"
-    )
-done
-(cd "$PROJECT_DIR" && "$IRRADIATE_BIN" results --report json -o "$RESULT_DIR/${CONFIG}_report.json" 2>/dev/null) || true
-echo
+    for i in $(seq 1 "$RUNS"); do
+        (
+            cd "$PROJECT_DIR"
+            run_config "$CONFIG" "$i" \
+                "$IRRADIATE_BIN" run \
+                    --paths-to-mutate "$PATHS_TO_MUTATE" \
+                    --tests-dir "$TESTS_DIR" \
+                    --workers 1 \
+                    --python "$PYTHON"
+        )
+    done
+    (cd "$PROJECT_DIR" && "$IRRADIATE_BIN" results --report json -o "$RESULT_DIR/${CONFIG}_report.json" 2>/dev/null) || true
+    echo
+else
+    echo "--- irradiate_pool_1w --- (skipped — set BENCH_1W=1 to enable)" >&2
+fi
 
 # ── Run irradiate isolate ─────────────────────────────────────────────────
-# Isolate mode spawns a fresh subprocess per mutant — very slow on CI.
-# Skipped on CI by default; set BENCH_ISOLATE=1 to force.
-if [ -n "${CI:-}" ] && [ "${BENCH_ISOLATE:-}" != "1" ]; then
-    echo "--- irradiate_isolate --- (skipped on CI — set BENCH_ISOLATE=1 to enable)" >&2
-else
+# Skipped by default — slow ablation config. Set BENCH_ISOLATE=1 to enable.
+if [ "${BENCH_ISOLATE:-}" = "1" ]; then
     CONFIG="irradiate_isolate"
     echo "--- $CONFIG ---"
     warmup_run "$CONFIG" \
@@ -245,24 +247,26 @@ else
 fi
 
 # ── Run mutmut (1 child) ─────────────────────────────────────────────
-if [ -n "${CI:-}" ] && [ "$BENCH_MUTMUT" != "1" ]; then
-    echo "--- mutmut_1c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
-elif [ ! -x "$MUTMUT_BIN" ]; then
-    echo "Warning: $MUTMUT_BIN not found — skipping mutmut benchmarks." >&2
-    echo "  Run: bash bench/setup.sh" >&2
-else
-    CONFIG="mutmut_1c"
-    echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION, 1 child)"
-    ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_BIN" run --max-children 1 )
+# Skipped by default. Set BENCH_MUTMUT_1C=1 to enable.
+if [ "${BENCH_MUTMUT_1C:-}" = "1" ]; then
+    if [ ! -x "$MUTMUT_BIN" ]; then
+        echo "Warning: $MUTMUT_BIN not found — skipping mutmut 1c." >&2
+    else
+        CONFIG="mutmut_1c"
+        echo "--- $CONFIG --- (mutmut $MUTMUT_VERSION, 1 child)"
+        ( cd "$PROJECT_DIR" && PATH="$MUTMUT_PATH" warmup_run "$CONFIG" "$MUTMUT_BIN" run --max-children 1 )
 
-    for i in $(seq 1 "$RUNS"); do
-        (
-            cd "$PROJECT_DIR"
-            PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
-                "$MUTMUT_BIN" run --max-children 1
-        )
-    done
-    echo
+        for i in $(seq 1 "$RUNS"); do
+            (
+                cd "$PROJECT_DIR"
+                PATH="$MUTMUT_PATH" run_config "$CONFIG" "$i" \
+                    "$MUTMUT_BIN" run --max-children 1
+            )
+        done
+        echo
+    fi
+else
+    echo "--- mutmut_1c --- (skipped — set BENCH_MUTMUT_1C=1 to enable)" >&2
 fi
 
 # ── Generate summary ──────────────────────────────────────────────────────
