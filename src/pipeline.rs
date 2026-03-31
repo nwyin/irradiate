@@ -140,7 +140,7 @@ fn sample_mutants(
 /// Checks that paths exist and Python/pytest are usable before doing any work,
 /// so the user gets a clear error message immediately rather than after mutation
 /// generation completes.
-fn validate_environment(config: &RunConfig) -> Result<()> {
+fn validate_environment(config: &RunConfig) -> Result<(u32, u32)> {
     // Check that --paths-to-mutate entries exist.
     if config.paths_to_mutate.is_empty() {
         bail!("--paths-to-mutate: at least one path is required");
@@ -156,34 +156,45 @@ fn validate_environment(config: &RunConfig) -> Result<()> {
         bail!("--tests-dir path '{}' does not exist", config.tests_dir);
     }
 
-    // Check that --python is executable.
-    let python_ok = std::process::Command::new(&config.python)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !python_ok {
-        bail!(
-            "Python interpreter '{}' not found. Set --python to a valid Python path.",
-            config.python.display()
-        );
-    }
+    // Single subprocess: check Python works, pytest is importable, and get version.
+    // This replaces 3 separate subprocess calls (~50-80ms each).
+    let output = std::process::Command::new(&config.python)
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}'); import pytest"])
+        .output();
 
-    // Check that pytest is importable.
-    let pytest_ok = std::process::Command::new(&config.python)
-        .args(["-c", "import pytest"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !pytest_ok {
-        bail!(
-            "pytest not found in '{}'. Install with: {} -m pip install pytest",
-            config.python.display(),
-            config.python.display()
-        );
+    match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let parts: Vec<&str> = s.trim().split('.').collect();
+            if parts.len() >= 2 {
+                let major: u32 = parts[0].parse().unwrap_or(3);
+                let minor: u32 = parts[1].parse().unwrap_or(0);
+                Ok((major, minor))
+            } else {
+                Ok((3, 0))
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("No module named") || stderr.contains("ModuleNotFoundError") {
+                bail!(
+                    "pytest not found in '{}'. Install with: {} -m pip install pytest",
+                    config.python.display(),
+                    config.python.display()
+                );
+            }
+            bail!(
+                "Python interpreter '{}' not found or failed. Set --python to a valid Python path.",
+                config.python.display()
+            );
+        }
+        Err(_) => {
+            bail!(
+                "Python interpreter '{}' not found. Set --python to a valid Python path.",
+                config.python.display()
+            );
+        }
     }
-
-    Ok(())
 }
 
 /// Shared context threaded through pipeline phases.
@@ -278,6 +289,7 @@ async fn phase_stats(
     ctx: &mut PipelineCtx,
     total_mutants: usize,
     has_mutants: bool,
+    python_version: (u32, u32),
 ) -> Result<(Option<TestStats>, Option<crate::orchestrator::PreSpawnedPool>)> {
     // Pre-spawn workers before stats so they boot (~480ms) in parallel with
     // stats collection (~3-4s).
@@ -319,8 +331,8 @@ async fn phase_stats(
         } else {
             // Use fast stats (sys.monitoring / sys.settrace) on Python 3.10+,
             // fall back to trampoline-based stats on older Pythons.
-            let use_fast_stats = stats::python_version(&config.python)
-                .is_some_and(|(major, minor)| major >= 3 && minor >= 10);
+            let (major, minor) = python_version;
+            let use_fast_stats = major >= 3 && minor >= 10;
 
             if use_fast_stats {
                 eprintln!("Running stats collection...");
@@ -731,7 +743,7 @@ fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
 
 /// Run the full mutation testing pipeline.
 pub async fn run(config: RunConfig) -> Result<()> {
-    validate_environment(&config)?;
+    let python_version = validate_environment(&config)?;
 
     let project_dir = std::env::current_dir()?;
     let mutants_dir = project_dir.join("mutants");
@@ -754,7 +766,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Phase 2: Stats + validation (+ pre-spawn workers)
     let (test_stats, pre_spawned) =
-        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty()).await?;
+        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty(), python_version).await?;
 
     // Phase 3+4: Schedule + execute
     let start = Instant::now();
