@@ -295,7 +295,10 @@ async fn phase_stats(
     // stats collection (~3-4s).
     let pre_spawned = if !config.isolate && !config.no_stats {
         let pool_config = build_pool_config(config, ctx);
-        let num_workers = config.workers.min(total_mutants);
+        // Don't spawn more workers than mutants. Each worker costs ~480ms to
+        // start (Python + pytest collection), so for small mutant counts we
+        // also cap to avoid spending more time on startup than execution.
+        let num_workers = config.workers.min(total_mutants).min(total_mutants.div_ceil(4).max(1));
         match crate::orchestrator::pre_spawn_pool(&pool_config, &ctx.harness_dir, num_workers) {
             Ok(pool) => Some(pool),
             Err(e) => {
