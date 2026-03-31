@@ -55,29 +55,10 @@ uv pip install --python .venv/bin/python -e .
 cd "$ROOT"
 echo
 
-# ── 5. mutmut venv (benchmark comparison) ────────────────────────────────
-# Default to the current benchmark pin; override with MUTMUT_VERSION if needed.
-# This venv also gets the synth package installed so mutmut can run its tests.
-echo "[5/7] Setting up bench/.venv (mutmut==$MUTMUT_VERSION for benchmark comparison)..."
-if [ ! -d bench/.venv ]; then
-    uv venv bench/.venv --python "$BENCH_PYTHON" --seed
-fi
-uv pip install --python bench/.venv/bin/python "mutmut==$MUTMUT_VERSION" pytest hatchling simplejson
-uv pip install --python bench/.venv/bin/python -e bench/targets/synth
-# Install benchmark corpora + their test deps into mutmut venv so mutmut can run their tests.
-# Each target needs its package installed (editable) plus any test-only deps.
-install_into_mutmut() {
-    local name="$1"; shift
-    if [ -d "bench/corpora/$name" ]; then
-        uv pip install --python bench/.venv/bin/python "$@" 2>/dev/null || true
-    fi
-}
-install_into_mutmut markupsafe      -e bench/corpora/markupsafe
-install_into_mutmut click           -e "bench/corpora/click[testing]"
-install_into_mutmut marshmallow     -e "bench/corpora/marshmallow[tests]"
-install_into_mutmut toolz           -e bench/corpora/toolz
-install_into_mutmut itsdangerous    freezegun -e bench/corpora/itsdangerous
-install_into_mutmut more-itertools  -e bench/corpora/more-itertools
+# ── 5. synth venv extras ─────────────────────────────────────────────────
+# The synth target needs mutmut installed in its own venv for comparison.
+echo "[5/7] Installing mutmut into synth venv..."
+uv pip install --python bench/targets/synth/.venv/bin/python "mutmut==$MUTMUT_VERSION" 2>/dev/null || true
 
 # Inject [tool.mutmut] config into corpora that lack it (corpora are gitignored shallow clones)
 inject_mutmut_config() {
@@ -130,9 +111,9 @@ setup_vendor_venv() {
     fi
     echo "  Setting up $name venv..."
     (cd "$vdir" && uv venv --python "$BENCH_PYTHON")
-    # Install pytest first (always needed), then project deps separately so a
-    # build failure in the project doesn't prevent pytest from being available.
-    (cd "$vdir" && uv pip install pytest)
+    # Install pytest + mutmut first (always needed), then project deps separately
+    # so a build failure in the project doesn't prevent pytest from being available.
+    (cd "$vdir" && uv pip install pytest "mutmut==$MUTMUT_VERSION")
     (cd "$vdir" && uv pip install "$@") \
         || echo "  WARNING: $name project install had errors — tests may still work"
 }

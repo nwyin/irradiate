@@ -222,9 +222,9 @@ if [ "${BENCH_ISOLATE:-}" = "1" ]; then
 fi
 
 # ── Run mutmut (N children) ───────────────────────────────────────────
-# Uses `mutmut` entry point (not `python -m mutmut`) to avoid set_start_method bug (#466).
-MUTMUT_BIN="$BENCH_DIR/.venv/bin/mutmut"
-MUTMUT_PATH="$BENCH_DIR/.venv/bin:$PATH"
+# Uses the target's own venv (mutmut installed per-project to avoid dep conflicts).
+MUTMUT_BIN="$PROJECT_DIR/.venv/bin/mutmut"
+MUTMUT_PATH="$PROJECT_DIR/.venv/bin:$PATH"
 BENCH_MUTMUT="${BENCH_MUTMUT:-}"
 if [ -n "${CI:-}" ] && [ "$BENCH_MUTMUT" != "1" ]; then
     echo "--- mutmut_${NCPU}c --- (skipped on CI — set BENCH_MUTMUT=1 to enable)" >&2
