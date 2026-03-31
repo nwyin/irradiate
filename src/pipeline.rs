@@ -335,28 +335,37 @@ async fn phase_stats(
             let use_fast_stats = major >= 3 && minor >= 10;
 
             if use_fast_stats {
-                eprintln!("Running stats collection...");
+                eprintln!("Running stats collection + trampoline validation...");
                 let fast_pythonpath = build_pythonpath_fast_stats(&ctx.harness_dir, &config.paths_to_mutate);
-                let s = stats::collect_stats_fast(
-                    &config.python, &ctx.project_dir, &fast_pythonpath,
-                    &config.tests_dir, &config.pytest_add_cli_args,
-                    config.stats_timeout,
-                ).with_context(|| format!(
+
+                // Run stats collection and trampoline validation concurrently.
+                // Stats is sync (subprocess), validation is async (subprocess).
+                // They use different PYTHONPATH so they don't conflict.
+                let stats_python = config.python.clone();
+                let stats_project = ctx.project_dir.clone();
+                let stats_tests = config.tests_dir.clone();
+                let stats_args = config.pytest_add_cli_args.clone();
+                let stats_timeout = config.stats_timeout;
+                let stats_handle = tokio::task::spawn_blocking(move || {
+                    stats::collect_stats_fast(
+                        &stats_python, &stats_project, &fast_pythonpath,
+                        &stats_tests, &stats_args, stats_timeout,
+                    )
+                });
+                let validate_fut = validate_fail_run(
+                    &config.python, &ctx.project_dir, &ctx.pythonpath,
+                    &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+                );
+                let (stats_result, validate_result) = tokio::join!(stats_handle, validate_fut);
+                let s = stats_result.unwrap().with_context(|| format!(
                     "Fast stats collection failed (python: {}, tests: {})",
                     config.python.display(), config.tests_dir
                 ))?;
+                validate_result?;
+
                 stats::save_stats_fingerprint(&ctx.project_dir, &config.paths_to_mutate, &config.tests_dir);
                 ctx.trace.phase("stats_collection_fast", phase_start, None);
                 eprintln!("  done in {:.0}ms", start.elapsed().as_millis());
-
-                // Fast stats doesn't validate the trampoline — do it separately.
-                eprintln!("Running trampoline validation...");
-                let val_start = Instant::now();
-                validate_fail_run(
-                    &config.python, &ctx.project_dir, &ctx.pythonpath,
-                    &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
-                ).await?;
-                eprintln!("  done in {:.0}ms", val_start.elapsed().as_millis());
                 s
             } else {
                 eprintln!("Running stats + validation...");
