@@ -215,6 +215,8 @@ fn spawn_worker(
         .env("IRRADIATE_PYTEST_ARGS", &pytest_args_json)
         // Avoid .pyc writes — workers are short-lived, disk I/O wastes startup time
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        // Pass through profiling dir if set (for perf analysis)
+        .envs(std::env::var("IRRADIATE_PROFILE_DIR").ok().map(|v| ("IRRADIATE_PROFILE_DIR", v)))
         .current_dir(&config.project_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

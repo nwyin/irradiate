@@ -88,6 +88,18 @@ class MutationWorkerPlugin:
         self.current_item_nodeid = None
         self.current_run_reports = []
 
+    def _profile_log(self, mutant_name, start, pre_fork, post_result):  # pragma: no mutate
+        """Write per-mutant timing to profile log if IRRADIATE_PROFILE_DIR is set."""
+        profile_dir = os.environ.get("IRRADIATE_PROFILE_DIR")
+        if not profile_dir:
+            return
+        prep_ms = (pre_fork - start) * 1000
+        total_ms = (post_result - start) * 1000
+        fork_ms = total_ms - prep_ms
+        path = os.path.join(profile_dir, f"worker_{os.getpid()}.log")
+        with open(path, "a") as f:
+            f.write(f"{mutant_name}\t{prep_ms:.1f}\t{fork_ms:.1f}\t{total_ms:.1f}\n")
+
     def _prepare_items(self, test_ids):
         # Preserve order from orchestrator (sorted by duration for fail-fast)
         return [self.items[tid] for tid in test_ids if tid in self.items]
@@ -267,10 +279,7 @@ class MutationWorkerPlugin:
                 pre_fork = time.monotonic()
                 self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
                 post_result = time.monotonic()
-                overhead_ms = (pre_fork - start) * 1000
-                total_ms = (post_result - start) * 1000
-                if os.environ.get("IRRADIATE_PROFILE"):
-                    print(f"[profile] {mutant_name}: prep={overhead_ms:.1f}ms total={total_ms:.1f}ms", file=sys.stderr)
+                self._profile_log(mutant_name, start, pre_fork, post_result)
 
         return True  # Signal to pytest that we handled the run loop
 
