@@ -264,7 +264,13 @@ class MutationWorkerPlugin:
                     )
                     continue
 
+                pre_fork = time.monotonic()
                 self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
+                post_result = time.monotonic()
+                overhead_ms = (pre_fork - start) * 1000
+                total_ms = (post_result - start) * 1000
+                if os.environ.get("IRRADIATE_PROFILE"):
+                    print(f"[profile] {mutant_name}: prep={overhead_ms:.1f}ms total={total_ms:.1f}ms", file=sys.stderr)
 
         return True  # Signal to pytest that we handled the run loop
 
