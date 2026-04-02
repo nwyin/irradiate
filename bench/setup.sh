@@ -63,17 +63,24 @@ uv pip install --python bench/targets/synth/.venv/bin/python "mutmut==$MUTMUT_VE
 # Inject [tool.mutmut] config into corpora that lack it (corpora are gitignored shallow clones)
 inject_mutmut_config() {
     local dir="$1" paths="$2" tests="$3"
+    shift 3
     local pyproject="$dir/pyproject.toml"
     # mutmut 3.x requires TOML arrays for paths_to_mutate and tests_dir.
     if [ -f "$pyproject" ] && ! grep -q 'tool.mutmut' "$pyproject"; then
         printf '\n[tool.mutmut]\npaths_to_mutate = ["%s"]\ntests_dir = ["%s"]\n' "$paths" "$tests" >> "$pyproject"
+        # Append any extra config lines (e.g., test exclusions)
+        for line in "$@"; do
+            printf '%s\n' "$line" >> "$pyproject"
+        done
         echo "  Injected [tool.mutmut] into $pyproject"
     fi
 }
 inject_mutmut_config bench/corpora/marshmallow     "src/marshmallow"    "tests"
-inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests"
+inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests" \
+    'pytest_add_cli_args_test_selection = ["-k", "not test_curried_operator"]'
 inject_mutmut_config bench/corpora/markupsafe      "src/markupsafe"     "tests"
-inject_mutmut_config bench/corpora/click           "src/click"          "tests"
+inject_mutmut_config bench/corpora/click           "src/click"          "tests" \
+    'pytest_add_cli_args_test_selection = ["-k", "not test_global_context_object"]'
 inject_mutmut_config bench/corpora/itsdangerous    "src/itsdangerous"   "tests"
 inject_mutmut_config bench/corpora/more-itertools  "more_itertools"     "tests"
 
