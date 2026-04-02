@@ -66,6 +66,7 @@ nav:
     - Understanding Results: guide/understanding-results.md
     - Surviving Mutants: guide/surviving-mutants.md
     - CI Integration: guide/ci-integration.md
+    - Performance: guide/performance.md
     - Comparison: guide/comparison.md
   - Reference:
     - CLI: reference/cli.md

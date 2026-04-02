@@ -4,11 +4,12 @@
 
 irradiate is heavily inspired by mutmut and shares its trampoline architecture, naming conventions, and config format. The main differences are in execution model and feature set.
 
-|                       | mutmut                                   | irradiate                                                             |
+|                       | mutmut 3.5.0                             | irradiate                                                             |
 | --------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
-| **Execution**         | `pytest.main()` per mutant (~200ms each) | Fork-per-mutant inside pre-warmed workers                             |
+| **Execution**         | Fork-from-parent (zero startup per mutant) | Fork-per-mutant inside pre-warmed worker pool                       |
+| **Test filtering**    | Coverage-based (since 3.x)               | Coverage-based with priority scheduling                               |
 | **Parser**            | LibCST (Python, sequential)              | tree-sitter (Rust, parallel via rayon)                                |
-| **Operators**         | ~20 categories                           | 38 categories                                                         |
+| **Operators**         | 14 categories                            | 38 categories (27 tree-sitter + 11 regex)                             |
 | **Cache**             | mtime-based (breaks on rebase, `touch`)  | Content-addressable (SHA-256)                                         |
 | **Orchestration**     | Python multiprocessing                   | Rust + tokio async                                                    |
 | **Incremental**       | --                                       | `--diff` with merge-base resolution                                   |
@@ -18,7 +19,7 @@ irradiate is heavily inspired by mutmut and shares its trampoline architecture, 
 | **Isolation**         | Fork only                                | Warm-session + `--isolate` + `--verify-survivors`                     |
 | **Config**            | `[tool.mutmut]`                          | `[tool.irradiate]` (mutmut section accepted with deprecation warning) |
 
-The speedup depends on pytest startup overhead. For projects where pytest takes 200ms+ to start, irradiate is typically 10-50x faster.
+mutmut is faster on small projects with fast test suites (< 500 mutants). irradiate is faster on larger projects where its bounded memory and duration-aware scheduling outweigh the startup overhead, and is more reliable on codebases with pre-existing test failures or macOS environments. See [Performance](performance.md) for detailed benchmarks.
 
 ## Python ecosystem
 
