@@ -60,44 +60,6 @@ echo
 echo "[5/7] Installing mutmut into synth venv..."
 uv pip install --python bench/targets/synth/.venv/bin/python "mutmut==$MUTMUT_VERSION" 2>/dev/null || true
 
-# Inject [tool.mutmut] config into corpora that lack it (corpora are gitignored shallow clones)
-inject_mutmut_config() {
-    local dir="$1" paths="$2" tests="$3"
-    shift 3
-    local pyproject="$dir/pyproject.toml"
-    # mutmut 3.x requires TOML arrays for paths_to_mutate and tests_dir.
-    if [ -f "$pyproject" ] && ! grep -q 'tool.mutmut' "$pyproject"; then
-        printf '\n[tool.mutmut]\npaths_to_mutate = ["%s"]\ntests_dir = ["%s"]\n' "$paths" "$tests" >> "$pyproject"
-        # Append any extra config lines (e.g., test exclusions)
-        for line in "$@"; do
-            printf '%s\n' "$line" >> "$pyproject"
-        done
-        echo "  Injected [tool.mutmut] into $pyproject"
-    fi
-}
-inject_mutmut_config bench/corpora/marshmallow     "src/marshmallow"    "tests"
-inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests" \
-    'pytest_add_cli_args_test_selection = ["-k", "not test_curried_operator"]'
-inject_mutmut_config bench/corpora/markupsafe      "src/markupsafe"     "tests"
-inject_mutmut_config bench/corpora/click           "src/click"          "tests" \
-    'pytest_add_cli_args_test_selection = ["-k", "not test_global_context_object"]'
-inject_mutmut_config bench/corpora/itsdangerous    "src/itsdangerous"   "tests"
-inject_mutmut_config bench/corpora/more-itertools  "more_itertools"     "tests"
-
-# toolz has tests inside the source package; exclude them from mutation
-inject_irradiate_config() {
-    local pyproject="$1"
-    shift
-    if [ -f "$pyproject" ] && ! grep -q 'tool.irradiate' "$pyproject"; then
-        printf '\n[tool.irradiate]\n' >> "$pyproject"
-        for line in "$@"; do
-            printf '%s\n' "$line" >> "$pyproject"
-        done
-        echo "  Injected [tool.irradiate] into $pyproject"
-    fi
-}
-inject_irradiate_config bench/corpora/toolz/pyproject.toml \
-    'do_not_mutate = ["toolz/tests/*", "toolz/sandbox/*"]'
 echo
 
 # ── 6. Bootstrap vendor corpora ───────────────────────────────────────────
@@ -132,6 +94,44 @@ setup_vendor_venv marshmallow     pytest simplejson -e ".[tests]"
 setup_vendor_venv toolz           pytest -e .
 setup_vendor_venv itsdangerous    pytest freezegun -e .
 setup_vendor_venv more-itertools  pytest -e .
+echo
+
+# ── 8. Inject tool configs into corpora ──────────────────────────────────
+# Must happen after bootstrap (step 6) so the pyproject.toml files exist.
+
+inject_mutmut_config() {
+    local dir="$1" paths="$2" tests="$3"
+    shift 3
+    local pyproject="$dir/pyproject.toml"
+    if [ -f "$pyproject" ] && ! grep -q 'tool.mutmut' "$pyproject"; then
+        printf '\n[tool.mutmut]\npaths_to_mutate = ["%s"]\ntests_dir = ["%s"]\n' "$paths" "$tests" >> "$pyproject"
+        for line in "$@"; do
+            printf '%s\n' "$line" >> "$pyproject"
+        done
+        echo "  Injected [tool.mutmut] into $pyproject"
+    fi
+}
+inject_mutmut_config bench/corpora/marshmallow     "src/marshmallow"    "tests"
+inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests" \
+    'pytest_add_cli_args_test_selection = ["-k", "not test_curried_operator"]'
+inject_mutmut_config bench/corpora/markupsafe      "src/markupsafe"     "tests"
+inject_mutmut_config bench/corpora/click           "src/click"          "tests" \
+    'pytest_add_cli_args_test_selection = ["-k", "not test_global_context_object"]'
+inject_mutmut_config bench/corpora/itsdangerous    "src/itsdangerous"   "tests"
+
+inject_irradiate_config() {
+    local pyproject="$1"
+    shift
+    if [ -f "$pyproject" ] && ! grep -q 'tool.irradiate' "$pyproject"; then
+        printf '\n[tool.irradiate]\n' >> "$pyproject"
+        for line in "$@"; do
+            printf '%s\n' "$line" >> "$pyproject"
+        done
+        echo "  Injected [tool.irradiate] into $pyproject"
+    fi
+}
+inject_irradiate_config bench/corpora/toolz/pyproject.toml \
+    'do_not_mutate = ["toolz/tests/*", "toolz/sandbox/*"]'
 echo
 
 echo "=== Setup complete ==="
