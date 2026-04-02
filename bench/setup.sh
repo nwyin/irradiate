@@ -113,7 +113,7 @@ inject_mutmut_config() {
 }
 inject_mutmut_config bench/corpora/marshmallow     "src/marshmallow"    "tests"
 inject_mutmut_config bench/corpora/toolz           "toolz"              "toolz/tests" \
-    'pytest_add_cli_args_test_selection = ["-k", "not test_curried_operator"]'
+    'pytest_add_cli_args_test_selection = ["-k", "not (test_curried_operator or test_curried_namespace)"]'
 inject_mutmut_config bench/corpora/markupsafe      "src/markupsafe"     "tests"
 inject_mutmut_config bench/corpora/click           "src/click"          "tests" \
     'pytest_add_cli_args_test_selection = ["-k", "not test_global_context_object"]'
