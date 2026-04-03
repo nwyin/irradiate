@@ -10,7 +10,7 @@ use crate::cache::MutantCacheDescriptor;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A single type checking error reported by the type checker.
@@ -357,76 +357,216 @@ pub fn diff_errors(
         .collect()
 }
 
+// --- Harness stub ---
+
+/// Generate a minimal `irradiate_harness` stub for the type checker.
+///
+/// Trampolined files import `irradiate_harness`, which only exists at runtime.
+/// This creates a typed stub so the type checker can resolve the import.
+pub fn generate_harness_stub(mutants_dir: &Path) -> Result<()> {
+    let stub_dir = mutants_dir.join("irradiate_harness");
+    std::fs::create_dir_all(&stub_dir)
+        .with_context(|| format!("Failed to create harness stub dir: {}", stub_dir.display()))?;
+
+    let stub_content = r#""""Type stub for irradiate_harness (used during type checking)."""
+from typing import Optional, Set
+
+active_mutant: Optional[str] = None
+
+class ProgrammaticFailException(Exception):
+    pass
+
+def record_hit(func_key: str) -> None: ...
+def get_hits() -> Set[str]: ...
+"#;
+
+    let init_path = stub_dir.join("__init__.py");
+    std::fs::write(&init_path, stub_content)
+        .with_context(|| format!("Failed to write harness stub: {}", init_path.display()))?;
+
+    tracing::debug!("Generated harness stub at {}", init_path.display());
+    Ok(())
+}
+
+// --- Trampoline parsing ---
+
+/// A function found in a trampolined file.
+#[derive(Debug, Clone)]
+struct TrampolineFunction {
+    name: String,
+    start_line: usize, // 1-indexed
+    end_line: usize,    // 1-indexed, inclusive
+}
+
+/// Scan trampolined file content for `def x_*__irradiate_*` functions.
+///
+/// Each function's range extends from its `def` line to the line before the
+/// next `__irradiate_` function definition (or end of file).
+fn parse_trampoline_functions(content: &str) -> Vec<TrampolineFunction> {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    // First pass: collect (name, start_line) for all __irradiate_ defs
+    let mut defs: Vec<(String, usize)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("def ") {
+            continue;
+        }
+        // Extract function name between "def " and "("
+        let after_def = &trimmed[4..];
+        let Some(paren_pos) = after_def.find('(') else {
+            continue;
+        };
+        let name = &after_def[..paren_pos];
+        if !name.contains("__irradiate_") {
+            continue;
+        }
+        defs.push((name.to_string(), i + 1)); // 1-indexed
+    }
+
+    // Second pass: compute end lines
+    let mut functions = Vec::with_capacity(defs.len());
+    for (idx, (name, start)) in defs.iter().enumerate() {
+        let end = if idx + 1 < defs.len() {
+            defs[idx + 1].1 - 1 // line before next __irradiate_ def
+        } else {
+            total // end of file
+        };
+        functions.push(TrampolineFunction {
+            name: name.clone(),
+            start_line: *start,
+            end_line: end,
+        });
+    }
+
+    functions
+}
+
+/// Returns true if the function name is a mutant variant (ends with `__irradiate_N`
+/// where N is one or more digits).
+fn is_mutant_function(name: &str) -> bool {
+    let Some(pos) = name.rfind("__irradiate_") else {
+        return false;
+    };
+    let suffix = &name[pos + "__irradiate_".len()..];
+    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Convert a mutant function name to the corresponding orig function name.
+///
+/// `x_foo__irradiate_3` → `x_foo__irradiate_orig`
+fn orig_function_name(mutant_name: &str) -> String {
+    let pos = mutant_name
+        .rfind("__irradiate_")
+        .expect("mutant_name must contain __irradiate_");
+    format!("{}__irradiate_orig", &mutant_name[..pos])
+}
+
 // --- Map errors to mutants ---
 
-/// Map type check errors to mutant names.
+/// Map type check errors to mutant names using trampoline function line ranges.
 ///
-/// For each error, finds mutants whose function span includes the error line.
-/// The error file path is mapped back from `mutants/` to the source file by
-/// stripping the mutants_dir prefix and comparing to `MutantCacheDescriptor.source_file`.
+/// For each trampolined file:
+/// 1. Parse function line ranges for `x_*__irradiate_*` functions
+/// 2. Assign each error to the function containing its line number
+/// 3. For each mutant function (`__irradiate_N`), compare error messages
+///    against the corresponding `__irradiate_orig` function
+/// 4. Errors present in the mutant but absent in orig are mutation-caused
 ///
-/// Returns deduplicated mutant names.
+/// Returns deduplicated, sorted mutant names that were caught.
 pub fn map_errors_to_mutants(
     errors: &[TypeCheckError],
     descriptors: &[MutantCacheDescriptor],
     mutants_dir: &Path,
 ) -> Vec<String> {
-    let mut matched: HashSet<String> = HashSet::new();
+    // Build lookup: function name (last component of mutant_name) → full mutant_name
+    // e.g. "x_distance__irradiate_1" → "typed_lib.x_distance__irradiate_1"
+    let mut func_to_mutant: HashMap<String, String> = HashMap::new();
+    for desc in descriptors {
+        let func_name = desc
+            .mutant_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&desc.mutant_name);
+        func_to_mutant.insert(func_name.to_string(), desc.mutant_name.clone());
+    }
 
+    // Group errors by file path
+    let mut errors_by_file: HashMap<PathBuf, Vec<&TypeCheckError>> = HashMap::new();
     for error in errors {
-        // Strip mutants_dir prefix to get relative path (e.g. "simple_lib.py")
-        let error_rel = error
-            .file
-            .strip_prefix(mutants_dir)
-            .unwrap_or(&error.file);
+        errors_by_file
+            .entry(error.file.clone())
+            .or_default()
+            .push(error);
+    }
 
-        for desc in descriptors {
-            // Compare: the error's relative path should match the source_file
-            // after normalizing — source_file is like "src/simple_lib.py" but
-            // the mutants dir mirrors the structure, so the error relative path
-            // within mutants/ should match the tail of source_file.
-            if !paths_match(error_rel, &desc.source_file) {
+    let mut caught: HashSet<String> = HashSet::new();
+
+    for (file_path, file_errors) in &errors_by_file {
+        // Resolve the trampolined file path (may be absolute or relative to mutants_dir)
+        let trampoline_path = if file_path.is_absolute() {
+            file_path.clone()
+        } else {
+            mutants_dir.join(file_path)
+        };
+
+        let content = match std::fs::read_to_string(&trampoline_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot read trampolined file {}: {e}",
+                    trampoline_path.display()
+                );
+                continue;
+            }
+        };
+
+        let functions = parse_trampoline_functions(&content);
+
+        // Map each error to its containing function
+        let mut errors_by_func: HashMap<String, Vec<&str>> = HashMap::new();
+        for error in file_errors {
+            for func in &functions {
+                if error.line >= func.start_line && error.line <= func.end_line {
+                    errors_by_func
+                        .entry(func.name.clone())
+                        .or_default()
+                        .push(&error.message);
+                    break;
+                }
+            }
+        }
+
+        // For each mutant function, compare against its orig
+        for (func_name, mutant_msgs) in &errors_by_func {
+            if !is_mutant_function(func_name) {
                 continue;
             }
 
-            // Check if the error line falls within the function's line range.
-            let fn_start = desc.fn_start_line;
-            if fn_start == 0 {
-                continue;
-            }
-            let fn_line_count = desc.function_source.lines().count();
-            let fn_end = fn_start + fn_line_count.saturating_sub(1);
+            let orig_name = orig_function_name(func_name);
+            let orig_msgs: HashSet<&str> = errors_by_func
+                .get(&orig_name)
+                .map(|msgs| msgs.iter().copied().collect())
+                .unwrap_or_default();
 
-            if error.line >= fn_start && error.line <= fn_end {
-                matched.insert(desc.mutant_name.clone());
+            // Errors in mutant but not in orig are mutation-caused
+            let has_new_error = mutant_msgs.iter().any(|msg| !orig_msgs.contains(msg));
+            if has_new_error {
+                if let Some(full_name) = func_to_mutant.get(func_name.as_str()) {
+                    caught.insert(full_name.clone());
+                } else {
+                    tracing::debug!(
+                        "No descriptor found for trampoline function {func_name}"
+                    );
+                }
             }
         }
     }
 
-    let mut result: Vec<String> = matched.into_iter().collect();
+    let mut result: Vec<String> = caught.into_iter().collect();
     result.sort();
     result
-}
-
-/// Check whether an error's relative path (from mutants dir) matches a source file path.
-///
-/// The mutants directory mirrors the source layout, so `simple_lib.py` in mutants/
-/// corresponds to `src/simple_lib.py` (or just `simple_lib.py`) in the source.
-/// We compare by file name and any shared suffix components.
-fn paths_match(error_rel: &Path, source_file: &str) -> bool {
-    let source_path = Path::new(source_file);
-    // Simple case: file names match
-    let error_name = error_rel.file_name().unwrap_or_default();
-    let source_name = source_path.file_name().unwrap_or_default();
-    if error_name != source_name {
-        return false;
-    }
-    // Check that the error path is a suffix of (or equal to) the source path
-    // or vice versa. This handles both "simple_lib.py" matching "src/simple_lib.py"
-    // and "pkg/mod.py" matching "src/pkg/mod.py".
-    let error_str = error_rel.to_string_lossy().replace('\\', "/");
-    let source_str = source_file.replace('\\', "/");
-    source_str.ends_with(&error_str) || error_str.ends_with(&source_str)
 }
 
 /// Extract a human-readable tool name from the type checker spec.
@@ -676,96 +816,175 @@ mod tests {
         assert!(diff.is_empty());
     }
 
-    // --- Mutant mapping ---
+    // --- Trampoline parsing ---
 
     #[test]
-    fn test_map_errors_to_mutants_by_line_range() {
-        let mutants_dir = PathBuf::from("/proj/mutants");
-        let descriptors = vec![
-            MutantCacheDescriptor {
-                mutant_name: "simple_lib.x_add__irradiate_1".into(),
-                source_file: "src/simple_lib.py".into(),
-                fn_start_line: 5,
-                fn_byte_offset: 0,
-                function_source: "def add(a, b):\n    return a + b\n".into(),
-                operator: "binop_swap".into(),
-                start: 20,
-                end: 21,
-                original: "+".into(),
-                replacement: "-".into(),
-            },
-            MutantCacheDescriptor {
-                mutant_name: "simple_lib.x_sub__irradiate_1".into(),
-                source_file: "src/simple_lib.py".into(),
-                fn_start_line: 10,
-                fn_byte_offset: 0,
-                function_source: "def sub(a, b):\n    return a - b\n".into(),
-                operator: "binop_swap".into(),
-                start: 20,
-                end: 21,
-                original: "-".into(),
-                replacement: "+".into(),
-            },
-        ];
+    fn test_parse_trampoline_functions() {
+        let content = "\
+import irradiate_harness as _ih
 
+def _irradiate_trampoline(orig, mutants):
+    pass
+
+def x_add__irradiate_orig(a, b):
+    return a + b
+
+def x_add__irradiate_1(a, b):
+    return a - b
+
+def x_add__irradiate_2(a, b):
+    return None
+
+x_add__irradiate_mutants = {}
+def add(a, b):
+    pass
+";
+        let funcs = parse_trampoline_functions(content);
+        assert_eq!(funcs.len(), 3);
+
+        assert_eq!(funcs[0].name, "x_add__irradiate_orig");
+        assert_eq!(funcs[0].start_line, 6);
+        assert_eq!(funcs[0].end_line, 8); // line before next __irradiate_ def
+
+        assert_eq!(funcs[1].name, "x_add__irradiate_1");
+        assert_eq!(funcs[1].start_line, 9);
+        assert_eq!(funcs[1].end_line, 11);
+
+        assert_eq!(funcs[2].name, "x_add__irradiate_2");
+        assert_eq!(funcs[2].start_line, 12);
+        assert_eq!(funcs[2].end_line, 17); // end of file
+    }
+
+    // --- is_mutant_function ---
+
+    #[test]
+    fn test_is_mutant_function() {
+        assert!(is_mutant_function("x_foo__irradiate_1"));
+        assert!(is_mutant_function("x_foo__irradiate_42"));
+        assert!(!is_mutant_function("x_foo__irradiate_orig"));
+        assert!(!is_mutant_function("x_foo__irradiate_"));
+        assert!(!is_mutant_function("plain_function"));
+        assert!(!is_mutant_function("_irradiate_trampoline"));
+    }
+
+    // --- orig_function_name ---
+
+    #[test]
+    fn test_orig_function_name() {
+        assert_eq!(
+            orig_function_name("x_foo__irradiate_3"),
+            "x_foo__irradiate_orig"
+        );
+        assert_eq!(
+            orig_function_name("x_distance__irradiate_1"),
+            "x_distance__irradiate_orig"
+        );
+    }
+
+    // --- Mutant mapping (trampoline-based) ---
+
+    #[test]
+    fn test_map_errors_catches_mutation_caused_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        // Write a trampolined file
+        let trampoline = "\
+def x_add__irradiate_orig(a: int, b: int) -> int:
+    return a + b
+
+def x_add__irradiate_1(a: int, b: int) -> int:
+    return None
+";
+        std::fs::write(mutants_dir.join("lib.py"), trampoline).unwrap();
+
+        let descriptors = vec![MutantCacheDescriptor {
+            mutant_name: "lib.x_add__irradiate_1".into(),
+            source_file: "src/lib.py".into(),
+            fn_start_line: 1,
+            fn_byte_offset: 0,
+            function_source: "def add(a, b):\n    return a + b\n".into(),
+            operator: "return_none".into(),
+            start: 0,
+            end: 0,
+            original: "a + b".into(),
+            replacement: "None".into(),
+        }];
+
+        // Error on line 5 (inside x_add__irradiate_1), not present in orig
         let errors = vec![TypeCheckError {
-            file: PathBuf::from("/proj/mutants/simple_lib.py"),
-            line: 6,
+            file: mutants_dir.join("lib.py"),
+            line: 5,
             message: "Incompatible return type".into(),
         }];
 
-        let matched = map_errors_to_mutants(&errors, &descriptors, &mutants_dir);
-        assert_eq!(matched, vec!["simple_lib.x_add__irradiate_1"]);
+        let caught = map_errors_to_mutants(&errors, &descriptors, mutants_dir);
+        assert_eq!(caught, vec!["lib.x_add__irradiate_1"]);
     }
 
     #[test]
-    fn test_map_errors_no_match() {
-        let mutants_dir = PathBuf::from("/proj/mutants");
+    fn test_map_errors_ignores_errors_in_orig() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
+
+        // Both orig and mutant have the same error
+        let trampoline = "\
+def x_add__irradiate_orig(a: int, b: int) -> int:
+    return a + b
+
+def x_add__irradiate_1(a: int, b: int) -> int:
+    return a - b
+";
+        std::fs::write(mutants_dir.join("lib.py"), trampoline).unwrap();
+
         let descriptors = vec![MutantCacheDescriptor {
-            mutant_name: "mod.x_f__irradiate_1".into(),
-            source_file: "src/mod.py".into(),
-            fn_start_line: 10,
+            mutant_name: "lib.x_add__irradiate_1".into(),
+            source_file: "src/lib.py".into(),
+            fn_start_line: 1,
             fn_byte_offset: 0,
-            function_source: "def f():\n    pass\n".into(),
-            operator: "noop".into(),
+            function_source: "def add(a, b):\n    return a + b\n".into(),
+            operator: "binop_swap".into(),
             start: 0,
             end: 0,
-            original: "".into(),
-            replacement: "".into(),
+            original: "+".into(),
+            replacement: "-".into(),
         }];
 
-        // Error on line 50 — outside the function range (10-11)
-        let errors = vec![TypeCheckError {
-            file: PathBuf::from("/proj/mutants/mod.py"),
-            line: 50,
-            message: "err".into(),
-        }];
+        // Same error message in both orig (line 2) and mutant (line 5)
+        let errors = vec![
+            TypeCheckError {
+                file: mutants_dir.join("lib.py"),
+                line: 2,
+                message: "Some pre-existing error".into(),
+            },
+            TypeCheckError {
+                file: mutants_dir.join("lib.py"),
+                line: 5,
+                message: "Some pre-existing error".into(),
+            },
+        ];
 
-        let matched = map_errors_to_mutants(&errors, &descriptors, &mutants_dir);
-        assert!(matched.is_empty());
+        let caught = map_errors_to_mutants(&errors, &descriptors, mutants_dir);
+        assert!(caught.is_empty(), "should not catch mutant when error also exists in orig");
     }
 
-    // --- Paths match ---
+    // --- Harness stub ---
 
     #[test]
-    fn test_paths_match_simple() {
-        assert!(paths_match(
-            Path::new("simple_lib.py"),
-            "src/simple_lib.py"
-        ));
-    }
+    fn test_generate_harness_stub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mutants_dir = tmp.path();
 
-    #[test]
-    fn test_paths_match_nested() {
-        assert!(paths_match(
-            Path::new("pkg/mod.py"),
-            "src/pkg/mod.py"
-        ));
-    }
+        generate_harness_stub(mutants_dir).unwrap();
 
-    #[test]
-    fn test_paths_no_match() {
-        assert!(!paths_match(Path::new("other.py"), "src/simple_lib.py"));
+        let init_path = mutants_dir.join("irradiate_harness/__init__.py");
+        assert!(init_path.exists());
+
+        let content = std::fs::read_to_string(&init_path).unwrap();
+        assert!(content.contains("active_mutant"));
+        assert!(content.contains("ProgrammaticFailException"));
+        assert!(content.contains("record_hit"));
+        assert!(content.contains("get_hits"));
     }
 
     // --- Baseline cache round-trip ---

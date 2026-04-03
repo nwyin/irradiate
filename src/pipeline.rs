@@ -309,29 +309,8 @@ fn phase_type_check(
     let tool = crate::type_check::tool_name_from_spec(type_checker_spec);
     eprintln!("Running type checker ({tool})...");
 
-    let cache_dir = crate::cache::cache_dir(&ctx.project_dir);
-
-    // Step 1: Baseline — run type checker on original source (or load from cache).
-    let source_hash = crate::type_check::compute_source_hash(&config.paths_to_mutate)?;
-    let baseline_errors = if let Some(cached) = crate::type_check::load_cached_baseline(&cache_dir, &source_hash) {
-        tracing::debug!("Using cached type check baseline ({} errors)", cached.len());
-        cached
-    } else {
-        let baseline_cmd = crate::type_check::resolve_command(type_checker_spec, &config.paths_to_mutate[0]);
-        match crate::type_check::run_type_checker(&baseline_cmd) {
-            Ok(errors) => {
-                tracing::debug!("Baseline type check: {} errors", errors.len());
-                if let Err(e) = crate::type_check::save_baseline_cache(&cache_dir, &source_hash, &errors) {
-                    tracing::warn!("Failed to save type check baseline cache: {e}");
-                }
-                errors
-            }
-            Err(e) => {
-                eprintln!("  Warning: baseline type check failed ({e}), skipping type check filter");
-                return Ok(vec![]);
-            }
-        }
-    };
+    // Step 1: Generate harness stub so the type checker can resolve `import irradiate_harness`.
+    crate::type_check::generate_harness_stub(&ctx.mutants_dir)?;
 
     // Step 2: Run type checker on mutants directory.
     let mutant_cmd = crate::type_check::resolve_command(type_checker_spec, &ctx.mutants_dir);
@@ -343,19 +322,14 @@ fn phase_type_check(
         }
     };
 
-    // Step 3: Diff — subtract baseline errors.
-    let new_errors = crate::type_check::diff_errors(&mutant_errors, &baseline_errors);
-    tracing::debug!(
-        "Type check: {} mutant errors, {} baseline errors, {} new errors",
-        mutant_errors.len(),
-        baseline_errors.len(),
-        new_errors.len(),
-    );
+    tracing::debug!("Type check: {} errors in mutants directory", mutant_errors.len());
 
-    // Step 4: Map errors to mutant names.
+    // Step 3: Map errors to mutant names using trampoline function analysis.
+    // Errors in __irradiate_orig functions are pre-existing; only errors unique
+    // to __irradiate_N functions indicate the mutation was caught.
     let all_descriptors: Vec<MutantCacheDescriptor> = all_mutants.clone();
     let caught_names = crate::type_check::map_errors_to_mutants(
-        &new_errors,
+        &mutant_errors,
         &all_descriptors,
         &ctx.mutants_dir,
     );
