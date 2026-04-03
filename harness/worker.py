@@ -132,6 +132,37 @@ class MutationWorkerPlugin:
             return
         self.current_run_reports.append(report)
 
+    def _run_in_process(self, mutant_name, items_to_run, start):  # pragma: no mutate
+        """Run tests in the current process (no-fork mode)."""
+        import irradiate_harness
+        import traceback
+
+        try:
+            self._reset_run_state()
+            self.current_run_mutant = mutant_name
+            irradiate_harness.active_mutant = mutant_name
+            exit_code = self._run_items_via_hooks(items_to_run)
+            duration = time.monotonic() - start
+            send_message(self.sock, {
+                "type": "result", "mutant": mutant_name,
+                "exit_code": exit_code, "duration": duration,
+            })
+        except SystemExit as exc:
+            duration = time.monotonic() - start
+            exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+            send_message(self.sock, {
+                "type": "result", "mutant": mutant_name,
+                "exit_code": exit_code, "duration": duration,
+            })
+        except BaseException:
+            duration = time.monotonic() - start
+            send_message(self.sock, {
+                "type": "error", "mutant": mutant_name,
+                "message": traceback.format_exc(), "duration": duration,
+            })
+        finally:
+            irradiate_harness.active_mutant = None
+
     def _run_forked(self, mutant_name, items_to_run, start, timeout_secs=None):  # pragma: no mutate
         """Fork a child to run tests. Parent waits and reports result."""
         import irradiate_harness
@@ -224,16 +255,19 @@ class MutationWorkerPlugin:
             },
         )
 
-        import gc
-        gc.freeze()  # prevent COW faults from GC refcount updates in children
-        import threading
-        thread_count = threading.active_count()
-        if thread_count > 1:
-            print(
-                f"[irradiate] WARNING: {thread_count} threads active at fork time; "
-                "fork-unsafe plugins may cause hangs",
-                file=sys.stderr,
-            )
+        fork_mode = os.environ.get("IRRADIATE_NO_FORK", "") != "1"
+
+        if fork_mode:
+            import gc
+            gc.freeze()  # prevent COW faults from GC refcount updates in children
+            import threading
+            thread_count = threading.active_count()
+            if thread_count > 1:
+                print(
+                    f"[irradiate] WARNING: {thread_count} threads active at fork time; "
+                    "fork-unsafe plugins may cause hangs",
+                    file=sys.stderr,
+                )
 
         while True:
             msg, self.buf = recv_message(self.sock, self.buf)
@@ -277,7 +311,10 @@ class MutationWorkerPlugin:
                     continue
 
                 pre_fork = time.monotonic()
-                self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
+                if fork_mode:
+                    self._run_forked(mutant_name, items_to_run, start, timeout_secs=msg.get("timeout_secs"))
+                else:
+                    self._run_in_process(mutant_name, items_to_run, start)
                 post_result = time.monotonic()
                 self._profile_log(mutant_name, start, pre_fork, post_result)
 

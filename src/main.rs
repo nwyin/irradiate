@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+
 /// Resolve the Python interpreter to use.
 ///
 /// Priority:
@@ -104,6 +105,15 @@ enum Commands {
         /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
         #[arg(long, default_value_t = 0)]
         max_worker_memory: usize,
+
+        /// Disable fork-per-mutant in workers (default on macOS to avoid kernel panics
+        /// from memory pressure). Slightly less isolation but avoids fork() overhead.
+        #[arg(long)]
+        no_fork: bool,
+
+        /// Force fork-per-mutant even on macOS (overrides --no-fork and the macOS default).
+        #[arg(long)]
+        fork: bool,
 
         /// Run each mutant in a fresh subprocess (slower, better isolation)
         #[arg(long)]
@@ -279,6 +289,8 @@ async fn main() -> Result<()> {
             cache_post_sync,
             type_checker,
             no_source_patch,
+            no_fork,
+            fork,
             ignore,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
@@ -338,6 +350,15 @@ async fn main() -> Result<()> {
                 cache_post_sync: cache_post_sync.or(file_config.cache_post_sync),
                 type_checker: type_checker.or(file_config.type_checker),
                 no_source_patch,
+                no_fork: if fork {
+                    false
+                } else if no_fork {
+                    true
+                } else {
+                    // Default to no-fork on macOS to avoid kernel panics from
+                    // fork() memory pressure on machines with limited RAM.
+                    cfg!(target_os = "macos")
+                },
             })
             .await
         }

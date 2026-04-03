@@ -48,6 +48,9 @@ pub struct PoolConfig {
     /// Timeout in seconds for workers to complete test collection and send the ready message.
     /// Default 30s. Increase for projects with slow imports (e.g. tinygrad, torch).
     pub worker_ready_timeout: u64,
+    /// Disable fork-per-mutant: run tests in-process within the worker instead.
+    /// Avoids memory pressure from fork on macOS but provides less isolation.
+    pub no_fork: bool,
 }
 
 impl Default for PoolConfig {
@@ -64,6 +67,7 @@ impl Default for PoolConfig {
             max_worker_memory_mb: 0,
             pytest_add_cli_args: Vec::new(),
             worker_ready_timeout: 30,
+            no_fork: false,
         }
     }
 }
@@ -228,6 +232,8 @@ fn spawn_worker(
         .env("IRRADIATE_PYTEST_ARGS", &pytest_args_json)
         // Avoid .pyc writes — workers are short-lived, disk I/O wastes startup time
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        // Disable fork-per-mutant when --no-fork is set (avoids memory pressure on macOS)
+        .envs(config.no_fork.then_some(("IRRADIATE_NO_FORK", "1")))
         // Pass through profiling dir if set (for perf analysis)
         .envs(std::env::var("IRRADIATE_PROFILE_DIR").ok().map(|v| ("IRRADIATE_PROFILE_DIR", v)))
         .current_dir(&config.project_dir)

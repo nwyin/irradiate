@@ -71,6 +71,9 @@ pub struct RunConfig {
     /// Disable source-patch mutations for decorated functions.
     /// When true, only trampoline-compatible functions are mutated (existing behaviour).
     pub no_source_patch: bool,
+    /// Disable fork-per-mutant: run tests in-process within the worker.
+    /// Avoids memory pressure from fork() on macOS but provides less isolation.
+    pub no_fork: bool,
 }
 
 #[derive(Debug)]
@@ -564,8 +567,9 @@ async fn phase_execute(
     if config.isolate {
         eprintln!("Running mutation testing ({total_mutants} mutants, isolated mode)...");
     } else {
+        let mode = if config.no_fork { ", no-fork" } else { "" };
         eprintln!(
-            "Running mutation testing ({total_mutants} mutants, {} workers)...",
+            "Running mutation testing ({total_mutants} mutants, {} workers{mode})...",
             config.workers
         );
     }
@@ -867,6 +871,7 @@ fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
         max_worker_memory_mb: config.max_worker_memory_mb,
         pytest_add_cli_args: config.pytest_add_cli_args.clone(),
         worker_ready_timeout: config.worker_ready_timeout,
+        no_fork: config.no_fork,
         ..Default::default()
     }
 }
@@ -3234,6 +3239,7 @@ index 000..abc
             cache_post_sync: None,
             type_checker: None,
             no_source_patch: false,
+            no_fork: false,
         }
     }
 
