@@ -2,6 +2,36 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Resolve the Python interpreter to use.
+///
+/// Priority:
+/// 1. Sibling of the current executable (e.g. `.venv/bin/irradiate` -> `.venv/bin/python3`)
+/// 2. `VIRTUAL_ENV` env var -> `$VIRTUAL_ENV/bin/python3`
+/// 3. Bare `python3` (PATH lookup)
+fn resolve_python() -> PathBuf {
+    // Check sibling of our own binary — this is the most reliable signal when
+    // installed into a venv via `uv pip install` / `pip install`.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let sibling = bin_dir.join("python3");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+
+    // Fall back to VIRTUAL_ENV env var (set by activate scripts).
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let venv_python = PathBuf::from(&venv).join("bin").join("python3");
+        if venv_python.exists() {
+            return venv_python;
+        }
+    }
+
+    // Last resort: bare name, rely on PATH.
+    PathBuf::from("python3")
+}
+
 fn parse_sample(s: &str) -> std::result::Result<f64, String> {
     let v: f64 = s
         .parse()
@@ -67,9 +97,9 @@ enum Commands {
         #[arg(long)]
         covered_only: bool,
 
-        /// Python interpreter path
-        #[arg(long, default_value = "python3")]
-        python: String,
+        /// Python interpreter path (auto-detected from venv if not set)
+        #[arg(long)]
+        python: Option<String>,
 
         /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
         #[arg(long, default_value_t = 0)]
@@ -284,7 +314,7 @@ async fn main() -> Result<()> {
                 timeout_multiplier,
                 no_stats,
                 covered_only,
-                python: PathBuf::from(python),
+                python: python.map(PathBuf::from).unwrap_or_else(resolve_python),
                 mutant_filter: if mutant.is_empty() {
                     None
                 } else {
