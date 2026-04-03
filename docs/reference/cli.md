@@ -16,7 +16,7 @@ irradiate [OPTIONS] <COMMAND>
 
 | Flag        | Description   |
 | ----------- | ------------- |
-| `--version` | Print version (irradiate 0.3.0) |
+| `--version` | Print version (irradiate 0.4.0) |
 | `--help`    | Print help    |
 
 ## `irradiate run`

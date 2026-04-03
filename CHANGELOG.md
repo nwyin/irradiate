@@ -2,6 +2,28 @@
 
 All notable changes to irradiate are documented here.
 
+## 0.4.0 — 2026-04-03
+
+### Features
+
+- **Decorator support** — functions with any decorator (`@lru_cache`, `@app.route`, `@login_required`, custom decorators) are now mutated via a source-patching fallback. Previously these were skipped entirely. Use `--no-source-patch` to opt out.
+- **`decorator_removal` operator** — each decorator on a function is a separate mutant where that decorator line is removed. Tests whether decorators like `@cache`, `@login_required`, or `@retry` are actually tested.
+- **Type-check filter** (`--type-checker mypy|pyright|ty`) — runs a type checker against mutated code after generation. Mutants that introduce type errors are marked as killed and skipped from test execution. On well-typed codebases this eliminates ~35% of test runs.
+- **Remote cache sync hooks** (`cache_pre_sync` / `cache_post_sync`) — shell commands that run before/after mutation testing, enabling shared caches across CI runs via S3, GCS, rsync, or any backend.
+- **Cache garbage collection** (`irradiate cache gc`) — prune old or oversized cache entries with `--max-age`, `--max-size`, and `--dry-run`. Defaults configurable in pyproject.toml.
+- **`--ignore` CLI flag** — shorthand for `do_not_mutate` config. Glob patterns to exclude files from mutation, can be repeated.
+- **Auto-generated CLI docs** — `scripts/gen-cli-docs.sh` generates `docs/reference/cli.md` from clap definitions, keeping docs in sync with code.
+
+### Performance
+
+- **Parallel worker accept handshakes** — worker ready-message reads now happen in background tokio tasks instead of blocking the accept loop sequentially. Reduces startup latency at high worker counts.
+- **Eager dispatch** — work is dispatched to idle workers immediately after each event, reducing gaps between mutant executions.
+
+### Fixes
+
+- **Type checker path resolution** — fixed double `mutants/` prefix in error-to-mutant mapping that caused zero matches when running `--type-checker`.
+- **`cache_pre_sync` hook timing** — moved to fire before stats collection (which reads the cache), not after.
+
 ## 0.3.0 — 2026-03-26
 
 ### Features

@@ -57,9 +57,11 @@ Survived mutants:
 ## Why irradiate
 
 - **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
-- **38 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, [and more](https://nwyin.github.io/irradiate/internals/mutation-operators/).
+- **38+ mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, decorator removal, [and more](https://nwyin.github.io/irradiate/internals/mutation-operators/).
+- **Full decorator support** — `@lru_cache`, `@app.route`, custom decorators all mutated via source-patching. `decorator_removal` tests whether decorators matter.
+- **Type-check filter** — `--type-checker mypy` skips mutants caught by static analysis (~35% fewer test runs on typed codebases).
 - **Incremental** — `--diff main` tests only functions changed since a git ref.
-- **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
+- **Cached** — content-addressed results survive rebases, branch switches, and `touch`. Share across CI with [remote cache sync hooks](https://nwyin.github.io/irradiate/guide/remote-cache/).
 - **CI-native** — `--fail-under` for gating, GitHub Actions annotations, JSON/HTML reports, [composite action](https://nwyin.github.io/irradiate/guide/ci-integration/).
 - **Drop-in** — works with any pytest project.
 
