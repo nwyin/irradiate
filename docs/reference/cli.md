@@ -55,6 +55,8 @@ irradiate run [OPTIONS] [PATHS]...
 | `--stats-timeout`      | int    | `300`       | Timeout in seconds for stats collection. Increase for large test suites.                                                                              |
 | `--worker-timeout`     | int    | `30`        | Timeout in seconds for workers to complete test collection. Increase for projects with slow imports (e.g. `--worker-timeout 120` for tinygrad/torch). |
 | `--pytest-args`        | string | --          | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc.                     |
+| `--cache-pre-sync`     | string | --          | Shell command to run before the mutation testing run (e.g. download remote cache). Overrides `cache_pre_sync` in pyproject.toml.                      |
+| `--cache-post-sync`    | string | --          | Shell command to run after the mutation testing run (e.g. upload cache to remote). Overrides `cache_post_sync` in pyproject.toml.                     |
 
 ### Examples
 
@@ -109,6 +111,22 @@ Remove the local result cache.
 ```bash
 irradiate cache clean
 ```
+
+## `irradiate cache gc`
+
+Garbage-collect old or excess cache entries.
+
+```bash
+irradiate cache gc [OPTIONS]
+```
+
+| Flag        | Type   | Default | Description                                                            |
+| ----------- | ------ | ------- | ---------------------------------------------------------------------- |
+| `--max-age` | string | `30d`   | Delete entries older than this duration (e.g. `30d`, `24h`, `1h30m`)   |
+| `--max-size`| string | `1gb`   | After age pruning, evict oldest until under this size (e.g. `500mb`)   |
+| `--dry-run` | flag   | --      | Show what would be pruned without deleting                             |
+
+Defaults can be set in pyproject.toml via `cache_max_age` and `cache_max_size`. See [Remote Cache](../guide/remote-cache.md).
 
 ## Configuration
 

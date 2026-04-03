@@ -73,6 +73,7 @@ nav:
     - Understanding Results: guide/understanding-results.md
     - Surviving Mutants: guide/surviving-mutants.md
     - CI Integration: guide/ci-integration.md
+    - Remote Cache: guide/remote-cache.md
     - Performance: guide/performance.md
     - Comparison: guide/comparison.md
   - Reference:
