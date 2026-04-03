@@ -1,6 +1,6 @@
 site_name: irradiate
-site_description: Mutation testing for Python, written in Rust
-site_url: https://nwyin.github.io/irradiate 
+site_description: Fast mutation testing for Python, written in Rust. 38 operators, incremental diff-based testing, GitHub Actions integration.
+site_url: https://nwyin.github.io/irradiate
 repo_url: https://github.com/nwyin/irradiate
 repo_name: irradiate
 
@@ -55,6 +55,13 @@ plugins:
   - search
   - minify:
       minify_html: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/nwyin/irradiate
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/irradiate/
 
 nav:
   - Home: index.md

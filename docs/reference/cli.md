@@ -1,3 +1,8 @@
+---
+title: CLI Reference — irradiate
+description: Complete command-line reference for irradiate. All commands, flags, and options for run, results, show, and cache.
+---
+
 # CLI Reference
 
 ## Global

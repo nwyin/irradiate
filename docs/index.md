@@ -1,3 +1,8 @@
+---
+title: irradiate — Fast Mutation Testing for Python
+description: Fast, incremental mutation testing for Python written in Rust. 38 operators, content-addressable caching, GitHub Actions integration. Drop-in replacement for mutmut.
+---
+
 # irradiate
 
 Fast mutation testing for Python, written in Rust.

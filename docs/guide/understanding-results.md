@@ -1,3 +1,8 @@
+---
+title: Understanding Mutation Testing Results
+description: How to read irradiate's output. Learn what killed, survived, timeout, and no-tests mean for your mutation score.
+---
+
 # Understanding Results
 
 ## Result categories

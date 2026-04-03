@@ -1,3 +1,8 @@
+---
+title: Mutation Operators — Cross-Framework Reference
+description: Comprehensive catalog of mutation operators across Python mutation testing tools. 38 operator categories in irradiate compared to mutmut, Stryker, and PITest.
+---
+
 # Mutation Operators — Cross-Framework Reference
 
 A comprehensive catalog of mutation operators across the mutation testing ecosystem. Compiled as a reference for irradiate's operator coverage and future development.

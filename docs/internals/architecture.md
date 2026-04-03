@@ -1,3 +1,8 @@
+---
+title: Architecture — irradiate Internals
+description: How irradiate works internally. Module layering, execution pipeline, worker pool, and design rationale.
+---
+
 # Architecture
 
 irradiate's architecture and execution model. Useful for contributors and anyone curious about how mutation testing works under the hood.

@@ -1,3 +1,8 @@
+---
+title: The Trampoline — How irradiate Switches Mutations at Runtime
+description: How irradiate's trampoline architecture enables fast mutation testing by switching mutant code at runtime without restarting pytest.
+---
+
 # The Trampoline: How irradiate switches mutations at runtime
 
 ## The problem

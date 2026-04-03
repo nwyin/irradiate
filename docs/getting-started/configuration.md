@@ -1,3 +1,8 @@
+---
+title: Configuration — irradiate
+description: Configure irradiate via pyproject.toml. Set source paths, test directories, exclusion patterns, and pytest arguments.
+---
+
 # Configuration
 
 irradiate reads configuration from `pyproject.toml` under `[tool.irradiate]`. All settings are optional, and CLI flags override config values.

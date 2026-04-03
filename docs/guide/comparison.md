@@ -1,3 +1,8 @@
+---
+title: irradiate vs mutmut — Python Mutation Testing Comparison
+description: Feature-by-feature comparison of irradiate and mutmut. Speed, operators, caching, CI integration, decorator support, and more.
+---
+
 # Comparison
 
 ## irradiate vs mutmut

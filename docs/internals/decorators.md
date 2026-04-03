@@ -1,3 +1,8 @@
+---
+title: Decorator Handling — irradiate Internals
+description: How irradiate handles Python decorators like @property, @classmethod, and @staticmethod during mutation testing.
+---
+
 # Decorator Handling in irradiate
 
 irradiate uses a trampoline architecture to test multiple mutant variants within a single Python process. This page explains how decorators interact with that architecture, which decorators irradiate can handle, and why.

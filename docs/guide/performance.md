@@ -1,3 +1,8 @@
+---
+title: Performance Benchmarks — irradiate vs mutmut
+description: Benchmark results comparing irradiate and mutmut on real Python projects. Wall-clock times, mutants per second, and memory usage.
+---
+
 # Performance
 
 irradiate and mutmut 3.5.0 share a trampoline architecture and both use coverage-based test filtering. The differences are in orchestration, operator coverage, and memory management. This page presents benchmark results on real-world Python projects, explains why the numbers look the way they do, and helps you decide which tradeoffs matter for your codebase.

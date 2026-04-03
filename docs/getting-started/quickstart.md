@@ -1,3 +1,8 @@
+---
+title: Quick Start — Python Mutation Testing with irradiate
+description: Get started with irradiate in under 5 minutes. Run mutation testing on any Python pytest project with a single command.
+---
+
 # Quick Start
 
 Run irradiate on a Python project with an existing pytest test suite.

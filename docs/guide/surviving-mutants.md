@@ -1,3 +1,8 @@
+---
+title: What to Do with Surviving Mutants
+description: How to interpret and fix surviving mutants from mutation testing. Practical guide to improving Python tests based on mutation results.
+---
+
 # Surviving Mutants
 
 When irradiate reports survived mutants, the terminal output groups them by operator category. This page explains what each category tests and how to respond to survivors.

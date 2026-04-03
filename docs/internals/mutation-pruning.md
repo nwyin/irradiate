@@ -1,3 +1,8 @@
+---
+title: Mutation Pruning Strategies
+description: How irradiate reduces redundant mutants without losing test effectiveness. Coverage-based filtering, operator subsumption, and academic research.
+---
+
 # Mutation Pruning
 
 How irradiate minimizes redundant mutant computation without losing test effectiveness.

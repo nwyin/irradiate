@@ -1,3 +1,8 @@
+---
+title: Mutation Testing in CI — GitHub Actions Integration
+description: Add Python mutation testing to your CI pipeline with irradiate's GitHub Actions action. Diff-based testing, score thresholds, and inline annotations.
+---
+
 # CI Integration
 
 ## GitHub Actions

@@ -1,3 +1,8 @@
+---
+title: Import Hook Design — irradiate Internals
+description: How irradiate uses a sys.meta_path import hook to control which Python code gets loaded during mutation testing.
+---
+
 # Import Hook Design
 
 How irradiate controls which Python code gets loaded during mutation testing, and why it uses a `sys.meta_path` import hook instead of PYTHONPATH manipulation.

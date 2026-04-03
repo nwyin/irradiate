@@ -1,3 +1,8 @@
+---
+title: Contributing — irradiate
+description: Developer guide for contributing to irradiate. Building, testing, project structure, and pre-release checklist.
+---
+
 # Contributing
 
 Developer guide for working on irradiate.

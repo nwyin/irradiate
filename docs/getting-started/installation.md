@@ -1,3 +1,8 @@
+---
+title: Installation — irradiate
+description: Install irradiate from PyPI or build from source. Requires Python 3.10+ with pytest.
+---
+
 # Installation
 
 ## From PyPI (recommended)
