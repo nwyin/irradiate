@@ -57,6 +57,9 @@ irradiate run [OPTIONS] [PATHS]...
 | `--pytest-args`        | string | --          | Extra arguments appended to every pytest invocation (stats, validation, and test runs). Use to pass `--ignore`, `--timeout`, etc.                     |
 | `--cache-pre-sync`     | string | --          | Shell command to run before the mutation testing run (e.g. download remote cache). Overrides `cache_pre_sync` in pyproject.toml.                      |
 | `--cache-post-sync`    | string | --          | Shell command to run after the mutation testing run (e.g. upload cache to remote). Overrides `cache_post_sync` in pyproject.toml.                     |
+| `--type-checker`       | string | --          | Run a type checker to filter mutants caught by static analysis. Accepts a preset (`mypy`, `pyright`, `ty`) or a raw command string.                  |
+| `--ignore`             | string | --          | Glob pattern for files to exclude from mutation. Can be repeated. Merged with `do_not_mutate` in pyproject.toml.                                     |
+| `--no-source-patch`    | flag   | --          | Disable source-patch mutations for decorated functions. Only trampoline-compatible functions will be mutated.                                          |
 
 ### Examples
 

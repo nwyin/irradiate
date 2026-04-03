@@ -31,6 +31,13 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 | `cache_post_sync`     | string          | --        | Shell command run after mutation testing (e.g. upload cache) |
 | `cache_max_age`       | string          | `"30d"`   | Default max-age for `irradiate cache gc` |
 | `cache_max_size`      | string          | `"1gb"`   | Default max-size for `irradiate cache gc` |
+| `type_checker`        | string          | --        | Type checker preset (`mypy`, `pyright`, `ty`) or raw command |
+
+The `do_not_mutate` patterns can also be passed from the CLI with `--ignore` (merged with config values):
+
+```bash
+irradiate run --ignore "src/vendor/*" --ignore "src/generated/*"
+```
 
 These arguments are forwarded to **all** pytest invocations — stats collection, validation, and per-mutant test runs. This is useful for ignoring test directories that fail collection, setting timeouts, or enabling plugins:
 
