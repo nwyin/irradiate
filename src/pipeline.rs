@@ -1142,10 +1142,15 @@ async fn run_source_patches(
             }
         }
 
-        // Read the file in mutants/ (trampolined or verbatim).
+        // Read the file in mutants/ (trampolined or verbatim) and save a backup.
         let mutants_file = mutants_dir.join(&sp.rel_path);
         let original_content = std::fs::read_to_string(&mutants_file)
             .with_context(|| format!("Failed to read {} for source-patching", mutants_file.display()))?;
+
+        // Write a backup so we can restore atomically even if we panic mid-run.
+        let backup_path = mutants_file.with_extension("py.irradiate_backup");
+        std::fs::write(&backup_path, &original_content)
+            .with_context(|| format!("Failed to write backup to {}", backup_path.display()))?;
 
         // Patch the ORIGINAL source file (not the trampolined version).
         let orig_source = std::fs::read_to_string(&sp.original_file)
@@ -1158,9 +1163,19 @@ async fn run_source_patches(
             &orig_source[sp.patch.file_byte_end..],
         );
 
-        // Write the patched content to mutants/ temporarily.
+        // Write patched content to mutants/ (the import hook will load this).
         std::fs::write(&mutants_file, &patched)
             .with_context(|| format!("Failed to write patch to {}", mutants_file.display()))?;
+
+        // Helper closure: restore original from backup.
+        let restore = |mf: &Path, bp: &Path, oc: &str| {
+            // Try restoring from backup first (atomic rename), fall back to write.
+            if bp.exists() {
+                let _ = std::fs::rename(bp, mf);
+            } else {
+                let _ = std::fs::write(mf, oc);
+            }
+        };
 
         let estimated_secs = test_stats
             .as_ref()
@@ -1200,7 +1215,7 @@ async fn run_source_patches(
             match tokio::time::timeout(timeout_duration, child.wait()).await {
                 Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
                 Ok(Err(e)) => {
-                    std::fs::write(&mutants_file, &original_content)?;
+                    restore(&mutants_file, &backup_path, &original_content);
                     return Err(e.into());
                 }
                 Err(_elapsed) => {
@@ -1211,8 +1226,8 @@ async fn run_source_patches(
 
         let duration = start.elapsed().as_secs_f64();
 
-        // Restore the original file in mutants/.
-        std::fs::write(&mutants_file, &original_content)?;
+        // Restore the original file in mutants/ from backup.
+        restore(&mutants_file, &backup_path, &original_content);
 
         let status = MutantStatus::from_exit_code(exit_code, timed_out);
 
