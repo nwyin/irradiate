@@ -68,6 +68,9 @@ pub struct RunConfig {
     /// Type checker preset or command string. When set, mutants that introduce type errors
     /// are filtered out before test execution and marked as `TypeCheck`.
     pub type_checker: Option<String>,
+    /// Disable source-patch mutations for decorated functions.
+    /// When true, only trampoline-compatible functions are mutated (existing behaviour).
+    pub no_source_patch: bool,
 }
 
 #[derive(Debug)]
@@ -2964,6 +2967,7 @@ index 000..abc
             cache_pre_sync: None,
             cache_post_sync: None,
             type_checker: None,
+            no_source_patch: false,
         }
     }
 

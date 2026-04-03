@@ -7,7 +7,7 @@
 //! - Functions with `nonlocal` anywhere in their subtree are skipped (scope chain breaks on extract).
 //! - `len` and `isinstance` calls are not arg_removal-mutated (they're trivially killed / noisy).
 
-use crate::mutation::{DescriptorDecorator, FunctionMutations, Mutation};
+use crate::mutation::{DescriptorDecorator, FileCollectionResult, FunctionMutations, Mutation, SourcePatchMutation};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Functions that are never mutated (whole function skipped).
@@ -153,35 +153,53 @@ const METHOD_SWAPS: &[(&str, &str)] = &[
 ];
 const CONDITIONAL_METHOD_SWAPS: &[(&str, &str)] = &[("split", "rsplit"), ("rsplit", "split")];
 
-pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
+/// Collect all mutations from a Python source file, separated by strategy.
+///
+/// Returns both trampoline-compatible mutations (for descriptor-decorated and undecorated
+/// functions) and source-patch mutations (for functions with non-descriptor decorators).
+pub fn collect_all_mutations(source: &str) -> FileCollectionResult {
     let tree = match parse_python(source) {
         Some(tree) => tree,
-        None => return vec![],
+        None => {
+            return FileCollectionResult {
+                trampoline: vec![],
+                source_patches: vec![],
+            }
+        }
     };
 
     let ignored_lines = pragma_no_mutate_lines(source);
     let root = tree.root_node();
-    let mut results = Vec::new();
+    let mut trampoline = Vec::new();
+    let mut source_patches = Vec::new();
     let mut cursor = root.walk();
 
     for child in root.named_children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
                 if let Some(fm) = collect_function_mutations(child, None, source, &ignored_lines, None) {
-                    results.push(fm);
+                    trampoline.push(fm);
                 }
             }
             "class_definition" => {
-                collect_class_methods(child, source, &ignored_lines, &mut results);
+                collect_class_methods(child, source, &ignored_lines, &mut trampoline, &mut source_patches);
             }
             "decorated_definition" => {
-                collect_decorated_definition(child, None, source, &ignored_lines, &mut results);
+                collect_decorated_definition(child, None, source, &ignored_lines, &mut trampoline, &mut source_patches);
             }
             _ => {}
         }
     }
 
-    results
+    FileCollectionResult {
+        trampoline,
+        source_patches,
+    }
+}
+
+/// Backward-compatible wrapper: collect only trampoline-compatible mutations.
+pub fn collect_file_mutations(source: &str) -> Vec<FunctionMutations> {
+    collect_all_mutations(source).trampoline
 }
 
 /// Parse Python source with tree-sitter, returning None if the source has syntax errors.
@@ -200,6 +218,7 @@ fn collect_class_methods(
     source: &str,
     ignored_lines: &std::collections::HashSet<usize>,
     results: &mut Vec<FunctionMutations>,
+    source_patches: &mut Vec<SourcePatchMutation>,
 ) {
     let class_name = match class_node.child_by_field_name("name") {
         Some(name) => node_text(source, name).to_string(),
@@ -228,7 +247,7 @@ fn collect_class_methods(
                 }
             }
             "decorated_definition" => {
-                collect_decorated_definition(child, Some(class_name.as_str()), source, ignored_lines, results);
+                collect_decorated_definition(child, Some(class_name.as_str()), source, ignored_lines, results, source_patches);
             }
             _ => {}
         }
@@ -262,15 +281,15 @@ const DESCRIPTOR_DECORATORS: &[(&str, DescriptorDecorator)] = &[
 /// Handle a `decorated_definition` node.
 ///
 /// If the decorators are exclusively descriptor decorators (@property, @classmethod,
-/// @staticmethod), collect mutations from the inner function definition. Otherwise
-/// skip the entire decorated definition (registration/caching decorators can't be
-/// trampolined safely).
+/// @staticmethod), collect mutations via the trampoline path. Otherwise collect
+/// mutations as source-patch entries (applied to the original file at runtime).
 fn collect_decorated_definition(
     decorated_node: Node<'_>,
     class_name: Option<&str>,
     source: &str,
     ignored_lines: &std::collections::HashSet<usize>,
-    results: &mut Vec<FunctionMutations>,
+    trampoline_results: &mut Vec<FunctionMutations>,
+    source_patch_results: &mut Vec<SourcePatchMutation>,
 ) {
     // Find the inner definition (function_definition or class_definition).
     let Some(definition) = decorated_node.child_by_field_name("definition") else {
@@ -281,38 +300,110 @@ fn collect_decorated_definition(
         return;
     }
 
-    // Collect all decorator names. If any is not a known descriptor decorator, skip.
+    // Check whether all decorators are known descriptor decorators.
     let mut descriptor_kind: Option<DescriptorDecorator> = None;
+    let mut has_non_descriptor = false;
     let mut cursor = decorated_node.walk();
     for child in decorated_node.children(&mut cursor) {
         if child.kind() != "decorator" {
             continue;
         }
-        // The decorator node's text is `@name` or `@name(args)`.
-        // Get the first named child which is the decorator expression.
         let Some(expr) = child.named_children(&mut child.walk()).next() else {
-            return; // can't parse decorator, skip
+            has_non_descriptor = true;
+            break;
         };
         let dec_text = node_text(source, expr);
-        // Only bare names — `@property`, not `@property.setter` or `@functools.cache`.
         if let Some((_, kind)) = DESCRIPTOR_DECORATORS.iter().find(|(name, _)| *name == dec_text) {
-            // If we see multiple descriptor decorators (e.g., @property + @classmethod),
-            // that's invalid Python but we take the first one.
             if descriptor_kind.is_none() {
                 descriptor_kind = Some(*kind);
             }
         } else {
-            // Non-descriptor decorator found — skip this function entirely.
-            return;
+            has_non_descriptor = true;
+            break;
         }
     }
 
-    let Some(kind) = descriptor_kind else {
-        return; // no decorators found (shouldn't happen for decorated_definition)
+    if has_non_descriptor {
+        // Non-descriptor decorator: collect body mutations as source patches.
+        collect_source_patches_from_function(
+            definition,
+            decorated_node,
+            class_name,
+            source,
+            ignored_lines,
+            source_patch_results,
+        );
+    } else if let Some(kind) = descriptor_kind {
+        // Pure descriptor decorators: use trampoline path.
+        if let Some(fm) = collect_function_mutations(definition, class_name, source, ignored_lines, Some(kind)) {
+            trampoline_results.push(fm);
+        }
+    }
+}
+
+/// Collect body mutations from a decorated function as source-patch entries.
+///
+/// Unlike the trampoline path, source-patching has no restrictions on `nonlocal`
+/// or `_getframe` usage since the function is not renamed or wrapped.
+fn collect_source_patches_from_function(
+    function_node: Node<'_>,
+    decorated_node: Node<'_>,
+    class_name: Option<&str>,
+    source: &str,
+    ignored_lines: &std::collections::HashSet<usize>,
+    results: &mut Vec<SourcePatchMutation>,
+) {
+    let name_node = match function_node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = node_text(source, name_node).to_string();
+    if NEVER_MUTATE_FUNCTIONS.contains(&name.as_str()) {
+        return;
+    }
+
+    let body = match function_node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return,
     };
 
-    if let Some(fm) = collect_function_mutations(definition, class_name, source, ignored_lines, Some(kind)) {
-        results.push(fm);
+    let fn_start = function_node.start_byte();
+    let fn_end = function_node.end_byte();
+    let func_source = &source[fn_start..fn_end];
+
+    // Collect body mutations using the same operators as the trampoline path.
+    // Offsets are relative to fn_start.
+    let mut mutations = Vec::new();
+    collect_default_arg_mutations(function_node, source, fn_start, &mut mutations);
+    let mut walk = body.walk();
+    for child in body.named_children(&mut walk) {
+        collect_node_mutations(child, source, fn_start, function_node.id(), &mut mutations);
+    }
+    filter_ignored_lines(source, fn_start, ignored_lines, &mut mutations);
+
+    if mutations.is_empty() {
+        return;
+    }
+
+    // Use the decorated_definition's range for line numbers (includes decorator lines).
+    let start_line = decorated_node.start_position().row + 1;
+    let end_line = decorated_node.end_position().row + 1;
+
+    // Convert function-relative mutations to file-absolute SourcePatchMutations.
+    for m in mutations {
+        results.push(SourcePatchMutation {
+            file_byte_start: fn_start + m.start,
+            file_byte_end: fn_start + m.end,
+            original: m.original,
+            replacement: m.replacement,
+            operator: m.operator,
+            function_name: name.clone(),
+            class_name: class_name.map(ToOwned::to_owned),
+            function_source: func_source.to_string(),
+            fn_byte_offset: fn_start,
+            start_line,
+            end_line,
+        });
     }
 }
 
@@ -2911,4 +3002,142 @@ mod tests {
         }
     }
 
+    // --- Source-patch mutation collection tests ---
+
+    #[test]
+    fn source_patch_lru_cache_decorated_function() {
+        let source = "\
+import functools
+
+@functools.lru_cache
+def add(a, b):
+    return a + b
+";
+        let result = collect_all_mutations(source);
+        // Should NOT produce trampoline mutations (non-descriptor decorator).
+        assert!(
+            result.trampoline.is_empty(),
+            "lru_cache function should not be in trampoline results"
+        );
+        // Should produce source-patch mutations.
+        assert!(
+            !result.source_patches.is_empty(),
+            "lru_cache function should produce source-patch mutations"
+        );
+        // Check that mutations target the `+` operator in `a + b`.
+        let has_binop = result.source_patches.iter().any(|sp| sp.operator == "binop_swap");
+        assert!(has_binop, "should have binop_swap for a + b");
+        // Verify all source patches reference the correct function.
+        for sp in &result.source_patches {
+            assert_eq!(sp.function_name, "add");
+            assert!(sp.class_name.is_none());
+        }
+    }
+
+    #[test]
+    fn source_patch_property_still_uses_trampoline() {
+        let source = "\
+class Foo:
+    @property
+    def bar(self):
+        return 42
+";
+        let result = collect_all_mutations(source);
+        assert!(
+            !result.trampoline.is_empty(),
+            "@property should use trampoline path"
+        );
+        assert!(
+            result.source_patches.is_empty(),
+            "@property should not produce source-patch mutations"
+        );
+    }
+
+    #[test]
+    fn source_patch_mixed_decorators() {
+        // @property on one method, @custom on another in same class.
+        let source = "\
+class Svc:
+    @property
+    def name(self):
+        return 'svc'
+
+    @custom_decorator
+    def process(self, x):
+        return x + 1
+";
+        let result = collect_all_mutations(source);
+        assert_eq!(
+            result.trampoline.len(),
+            1,
+            "only @property method goes through trampoline"
+        );
+        assert_eq!(result.trampoline[0].name, "name");
+        assert!(
+            !result.source_patches.is_empty(),
+            "@custom_decorator method should produce source-patch mutations"
+        );
+        assert!(result.source_patches.iter().all(|sp| sp.function_name == "process"));
+        assert!(result.source_patches.iter().all(|sp| sp.class_name.as_deref() == Some("Svc")));
+    }
+
+    #[test]
+    fn source_patch_byte_offsets_are_absolute() {
+        // Verify that file_byte_start/end are absolute positions in the source,
+        // not relative to the function definition.
+        let source = "\
+import functools
+
+@functools.cache
+def add(a, b):
+    return a + b
+";
+        let result = collect_all_mutations(source);
+        for sp in &result.source_patches {
+            // The original text extracted from the file at the byte range should match.
+            let extracted = &source[sp.file_byte_start..sp.file_byte_end];
+            assert_eq!(
+                extracted, sp.original,
+                "byte range must extract the original text from the source file"
+            );
+        }
+    }
+
+    #[test]
+    fn source_patch_stacked_decorators() {
+        let source = "\
+@decorator_a
+@decorator_b
+def compute(x):
+    return x * 2
+";
+        let result = collect_all_mutations(source);
+        assert!(result.trampoline.is_empty());
+        assert!(!result.source_patches.is_empty());
+        // Start line should include the first decorator.
+        let first = &result.source_patches[0];
+        assert_eq!(first.start_line, 1, "start_line should include decorator lines");
+    }
+
+    #[test]
+    fn source_patch_nonlocal_not_skipped() {
+        // The trampoline path skips functions with nonlocal. Source-patching should not.
+        let source = "\
+@some_decorator
+def outer():
+    x = 0
+    def inner():
+        nonlocal x
+        x += 1
+    inner()
+    return x + 1
+";
+        let result = collect_all_mutations(source);
+        assert!(result.trampoline.is_empty());
+        // Source-patching should still find mutations in the outer function body.
+        assert!(
+            !result.source_patches.is_empty(),
+            "source-patch should not skip functions with nonlocal in nested scope"
+        );
+    }
 }

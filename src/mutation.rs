@@ -63,6 +63,45 @@ pub struct FunctionMutations {
     pub descriptor_decorator: Option<DescriptorDecorator>,
 }
 
+/// A source-patch mutation: a direct byte-range replacement in the original source file.
+///
+/// Used for functions with non-descriptor decorators (e.g., `@lru_cache`, `@app.route`)
+/// that can't be trampolined. Instead of renaming/wrapping, the mutation is applied by
+/// writing a patched copy of the source file and running tests in a subprocess.
+#[derive(Debug, Clone)]
+pub struct SourcePatchMutation {
+    /// Absolute byte offset in the source file where the original text starts.
+    pub file_byte_start: usize,
+    /// Absolute byte offset one past the end of the original text.
+    pub file_byte_end: usize,
+    /// The original text to replace.
+    pub original: String,
+    /// The replacement text.
+    pub replacement: String,
+    /// Which operator produced this mutation.
+    pub operator: &'static str,
+    /// Function name as it appears in the source.
+    pub function_name: String,
+    /// Class name if this is a method.
+    pub class_name: Option<String>,
+    /// The complete source text of the function definition (for cache invalidation).
+    pub function_source: String,
+    /// Byte offset of the function definition start in the source file.
+    pub fn_byte_offset: usize,
+    /// 1-indexed start line of the decorated definition (including decorator lines).
+    pub start_line: usize,
+    /// 1-indexed end line of the function.
+    pub end_line: usize,
+}
+
+/// Result of collecting all mutations from a source file.
+pub struct FileCollectionResult {
+    /// Mutations for functions that can be trampolined (descriptor-decorated or undecorated).
+    pub trampoline: Vec<FunctionMutations>,
+    /// Source-patch mutations for functions with non-descriptor decorators.
+    pub source_patches: Vec<SourcePatchMutation>,
+}
+
 /// Re-export from `tree_sitter_mutation` so callers can use `mutation::collect_file_mutations`.
 pub use crate::tree_sitter_mutation::collect_file_mutations;
 

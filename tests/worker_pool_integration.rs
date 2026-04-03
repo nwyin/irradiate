@@ -736,6 +736,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         cache_pre_sync: None,
         cache_post_sync: None,
         type_checker: None,
+        no_source_patch: false,
     }
 }
 

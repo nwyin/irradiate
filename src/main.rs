@@ -145,6 +145,12 @@ enum Commands {
         /// Mutants that introduce type errors are marked as killed (exit code 37).
         #[arg(long)]
         type_checker: Option<String>,
+
+        /// Disable source-patch mutations for decorated functions.
+        /// Only trampoline-compatible functions (@property, @classmethod, @staticmethod)
+        /// will be mutated. Skips the slower source-patch phase.
+        #[arg(long)]
+        no_source_patch: bool,
     },
 
     /// Display mutation testing results
@@ -237,6 +243,7 @@ async fn main() -> Result<()> {
             cache_pre_sync,
             cache_post_sync,
             type_checker,
+            no_source_patch,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -290,6 +297,7 @@ async fn main() -> Result<()> {
                 cache_pre_sync: cache_pre_sync.or(file_config.cache_pre_sync),
                 cache_post_sync: cache_post_sync.or(file_config.cache_post_sync),
                 type_checker: type_checker.or(file_config.type_checker),
+                no_source_patch,
             })
             .await
         }
