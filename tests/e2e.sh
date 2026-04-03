@@ -462,5 +462,65 @@ echo "  no type checker without flag: OK"
 # Clean up
 rm -rf "$TYPED_FIXTURE/mutants" "$TYPED_FIXTURE/.irradiate"
 
+# -------------------------------------------------------------------
+echo ""
+echo "=== E2E: decorator_project (source-patch mutations) ==="
+DECO_FIXTURE="$SCRIPT_DIR/fixtures/decorator_project"
+
+# Ensure venv exists
+if [ ! -d "$DECO_FIXTURE/.venv" ]; then
+    echo "Setting up Python venv..."
+    (cd "$DECO_FIXTURE" && uv venv && uv pip install pytest)
+fi
+
+# Clean previous run
+rm -rf "$DECO_FIXTURE/mutants" "$DECO_FIXTURE/.irradiate"
+
+# Run mutation testing
+DECO_OUTPUT=$( cd "$DECO_FIXTURE" && "$BINARY" run --python .venv/bin/python --no-cache 2>&1 )
+echo "$DECO_OUTPUT"
+
+# Verify source-patch mutants are generated
+if ! echo "$DECO_OUTPUT" | grep -q "source-patch"; then
+    echo "FAIL: Expected 'source-patch' in output"
+    exit 1
+fi
+echo "  source-patch mutants generated: OK"
+
+# Verify source-patch phase executed
+if ! echo "$DECO_OUTPUT" | grep -q "Source-patch phase:"; then
+    echo "FAIL: Expected 'Source-patch phase:' in output"
+    exit 1
+fi
+echo "  source-patch phase ran: OK"
+
+# Verify source-patch mutants were killed
+SP_KILLED=$(echo "$DECO_OUTPUT" | grep "Source-patch phase:" | grep -oE '[0-9]+ killed' | awk '{print $1}')
+if [ -z "${SP_KILLED:-}" ] || [ "$SP_KILLED" -lt 1 ]; then
+    echo "FAIL: Expected at least 1 source-patch mutant killed, got '${SP_KILLED:-0}'"
+    exit 1
+fi
+echo "  source-patch mutants killed ($SP_KILLED): OK"
+
+# Verify decorator_removal mutations appear
+if ! echo "$DECO_OUTPUT" | grep -q "decorator_removal"; then
+    echo "FAIL: Expected 'decorator_removal' in output"
+    exit 1
+fi
+echo "  decorator_removal mutations: OK"
+
+# Verify --no-source-patch disables source-patching
+rm -rf "$DECO_FIXTURE/mutants" "$DECO_FIXTURE/.irradiate"
+NSP_OUTPUT=$( cd "$DECO_FIXTURE" && "$BINARY" run --python .venv/bin/python --no-source-patch --no-cache 2>&1 )
+echo "$NSP_OUTPUT"
+if echo "$NSP_OUTPUT" | grep -q "Source-patch phase:"; then
+    echo "FAIL: --no-source-patch should skip source-patch phase"
+    exit 1
+fi
+echo "  --no-source-patch disables source-patching: OK"
+
+# Clean up
+rm -rf "$DECO_FIXTURE/mutants" "$DECO_FIXTURE/.irradiate"
+
 echo ""
 echo "=== E2E tests: PASS ==="
