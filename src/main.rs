@@ -151,6 +151,11 @@ enum Commands {
         /// will be mutated. Skips the slower source-patch phase.
         #[arg(long)]
         no_source_patch: bool,
+
+        /// Glob patterns for files to exclude from mutation. Can be repeated.
+        /// Merged with do_not_mutate from pyproject.toml.
+        #[arg(long)]
+        ignore: Vec<String>,
     },
 
     /// Display mutation testing results
@@ -244,6 +249,7 @@ async fn main() -> Result<()> {
             cache_post_sync,
             type_checker,
             no_source_patch,
+            ignore,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -251,6 +257,10 @@ async fn main() -> Result<()> {
             // pytest_add_cli_args: start from config, then append CLI --pytest-args
             let mut pytest_add_cli_args = file_config.pytest_add_cli_args.unwrap_or_default();
             pytest_add_cli_args.extend(pytest_args);
+
+            // do_not_mutate: merge config with CLI --ignore patterns
+            let mut do_not_mutate = file_config.do_not_mutate.unwrap_or_default();
+            do_not_mutate.extend(ignore);
 
             // Merge positional paths and --paths-to-mutate (positional takes priority)
             let mut all_paths = paths;
@@ -283,7 +293,7 @@ async fn main() -> Result<()> {
                 max_worker_memory_mb: max_worker_memory,
                 isolate,
                 verify_survivors,
-                do_not_mutate: file_config.do_not_mutate.unwrap_or_default(),
+                do_not_mutate,
                 fail_under,
                 diff_ref: diff,
                 report,
