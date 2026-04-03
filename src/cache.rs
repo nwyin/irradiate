@@ -191,7 +191,7 @@ pub fn gc(project_dir: &Path, max_age_secs: u64, max_size_bytes: u64, dry_run: b
         kept = still_kept;
     }
 
-    // Clean up empty bucket directories
+    // Clean up empty bucket directories (skipped in dry-run — no files were removed)
     if !dry_run {
         if let Ok(buckets) = fs::read_dir(&dir) {
             for bucket in buckets.flatten() {

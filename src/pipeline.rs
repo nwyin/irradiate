@@ -808,14 +808,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
     };
     let total_mutants = all_mutants.len();
 
-    // Phase 2: Stats + validation (+ pre-spawn workers)
-    let (test_stats, pre_spawned) =
-        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty(), python_version).await?;
-
-    // Cache pre-sync hook
+    // Cache pre-sync hook (before stats — stats reads cached entries)
     if let Some(ref cmd) = config.cache_pre_sync {
         run_sync_hook("cache_pre_sync", cmd, &ctx.project_dir);
     }
+
+    // Phase 2: Stats + validation (+ pre-spawn workers)
+    let (test_stats, pre_spawned) =
+        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty(), python_version).await?;
 
     // Phase 3+4: Schedule + execute
     let start = Instant::now();
