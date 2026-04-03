@@ -4,69 +4,36 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-nwyin.github.io%2Firradiate-blue)](https://nwyin.github.io/irradiate/)
 
-Fast mutation testing for Python, written in Rust.
+Fast mutation testing for Python, written in Rust. Built for CI.
 
-## What mutation testing catches
+Code coverage tells you which lines ran. [Mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) tells you which lines are actually *tested*. irradiate makes small changes to your code — flipping `<` to `<=`, swapping `+` with `-`, replacing `True` with `False` — and checks whether your tests catch each one. If they don't, that's a gap.
 
-[Mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) works by making small, deliberate changes to your code — like flipping a `<` to `<=`, swapping `True` for `False`, or replacing `+` with `-` — and then running your tests against each change. If a test fails, great: your tests caught the bug. If every test still passes, that's a gap — you have code that can break without any test noticing.
-
-Code coverage tells you which lines ran. Mutation testing tells you which lines are actually *tested*. A function can have 100% line coverage but still have mutants that survive, meaning your tests execute the code without meaningfully checking what it does.
-
-## Highlights
-
-- **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
-- **38 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, and more.
-- **Incremental** — `--diff main` tests only functions changed since a git ref.
-- **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
-- **CI-ready** — `--fail-under 80` for gating, GitHub Actions annotations, JSON and HTML reports.
-- **Drop-in** — works with any pytest project. `pip install irradiate && irradiate run src`.
-
-## Install
+## Quick start
 
 ```bash
 pip install irradiate
-```
 
-Or build from source:
-
-```bash
-cargo build --release
-```
-
-Requires Python 3.10+ with pytest installed.
-
-## Usage
-
-```bash
-# Run mutation testing (auto-detects src/ and tests/)
-irradiate run
-
-# Only test functions changed since main
+# Test only functions changed in your PR
 irradiate run --diff main
-
-# Test 10% of mutants (fast CI feedback)
-irradiate run --sample 0.1
-
-# Generate JSON report (Stryker mutation-testing-report-schema v2)
-irradiate run --report json
-
-# Generate self-contained HTML report
-irradiate run --report html
-
-# Fail CI if mutation score is below threshold
-irradiate run --fail-under 80
-
-# See cached results
-irradiate results
-
-# Show diff for a specific mutant
-irradiate show module.x_func__irradiate_1
 ```
+
+That's it. irradiate finds your `src/` and `tests/`, generates mutants for the changed code, and reports which ones survived.
+
+### Add to CI in 3 lines
+
+```yaml
+- uses: nwyin/irradiate@v0
+  with:
+    diff: origin/main
+    fail-under: "80"
+```
+
+This runs mutation testing on every PR, fails if the score drops below 80%, and posts inline annotations on surviving mutants.
 
 ### Example output
 
 ```
-$ irradiate run
+$ irradiate run --diff main
 Generating mutants...
   done in 3ms (14 mutants across 1 files)
 Running stats + validation...
@@ -85,6 +52,47 @@ Survived mutants:
 
   number_mutation (1):
     simple_lib/__init__.py:6  replaced `0` with `1`  [simple_lib.x_add__irradiate_3]
+```
+
+## Why irradiate
+
+- **Fast** — pre-warmed pytest workers with fork-per-mutant execution. Pytest starts once. Tests run many times.
+- **38 mutation operators** — arithmetic, comparison, boolean, string methods, return values, exception types, regex patterns, [and more](https://nwyin.github.io/irradiate/internals/mutation-operators/).
+- **Incremental** — `--diff main` tests only functions changed since a git ref.
+- **Cached** — content-addressed results survive rebases, branch switches, and `touch`.
+- **CI-native** — `--fail-under` for gating, GitHub Actions annotations, JSON/HTML reports, [composite action](https://nwyin.github.io/irradiate/guide/ci-integration/).
+- **Drop-in** — works with any pytest project.
+
+## Install
+
+```bash
+pip install irradiate
+```
+
+Requires Python 3.10+ with pytest installed. See the [installation guide](https://nwyin.github.io/irradiate/getting-started/installation/) for more options.
+
+## Usage
+
+```bash
+# Test functions changed since main (the CI use case)
+irradiate run --diff main
+
+# Run on the full codebase
+irradiate run
+
+# Sample 10% of mutants for fast feedback
+irradiate run --sample 0.1
+
+# Generate reports
+irradiate run --report json   # Stryker mutation-testing-report-schema v2
+irradiate run --report html   # self-contained HTML report
+
+# Fail CI if score is below threshold
+irradiate run --fail-under 80
+
+# Explore results
+irradiate results
+irradiate show module.x_func__irradiate_1
 ```
 
 ## Configuration
@@ -141,16 +149,7 @@ Sampling is operator-stratified, so every mutation category is proportionally re
 
 ### CI integration
 
-Drop-in [GitHub Actions composite action](docs/guide/ci-integration.md):
-
-```yaml
-- uses: nwyin/irradiate@v0
-  with:
-    diff: origin/main
-    fail-under: "80"
-```
-
-Auto-detects GitHub Actions and emits inline `::warning` annotations on survived mutants, plus a Markdown step summary.
+The [GitHub Actions composite action](https://nwyin.github.io/irradiate/guide/ci-integration/) (shown above) auto-detects the CI environment, emits inline `::warning` annotations on survived mutants, and writes a Markdown step summary. See the [CI integration guide](https://nwyin.github.io/irradiate/guide/ci-integration/) for advanced configuration, caching, and non-GitHub setups.
 
 ### Performance tuning
 
@@ -171,6 +170,16 @@ Parallelism defaults to CPU count (`--workers N` to override). Workers are recyc
 | **Sampling** | no | `--sample` with operator stratification |
 | **CI integration** | Manual | `--fail-under`, GitHub Actions action, annotations, step summary |
 | **Isolation** | Fork only | Warm-session + `--isolate` + `--verify-survivors` |
+
+## Guides
+
+- [Quick start](https://nwyin.github.io/irradiate/getting-started/quickstart/) — install, run, interpret results
+- [CI integration](https://nwyin.github.io/irradiate/guide/ci-integration/) — GitHub Actions, caching, gating
+- [Understanding results](https://nwyin.github.io/irradiate/guide/understanding-results/) — what mutation scores mean
+- [Surviving mutants](https://nwyin.github.io/irradiate/guide/surviving-mutants/) — what to do when mutants survive
+- [Performance tuning](https://nwyin.github.io/irradiate/guide/performance/) — workers, sampling, `--covered-only`
+- [Configuration](https://nwyin.github.io/irradiate/getting-started/configuration/) — pyproject.toml reference
+- [Comparison with mutmut](https://nwyin.github.io/irradiate/guide/comparison/) — detailed feature comparison
 
 ## Acknowledgments
 
