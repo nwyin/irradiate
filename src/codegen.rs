@@ -3,8 +3,9 @@
 
 use crate::cache::MutantCacheDescriptor;
 use crate::git_diff::DiffFilter;
-use crate::mutation::{collect_file_mutations, FunctionMutations};
-use crate::trampoline::{generate_trampoline, trampoline_impl, TrampolineOutput};
+use crate::mutation::{collect_file_mutations, FunctionMutations, SourcePatchMutation};
+use crate::tree_sitter_mutation::collect_all_mutations;
+use crate::trampoline::{generate_trampoline, mangle_name, trampoline_impl, TrampolineOutput};
 use std::path::Path;
 
 /// Result of mutating a single Python source file.
@@ -20,6 +21,28 @@ pub struct MutatedFile {
     /// func_key (e.g., "module.x_add"). Used by the fast stats plugin to map
     /// sys.monitoring / sys.settrace call events to irradiate function keys.
     pub function_map: Vec<(String, String)>,
+}
+
+/// A named source-patch mutation with a generated mutant key and cache descriptor.
+#[derive(Debug, Clone)]
+pub struct NamedSourcePatch {
+    /// Unique mutant name (e.g., "module.xǁClassǁmethod__sp_1").
+    pub mutant_name: String,
+    /// Absolute byte range in the original source file.
+    pub file_byte_start: usize,
+    pub file_byte_end: usize,
+    /// The replacement text (empty for decorator_removal).
+    pub replacement: String,
+    /// Cache descriptor for this mutant.
+    pub descriptor: MutantCacheDescriptor,
+}
+
+/// Result of processing a file for both trampoline and source-patch mutations.
+pub struct CodegenResult {
+    /// The trampolined mutated file, if any trampoline mutations were found.
+    pub mutated_file: Option<MutatedFile>,
+    /// Named source-patch mutations (body mutations + decorator removals).
+    pub source_patches: Vec<NamedSourcePatch>,
 }
 
 /// Generate the mutated version of a Python source file.
@@ -339,6 +362,89 @@ pub fn mutate_file(
         descriptors,
         function_map,
     })
+}
+
+/// Generate both trampoline mutations and named source-patch mutations for a file.
+///
+/// Calls the existing `mutate_file` for the trampoline path, then separately collects
+/// source-patch mutations from `collect_all_mutations`. This parses the file twice
+/// (once per path) but keeps the existing trampoline codegen completely unchanged.
+pub fn mutate_file_all(
+    source: &str,
+    module_name: &str,
+    diff_filter: Option<(&DiffFilter, &Path)>,
+    include_source_patches: bool,
+) -> CodegenResult {
+    // Trampoline path (existing, unchanged).
+    let mutated_file = mutate_file(source, module_name, diff_filter);
+
+    // Source-patch path.
+    let source_patches = if include_source_patches {
+        let collection = collect_all_mutations(source);
+        let mut patches = collection.source_patches;
+        if let Some((filter, rel_path)) = diff_filter {
+            patches.retain(|sp| filter.function_is_touched(rel_path, sp.start_line, sp.end_line));
+        }
+        name_source_patches(&patches, module_name)
+    } else {
+        vec![]
+    };
+
+    CodegenResult {
+        mutated_file,
+        source_patches,
+    }
+}
+
+/// Generate unique names and cache descriptors for source-patch mutations.
+fn name_source_patches(patches: &[SourcePatchMutation], module_name: &str) -> Vec<NamedSourcePatch> {
+    let mut counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut result = Vec::new();
+
+    for sp in patches {
+        let mangled = mangle_name(&sp.function_name, sp.class_name.as_deref());
+        let prefix = if sp.operator == "decorator_removal" {
+            format!("{module_name}.{mangled}__decrem")
+        } else {
+            format!("{module_name}.{mangled}__sp")
+        };
+        let counter = counters.entry(prefix.clone()).or_insert(0);
+        *counter += 1;
+        let mutant_name = format!("{prefix}_{counter}");
+
+        // For decorator_removal, the byte offsets may be outside the function body
+        // (they cover the decorator line). Use saturating_sub to avoid underflow
+        // when the decorator starts before the function.
+        let descriptor = MutantCacheDescriptor {
+            mutant_name: mutant_name.clone(),
+            function_source: sp.function_source.clone(),
+            operator: if sp.operator == "decorator_removal" {
+                format!(
+                    "decorator_removal: {}",
+                    sp.decorator_text.as_deref().unwrap_or("@?")
+                )
+            } else {
+                sp.operator.to_string()
+            },
+            start: sp.file_byte_start.saturating_sub(sp.fn_byte_offset),
+            end: sp.file_byte_end.saturating_sub(sp.fn_byte_offset),
+            original: sp.original.clone(),
+            replacement: sp.replacement.clone(),
+            source_file: module_name.to_string(),
+            fn_byte_offset: sp.fn_byte_offset,
+            fn_start_line: sp.start_line,
+        };
+
+        result.push(NamedSourcePatch {
+            mutant_name,
+            file_byte_start: sp.file_byte_start,
+            file_byte_end: sp.file_byte_end,
+            replacement: sp.replacement.clone(),
+            descriptor,
+        });
+    }
+
+    result
 }
 
 /// Find the index of the trampoline for (class_name, func_name) in function_mutations.

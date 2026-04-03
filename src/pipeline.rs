@@ -1,7 +1,7 @@
 //! Full mutation testing pipeline: mutate → stats → validate → test → report.
 
 use crate::cache::{self, CacheCounts, MutantCacheDescriptor};
-use crate::codegen::mutate_file;
+use crate::codegen::{mutate_file_all, NamedSourcePatch};
 use crate::harness;
 use crate::orchestrator::{run_worker_pool, PoolConfig};
 use crate::protocol::{MutantResult, MutantStatus, WorkItem};
@@ -77,6 +77,17 @@ pub struct RunConfig {
 struct GenerationOutput {
     names_by_module: HashMap<String, Vec<String>>,
     descriptors_by_name: HashMap<String, MutantCacheDescriptor>,
+}
+
+/// A source-patch mutant ready for execution.
+#[derive(Debug, Clone)]
+struct SourcePatchWorkItem {
+    /// The named patch with mutant name and byte range.
+    patch: NamedSourcePatch,
+    /// Absolute path to the original source file on disk.
+    original_file: PathBuf,
+    /// Relative path of the file within the mutants/ directory.
+    rel_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +233,7 @@ struct PipelineCtx {
 fn phase_generate(
     config: &RunConfig,
     ctx: &mut PipelineCtx,
-) -> Result<Option<(GenerationOutput, Vec<MutantCacheDescriptor>, Option<usize>)>> {
+) -> Result<Option<(GenerationOutput, Vec<MutantCacheDescriptor>, Option<usize>, Vec<SourcePatchWorkItem>)>> {
     #![allow(clippy::type_complexity)]
     let diff_filter = if let Some(ref diff_ref) = config.diff_ref {
         let repo_root = crate::git_diff::find_git_root(&ctx.project_dir)?;
@@ -236,27 +247,40 @@ fn phase_generate(
 
     let phase_start = ctx.trace.now_us();
     let start = Instant::now();
-    let generation = generate_mutants(
+    let (generation, source_patches) = generate_mutants(
         &config.paths_to_mutate,
         &ctx.mutants_dir,
         &config.do_not_mutate,
         diff_filter.as_ref().map(|(f, r)| (f, r.as_path())),
         &config.tests_dir,
+        config.no_source_patch,
     )?;
     let gen_time = start.elapsed();
     let mutant_count: usize = generation.names_by_module.values().map(|v| v.len()).sum();
+    let sp_count = source_patches.len();
     ctx.trace.phase("mutation_generation", phase_start, Some(serde_json::json!({
         "mutants": mutant_count,
+        "source_patches": sp_count,
         "files": generation.names_by_module.len(),
     })));
-    eprintln!(
-        "  done in {:.0}ms ({} mutants across {} files)",
-        gen_time.as_millis(),
-        mutant_count,
-        generation.names_by_module.len(),
-    );
+    if sp_count > 0 {
+        eprintln!(
+            "  done in {:.0}ms ({} trampoline + {} source-patch mutants across {} files)",
+            gen_time.as_millis(),
+            mutant_count,
+            sp_count,
+            generation.names_by_module.len(),
+        );
+    } else {
+        eprintln!(
+            "  done in {:.0}ms ({} mutants across {} files)",
+            gen_time.as_millis(),
+            mutant_count,
+            generation.names_by_module.len(),
+        );
+    }
 
-    if generation.descriptors_by_name.is_empty() {
+    if generation.descriptors_by_name.is_empty() && source_patches.is_empty() {
         let paths_str: Vec<_> = config.paths_to_mutate.iter().map(|p| p.display().to_string()).collect();
         eprintln!(
             "No mutations found in {}. Check that your source files contain functions to mutate.",
@@ -290,7 +314,7 @@ fn phase_generate(
         None
     };
 
-    Ok(Some((generation, all_mutants, sampled_from)))
+    Ok(Some((generation, all_mutants, sampled_from, source_patches)))
 }
 
 /// Phase 1.5: Run type checker to filter mutants caught by static analysis.
@@ -893,7 +917,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     };
 
     // Phase 1: Generate mutations
-    let Some((generation, mut all_mutants, sampled_from)) = phase_generate(&config, &mut ctx)? else {
+    let Some((generation, mut all_mutants, sampled_from, source_patches)) = phase_generate(&config, &mut ctx)? else {
         return Ok(()); // no mutants found or all filtered out
     };
 
@@ -911,7 +935,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let (test_stats, pre_spawned) =
         phase_stats(&config, &mut ctx, remaining_mutants, !all_mutants.is_empty(), python_version).await?;
 
-    // Phase 3+4: Schedule + execute
+    // Phase 3+4: Schedule + execute (trampoline phase)
     let start = Instant::now();
     let (mut results, cache_counts, covered_work) =
         phase_execute(&config, &mut ctx, &all_mutants, &test_stats, pre_spawned, remaining_mutants).await?;
@@ -921,6 +945,21 @@ pub async fn run(config: RunConfig) -> Result<()> {
     // Phase 4b: Verify survivors
     phase_verify_survivors(&config, &ctx, &mut results, &covered_work, &test_stats).await?;
 
+    // Phase 5: Source-patch execution (runs after trampoline phase)
+    if !source_patches.is_empty() {
+        let sp_results = run_source_patches(
+            &config, &source_patches, &test_stats, &ctx.project_dir,
+            &ctx.mutants_dir, &ctx.harness_dir,
+        ).await?;
+        let sp_killed = sp_results.iter().filter(|r| r.status == MutantStatus::Killed).count();
+        let sp_survived = sp_results.iter().filter(|r| r.status == MutantStatus::Survived).count();
+        eprintln!(
+            "  Source-patch phase: {} tested, {} killed, {} survived",
+            sp_results.len(), sp_killed, sp_survived,
+        );
+        results.extend(sp_results);
+    }
+
     let test_time = start.elapsed();
 
     // Cache post-sync hook
@@ -928,7 +967,7 @@ pub async fn run(config: RunConfig) -> Result<()> {
         run_sync_hook("cache_post_sync", cmd, &ctx.project_dir);
     }
 
-    // Phase 5: Results + reports
+    // Phase 6: Results + reports
     phase_results(
         &config, &mut ctx, &results, &generation, &test_stats,
         cache_counts, test_time.as_secs_f64(), sampled_from,
@@ -1023,6 +1062,154 @@ pub async fn run_isolated(
         let duration = start.elapsed().as_secs_f64();
         results.push(MutantResult {
             mutant_name: item.mutant_name,
+            exit_code,
+            duration,
+            status: MutantStatus::from_exit_code(exit_code, timed_out),
+        });
+    }
+
+    Ok(results)
+}
+
+/// Run source-patch mutants: for each mutant, patch the original source file in the
+/// `mutants/` directory, run pytest in a fresh subprocess, then restore the original.
+///
+/// This executes AFTER the trampoline phase. Each mutant gets its own subprocess
+/// for perfect isolation. The patched file is loaded via the existing import hook
+/// (IRRADIATE_MUTANTS_DIR), but IRRADIATE_ACTIVE_MUTANT is not set so trampoline
+/// wrappers in other functions dispatch to their originals.
+async fn run_source_patches(
+    config: &RunConfig,
+    patches: &[SourcePatchWorkItem],
+    test_stats: &Option<TestStats>,
+    project_dir: &Path,
+    mutants_dir: &Path,
+    harness_dir: &Path,
+) -> Result<Vec<MutantResult>> {
+    if patches.is_empty() {
+        return Ok(vec![]);
+    }
+    eprintln!(
+        "Running source-patch phase ({} mutants, isolated)...",
+        patches.len()
+    );
+
+    let pythonpath = build_pythonpath(harness_dir, &config.paths_to_mutate);
+    let mut results = Vec::new();
+
+    for sp in patches {
+        let mutant_name = &sp.patch.mutant_name;
+
+        // Read the file in mutants/ (this is either trampolined or verbatim original).
+        let mutants_file = mutants_dir.join(&sp.rel_path);
+        let original_content = std::fs::read_to_string(&mutants_file)
+            .with_context(|| format!("Failed to read {} for source-patching", mutants_file.display()))?;
+
+        // We need to patch the ORIGINAL source file, not the trampolined one.
+        // Read the original and apply the byte-range mutation.
+        let orig_source = std::fs::read_to_string(&sp.original_file)
+            .with_context(|| format!("Failed to read original source {}", sp.original_file.display()))?;
+
+        let patched = format!(
+            "{}{}{}",
+            &orig_source[..sp.patch.file_byte_start],
+            &sp.patch.replacement,
+            &orig_source[sp.patch.file_byte_end..],
+        );
+
+        // Write the patched content to mutants/ (replacing the trampolined version temporarily).
+        std::fs::write(&mutants_file, &patched)
+            .with_context(|| format!("Failed to write patch to {}", mutants_file.display()))?;
+
+        // Determine test IDs. For source-patch mutants, we look up by function qualname
+        // in the fast_stats test mapping (same as trampoline path). If no coverage info
+        // is available, run all tests.
+        let test_ids: Vec<String> = if let Some(ref stats) = test_stats {
+            // Try the func key pattern used by the fast stats plugin.
+            let qualname = match &sp.patch.descriptor.source_file.rsplit_once('.') {
+                Some(_) => {
+                    // Module-qualified: just use the function name directly
+                    sp.patch.descriptor.mutant_name
+                        .rsplit_once("__sp_")
+                        .or_else(|| sp.patch.descriptor.mutant_name.rsplit_once("__decrem_"))
+                        .map(|(prefix, _)| prefix)
+                        .unwrap_or(&sp.patch.descriptor.mutant_name)
+                        .to_string()
+                }
+                None => sp.patch.descriptor.mutant_name.clone(),
+            };
+            let tests = stats.tests_for_function_by_duration(&qualname);
+            if tests.is_empty() && config.covered_only {
+                // Skip this mutant — no coverage data available.
+                results.push(MutantResult {
+                    mutant_name: mutant_name.clone(),
+                    exit_code: 33,
+                    duration: 0.0,
+                    status: MutantStatus::NoTests,
+                });
+                // Restore the original file in mutants/.
+                std::fs::write(&mutants_file, &original_content)?;
+                continue;
+            }
+            tests
+        } else {
+            vec![]
+        };
+
+        let estimated_secs = test_stats
+            .as_ref()
+            .map(|s| s.estimated_duration(&test_ids))
+            .unwrap_or(0.0);
+        let timeout_secs = compute_timeout(config.timeout_multiplier, estimated_secs);
+        let timeout_duration = std::time::Duration::from_secs_f64(timeout_secs);
+
+        let start = Instant::now();
+        let mut cmd = tokio::process::Command::new(&config.python);
+        cmd.arg("-m")
+            .arg("pytest")
+            .arg("-x")
+            .arg("-q")
+            .arg("--no-header")
+            .arg("-p")
+            .arg("irradiate_harness")
+            .args(&config.pytest_add_cli_args);
+        if test_ids.is_empty() {
+            cmd.arg(&config.tests_dir);
+        } else {
+            cmd.args(&test_ids);
+        }
+        cmd.env("PYTHONPATH", &pythonpath)
+            .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
+            .current_dir(project_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn subprocess for source-patch {mutant_name}"))?;
+
+        let (exit_code, timed_out) =
+            match tokio::time::timeout(timeout_duration, child.wait()).await {
+                Ok(Ok(status)) => (status.code().unwrap_or(-1), false),
+                Ok(Err(e)) => {
+                    std::fs::write(&mutants_file, &original_content)?;
+                    return Err(e.into());
+                }
+                Err(_elapsed) => {
+                    let _ = child.kill().await;
+                    (-1, true)
+                }
+            };
+
+        let duration = start.elapsed().as_secs_f64();
+
+        // Restore the original file in mutants/.
+        std::fs::write(&mutants_file, &original_content)?;
+
+        results.push(MutantResult {
+            mutant_name: mutant_name.clone(),
             exit_code,
             duration,
             status: MutantStatus::from_exit_code(exit_code, timed_out),
@@ -1163,7 +1350,8 @@ fn generate_mutants(
     do_not_mutate: &[String],
     diff_filter: Option<(&crate::git_diff::DiffFilter, &Path)>,
     tests_dir: &str,
-) -> Result<GenerationOutput> {
+    no_source_patch: bool,
+) -> Result<(GenerationOutput, Vec<SourcePatchWorkItem>)> {
     // Clean mutants dir
     if mutants_dir.exists() {
         std::fs::remove_dir_all(mutants_dir)?;
@@ -1260,22 +1448,25 @@ fn generate_mutants(
 
     // Process files in parallel — each writes to a unique path, no conflicts.
     // create_dir_all is safe to call concurrently (handles races internally).
-    // (module_name, mutant_names, descriptors, function_map_entries)
-    type MutantEntry = Option<(String, Vec<String>, Vec<MutantCacheDescriptor>, Vec<(String, String)>)>;
+    // (module_name, mutant_names, descriptors, function_map_entries, source_patch_work_items)
+    type MutantEntry = Option<(
+        String,
+        Vec<String>,
+        Vec<MutantCacheDescriptor>,
+        Vec<(String, String)>,
+        Vec<SourcePatchWorkItem>,
+    )>;
+    let include_source_patches = !no_source_patch;
     let results: Vec<Result<MutantEntry>> = file_entries
         .par_iter()
         .map(|(py_file, strip_base)| -> Result<MutantEntry> {
             let source = std::fs::read_to_string(py_file)?;
 
             // Compute module name from file path relative to strip_base.
-            // e.g., src/simple_lib/__init__.py with strip_base=src → simple_lib/__init__.py → simple_lib
-            // e.g., src/click/types.py with strip_base=src → click/types.py → click.types
             let rel_path = py_file.strip_prefix(strip_base)?;
             let module_name = path_to_module(rel_path);
 
             // Check do_not_mutate patterns against path relative to cwd.
-            // Patterns like "src/config.py" or "**/utils.py" are matched against the
-            // file path as it would appear from the project root.
             if !do_not_mutate.is_empty() {
                 let rel_for_filter = py_file.strip_prefix(&cwd).unwrap_or(py_file);
                 let rel_filter_str = rel_for_filter.to_string_lossy().replace('\\', "/");
@@ -1283,19 +1474,16 @@ fn generate_mutants(
                     .iter()
                     .any(|pat| path_matches_glob(&rel_filter_str, pat))
                 {
-                    // Copy original for package integrity but skip mutation generation.
                     let dest = mutants_dir.join(rel_path);
                     write_file_with_parents(&dest, &source)?;
                     return Ok(None);
                 }
             }
 
-            // Diff-level filtering: compute path relative to repo root for diff lookup.
-            // File paths in the diff are relative to the repo root.
+            // Diff-level filtering.
             let per_file_diff = if let Some((filter, repo_root)) = diff_filter {
                 let repo_rel = py_file.strip_prefix(repo_root).unwrap_or(py_file);
                 if !filter.file_is_touched(repo_rel) {
-                    // File unchanged: copy verbatim for package integrity, generate no mutants.
                     let dest = mutants_dir.join(rel_path);
                     write_file_with_parents(&dest, &source)?;
                     return Ok(None);
@@ -1307,18 +1495,31 @@ fn generate_mutants(
 
             let file_diff_arg = per_file_diff.as_ref().map(|(f, p)| (*f, p.as_path()));
 
-            if let Some(mut mutated) = mutate_file(&source, &module_name, file_diff_arg) {
-                // Patch descriptors with source_file (rel_path relative to strip_base).
-                let source_file_str = rel_path.to_string_lossy().replace('\\', "/");
+            let codegen_result = mutate_file_all(&source, &module_name, file_diff_arg, include_source_patches);
+
+            // Build source-patch work items for this file.
+            let source_file_str = rel_path.to_string_lossy().replace('\\', "/");
+            let sp_work_items: Vec<SourcePatchWorkItem> = codegen_result
+                .source_patches
+                .into_iter()
+                .map(|mut patch| {
+                    patch.descriptor.source_file = source_file_str.clone();
+                    SourcePatchWorkItem {
+                        patch,
+                        original_file: py_file.clone(),
+                        rel_path: rel_path.to_path_buf(),
+                    }
+                })
+                .collect();
+
+            if let Some(mut mutated) = codegen_result.mutated_file {
                 for desc in &mut mutated.descriptors {
                     desc.source_file = source_file_str.clone();
                 }
 
-                // Write mutated file
                 let dest = mutants_dir.join(rel_path);
                 write_file_with_parents(&dest, &mutated.source)?;
 
-                // Write .meta stub
                 let meta_path = PathBuf::from(format!("{}.meta", dest.display()));
                 let meta = crate::report::FileMeta::default();
                 std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
@@ -1328,13 +1529,22 @@ fn generate_mutants(
                     mutated.mutant_names,
                     mutated.descriptors,
                     mutated.function_map,
+                    sp_work_items,
+                )))
+            } else if !sp_work_items.is_empty() {
+                // No trampoline mutations but we have source-patch mutations.
+                // Still need to copy the original file verbatim for package integrity.
+                let dest = mutants_dir.join(rel_path);
+                write_file_with_parents(&dest, &source)?;
+
+                Ok(Some((
+                    module_name,
+                    vec![],
+                    vec![],
+                    vec![],
+                    sp_work_items,
                 )))
             } else {
-                // No mutations found, but copy the original file verbatim so
-                // the full package structure is present in mutants/.  Without
-                // this, sibling imports break because Python finds the package
-                // in mutants/ (first on PYTHONPATH) but missing modules aren't
-                // there.
                 let dest = mutants_dir.join(rel_path);
                 write_file_with_parents(&dest, &source)?;
                 Ok(None)
@@ -1346,11 +1556,13 @@ fn generate_mutants(
     let mut all_names: HashMap<String, Vec<String>> = HashMap::new();
     let mut descriptors_by_name: HashMap<String, MutantCacheDescriptor> = HashMap::new();
     let mut function_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut all_source_patches: Vec<SourcePatchWorkItem> = Vec::new();
     for result in results {
-        if let Some((module, names, descriptors, func_map_entries)) = result? {
+        if let Some((module, names, descriptors, func_map_entries, sp_items)) = result? {
             for descriptor in descriptors {
                 descriptors_by_name.insert(descriptor.mutant_name.clone(), descriptor);
             }
+            all_source_patches.extend(sp_items);
             if !func_map_entries.is_empty() {
                 let module_map = function_map.entry(module.clone()).or_default();
                 for (qualname, func_key) in func_map_entries {
@@ -1387,10 +1599,13 @@ fn generate_mutants(
         copy_data_files(path, &strip_base, mutants_dir)?;
     }
 
-    Ok(GenerationOutput {
-        names_by_module: all_names,
-        descriptors_by_name,
-    })
+    Ok((
+        GenerationOutput {
+            names_by_module: all_names,
+            descriptors_by_name,
+        },
+        all_source_patches,
+    ))
 }
 
 /// Recursively copy non-Python data files from `dir` into `mutants_dir`, preserving
@@ -2114,7 +2329,7 @@ mod tests {
         // File that will NOT produce mutations (just a constant)
         std::fs::write(src_tmp.path().join("constants.py"), "MAX_RETRIES = 3\n").unwrap();
 
-        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests", false).unwrap();
 
         // Both files must be present in mutants/
         assert!(
@@ -2149,7 +2364,7 @@ mod tests {
         // utils.py — only constants, no mutations
         std::fs::write(pkg.join("utils.py"), "TIMEOUT = 30\n").unwrap();
 
-        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
+        generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests", false).unwrap();
 
         let mutants_pkg = mutants_tmp.path().join("pkg");
         assert!(
@@ -2194,7 +2409,7 @@ mod tests {
         std::fs::write(pkg.join("types.py"), "def parse(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points directly at the package directory "src/mypkg"
-        generate_mutants(&[pkg.clone()], mutants_tmp.path(), &[], None, "tests").unwrap();
+        generate_mutants(&[pkg.clone()], mutants_tmp.path(), &[], None, "tests", false).unwrap();
 
         // Files must land under mutants/mypkg/, not directly in mutants/
         let mutants_pkg = mutants_tmp.path().join("mypkg");
@@ -2232,7 +2447,7 @@ mod tests {
         std::fs::write(pkg.join("__init__.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // paths_to_mutate points at the source root "src" (no __init__.py there)
-        generate_mutants(&[src.clone()], mutants_tmp.path(), &[], None, "tests").unwrap();
+        generate_mutants(&[src.clone()], mutants_tmp.path(), &[], None, "tests", false).unwrap();
 
         // Files must land under mutants/simple_lib/
         assert!(
@@ -2258,7 +2473,7 @@ mod tests {
         std::fs::write(tmp.path().join("core.py"), "def f(x):\n    return x + 1\n").unwrap();
 
         // Should not panic even when parent() returns an empty component
-        let result = generate_mutants(&[tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests");
+        let result = generate_mutants(&[tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests", false).map(|(g, _)| g);
         assert!(
             result.is_ok(),
             "should not fail for package dirs with no parent prefix"
@@ -2335,7 +2550,7 @@ mod tests {
         // Build pattern that matches config.py. Since the test uses absolute paths,
         // we match using just the filename via **.
         let pattern = "**/config.py".to_string();
-        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[pattern], None, "tests").unwrap();
+        let (result, _sp) = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[pattern], None, "tests", false).unwrap();
 
         // config.py should NOT be in the mutant names (skipped)
         for module in result.names_by_module.keys() {
@@ -2369,7 +2584,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests").unwrap();
+        let (result, _sp) = generate_mutants(&[src_tmp.path().to_path_buf()], mutants_tmp.path(), &[], None, "tests", false).unwrap();
         assert!(
             !result.names_by_module.is_empty(),
             "empty do_not_mutate list must not skip any files"
@@ -2476,7 +2691,7 @@ mod tests {
 
         // Generate real mutants — the trampoline `if active == 'fail': raise …` must be present.
         let tmp_mutants = tempfile::tempdir().unwrap();
-        generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None, "tests")
+        generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None, "tests", false)
             .expect("mutant generation should succeed for fixture");
 
         let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
@@ -2789,12 +3004,13 @@ mod tests {
         let filter = DiffFilter::default();
         let repo_root = src_tmp.path();
 
-        let result = generate_mutants(
+        let (result, _sp) = generate_mutants(
             &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
             "tests",
+            false,
         )
         .unwrap();
 
@@ -2836,12 +3052,13 @@ index abc..def 100644
         let filter = crate::git_diff::parse_unified_diff(diff_text);
         let repo_root = src_tmp.path();
 
-        let result = generate_mutants(
+        let (result, _sp) = generate_mutants(
             &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
             "tests",
+            false,
         )
         .unwrap();
 
@@ -2878,10 +3095,10 @@ index abc..def 100644
         )
         .unwrap();
 
-        let result_no_filter =
-            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_a.path(), &[], None, "tests").unwrap();
-        let result_none_filter =
-            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_b.path(), &[], None, "tests").unwrap();
+        let (result_no_filter, _) =
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_a.path(), &[], None, "tests", false).unwrap();
+        let (result_none_filter, _) =
+            generate_mutants(&[src_tmp.path().to_path_buf()], mutants_b.path(), &[], None, "tests", false).unwrap();
 
         assert_eq!(
             result_no_filter.names_by_module.len(),
@@ -2919,12 +3136,13 @@ index 000..abc
         let filter = crate::git_diff::parse_unified_diff(diff_text);
         let repo_root = src_tmp.path();
 
-        let result = generate_mutants(
+        let (result, _sp) = generate_mutants(
             &[src_tmp.path().to_path_buf()],
             mutants_tmp.path(),
             &[],
             Some((&filter, repo_root)),
             "tests",
+            false,
         )
         .unwrap();
 
