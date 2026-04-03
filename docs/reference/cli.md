@@ -16,7 +16,7 @@ irradiate [OPTIONS] <COMMAND>
 
 | Flag        | Description   |
 | ----------- | ------------- |
-| `--version` | Print version (irradiate 0.4.0) |
+| `--version` | Print version (irradiate 0.4.1) |
 | `--help`    | Print help    |
 
 ## `irradiate run`
@@ -38,7 +38,7 @@ irradiate run [OPTIONS] [PATHS]...
 | `--timeout-multiplier <TIMEOUT_MULTIPLIER>` | `10` | Timeout multiplier (applied to baseline test duration) |
 | `--no-stats` | -- | Skip stats collection, test all mutants against all tests |
 | `--covered-only` | -- | Skip mutants with no test coverage |
-| `--python <PYTHON>` | `python3` | Python interpreter path |
+| `--python <PYTHON>` | -- | Python interpreter path (auto-detected from venv if not set) |
 | `--max-worker-memory <MAX_WORKER_MEMORY>` | `0` | Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable) |
 | `--isolate` | -- | Run each mutant in a fresh subprocess (slower, better isolation) |
 | `--verify-survivors` | -- | After the main run, re-test survived mutants in isolate mode to detect false negatives from warm-session state leakage. No-op when --isolate is set |

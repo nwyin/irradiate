@@ -2,6 +2,12 @@
 
 All notable changes to irradiate are documented here.
 
+## 0.4.1 — 2026-04-04
+
+### Fixes
+
+- **Python interpreter auto-detection** — irradiate now finds the correct Python interpreter when installed into a virtualenv via `uv pip install` or `pip install`. Previously it defaulted to bare `python3` on PATH, which could resolve to the system Python (without pytest). Resolution order: sibling of the irradiate binary, then `$VIRTUAL_ENV/bin/python3`, then PATH. The `--python` flag still overrides all auto-detection.
+
 ## 0.4.0 — 2026-04-03
 
 ### Features
