@@ -34,6 +34,16 @@ pub struct IrradiateConfig {
     /// A plain string is accepted for backward compatibility and split on whitespace.
     #[serde(default, deserialize_with = "deserialize_string_or_vec_opt")]
     pub pytest_add_cli_args: Option<Vec<String>>,
+    /// Shell command to run before a mutation testing run (e.g. download remote cache).
+    /// Executed via `sh -c` with `IRRADIATE_CACHE_DIR` and `IRRADIATE_PROJECT_DIR` env vars.
+    pub cache_pre_sync: Option<String>,
+    /// Shell command to run after a mutation testing run (e.g. upload cache to remote).
+    /// Executed via `sh -c` with `IRRADIATE_CACHE_DIR` and `IRRADIATE_PROJECT_DIR` env vars.
+    pub cache_post_sync: Option<String>,
+    /// Maximum age for cache entries when running `irradiate cache gc` (e.g. "30d", "24h").
+    pub cache_max_age: Option<String>,
+    /// Maximum total cache size when running `irradiate cache gc` (e.g. "1gb", "500mb").
+    pub cache_max_size: Option<String>,
 }
 
 /// Deserialize a field that accepts either a TOML string or array of strings.
@@ -323,6 +333,37 @@ paths_to_mutate = "src"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(config.tool.irradiate.as_ref().unwrap().pytest_add_cli_args.is_none());
+    }
+
+    #[test]
+    fn test_cache_sync_config() {
+        let toml_str = r#"
+[tool.irradiate]
+cache_pre_sync = "aws s3 sync s3://bucket/cache .irradiate/cache"
+cache_post_sync = "aws s3 sync .irradiate/cache s3://bucket/cache"
+cache_max_age = "30d"
+cache_max_size = "1gb"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert_eq!(irr.cache_pre_sync.as_deref(), Some("aws s3 sync s3://bucket/cache .irradiate/cache"));
+        assert_eq!(irr.cache_post_sync.as_deref(), Some("aws s3 sync .irradiate/cache s3://bucket/cache"));
+        assert_eq!(irr.cache_max_age.as_deref(), Some("30d"));
+        assert_eq!(irr.cache_max_size.as_deref(), Some("1gb"));
+    }
+
+    #[test]
+    fn test_cache_sync_config_absent() {
+        let toml_str = r#"
+[tool.irradiate]
+paths_to_mutate = "src"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert!(irr.cache_pre_sync.is_none());
+        assert!(irr.cache_post_sync.is_none());
+        assert!(irr.cache_max_age.is_none());
+        assert!(irr.cache_max_size.is_none());
     }
 
     // INV-4: [tool.mutmut] fallback — load_config must return its values when [tool.irradiate] absent.

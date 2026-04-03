@@ -61,6 +61,10 @@ pub struct RunConfig {
     /// Timeout in seconds for workers to complete test collection and send the ready message.
     /// Default 30. Increase for projects with slow imports.
     pub worker_ready_timeout: u64,
+    /// Shell command to run before the mutation testing run (e.g. download remote cache).
+    pub cache_pre_sync: Option<String>,
+    /// Shell command to run after the mutation testing run (e.g. upload remote cache).
+    pub cache_post_sync: Option<String>,
 }
 
 #[derive(Debug)]
@@ -753,6 +757,34 @@ fn build_pool_config(config: &RunConfig, ctx: &PipelineCtx) -> PoolConfig {
     }
 }
 
+/// Execute a cache sync hook command, logging a warning on failure.
+fn run_sync_hook(label: &str, command: &str, project_dir: &Path) {
+    let cache_dir = cache::cache_dir(project_dir);
+    // Ensure cache directory exists so hooks can reference it
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let result = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(project_dir)
+        .env("IRRADIATE_CACHE_DIR", &cache_dir)
+        .env("IRRADIATE_PROJECT_DIR", project_dir)
+        .output();
+    match result {
+        Ok(output) if !output.status.success() => {
+            let code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("warning: {label} hook exited with code {code}");
+            if !stderr.trim().is_empty() {
+                eprintln!("  stderr: {}", stderr.trim());
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: {label} hook failed to execute: {e}");
+        }
+        Ok(_) => {}
+    }
+}
+
 /// Run the full mutation testing pipeline.
 pub async fn run(config: RunConfig) -> Result<()> {
     let python_version = validate_environment(&config)?;
@@ -780,6 +812,11 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let (test_stats, pre_spawned) =
         phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty(), python_version).await?;
 
+    // Cache pre-sync hook
+    if let Some(ref cmd) = config.cache_pre_sync {
+        run_sync_hook("cache_pre_sync", cmd, &ctx.project_dir);
+    }
+
     // Phase 3+4: Schedule + execute
     let start = Instant::now();
     let (mut results, cache_counts, covered_work) =
@@ -789,6 +826,11 @@ pub async fn run(config: RunConfig) -> Result<()> {
     phase_verify_survivors(&config, &ctx, &mut results, &covered_work, &test_stats).await?;
 
     let test_time = start.elapsed();
+
+    // Cache post-sync hook
+    if let Some(ref cmd) = config.cache_post_sync {
+        run_sync_hook("cache_post_sync", cmd, &ctx.project_dir);
+    }
 
     // Phase 5: Results + reports
     phase_results(
@@ -2826,6 +2868,8 @@ index 000..abc
             sample_seed: 0,
             pytest_add_cli_args: vec![],
             worker_ready_timeout: 30,
+            cache_pre_sync: None,
+            cache_post_sync: None,
         }
     }
 

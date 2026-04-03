@@ -733,6 +733,8 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         sample_seed: 0,
         pytest_add_cli_args: vec![],
         worker_ready_timeout: 30,
+        cache_pre_sync: None,
+        cache_post_sync: None,
     }
 }
 

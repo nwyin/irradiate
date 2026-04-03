@@ -129,6 +129,16 @@ enum Commands {
         /// Increase for projects with slow imports (e.g. --worker-timeout 120 for tinygrad/torch).
         #[arg(long, default_value_t = 30)]
         worker_timeout: u64,
+
+        /// Shell command to run before the mutation testing run (e.g. download remote cache).
+        /// Overrides cache_pre_sync in pyproject.toml.
+        #[arg(long)]
+        cache_pre_sync: Option<String>,
+
+        /// Shell command to run after the mutation testing run (e.g. upload cache to remote).
+        /// Overrides cache_post_sync in pyproject.toml.
+        #[arg(long)]
+        cache_post_sync: Option<String>,
     },
 
     /// Display mutation testing results
@@ -202,6 +212,8 @@ async fn main() -> Result<()> {
             sample_seed,
             pytest_args,
             worker_timeout,
+            cache_pre_sync,
+            cache_post_sync,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -252,6 +264,8 @@ async fn main() -> Result<()> {
                 stats_timeout,
                 pytest_add_cli_args,
                 worker_ready_timeout: worker_timeout,
+                cache_pre_sync: cache_pre_sync.or(file_config.cache_pre_sync),
+                cache_post_sync: cache_post_sync.or(file_config.cache_post_sync),
             })
             .await
         }
