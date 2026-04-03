@@ -46,9 +46,10 @@ A comprehensive catalog of mutation operators across the mutation testing ecosys
 
 ### Skip rules
 
-- Decorated functions (any decorator) — skipped entirely (trampoline incompatibility)
 - Enum subclass methods (`Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`) — `EnumMeta` metaclass conflicts
-- Functions containing `nonlocal` — trampoline extraction breaks scope chains
+- Functions containing `nonlocal` — skipped for trampoline path (source-patch path handles these)
+- Descriptor-decorated functions (`@property`, `@classmethod`, `@staticmethod`) — mutated via trampoline
+- Other decorated functions (`@lru_cache`, `@app.route`, custom decorators) — mutated via source-patching
 - `__getattribute__`, `__setattr__`, `__new__`
 - `len()`, `isinstance()` calls (arg_removal skipped — trivially killed, noisy)
 - Generator expression / comprehension arguments (arg_removal skipped — invalid syntax)

@@ -109,29 +109,35 @@ Some decorators are effectively no-ops at runtime and don't interfere with tramp
 - `@abstractmethod` marks abstract methods for ABC enforcement. The function body is still real code. Currently skipped but could be handled like a regular instance method.
 - `@functools.wraps` copies metadata inside other decorators. No runtime behavior change.
 
-### Decorators that remain skipped
+### Non-descriptor decorators: source-patch path
 
-Decorators with definition-time side effects or complex wrapping behavior are still skipped. This includes registration decorators (`@app.route()`, `@click.command()`, `@pytest.fixture`), caching decorators (`@lru_cache`, `@cache`, `@cached_property`), wrapping decorators (`@contextmanager`, `@retry`, `@login_required`), and any user-defined decorators.
+Decorators with definition-time side effects or complex wrapping behavior cannot use the trampoline. These are now handled via **source-patching**: irradiate writes a patched copy of the source file with a single mutation applied and runs tests in a subprocess.
 
-These require a different execution model (source-patching) that avoids the trampoline entirely. See [GitHub issue #13](https://github.com/nwyin/irradiate/issues/13) for the design.
+This covers registration decorators (`@app.route()`, `@click.command()`, `@pytest.fixture`), caching decorators (`@lru_cache`, `@cache`, `@cached_property`), wrapping decorators (`@contextmanager`, `@retry`, `@login_required`), and any user-defined decorators.
+
+Source-patch mutations include:
+- **Body mutations**: the same operators as trampoline (binop, return_value, etc.) applied to the function body
+- **`decorator_removal`**: each decorator is a separate mutant where that decorator line is removed entirely
+
+Use `--no-source-patch` to disable source-patching and only mutate trampoline-compatible functions.
 
 ## Real-world impact
 
 Decorator frequency measured across 5 popular Python projects:
 
-| Project | Functions | Decorated | @property/@classmethod/@staticmethod | Remaining skipped |
-|---------|-----------|-----------|--------------------------------------|-------------------|
+| Project | Functions | Decorated | @property/@classmethod/@staticmethod | Source-patched |
+|---------|-----------|-----------|--------------------------------------|----------------|
 | click | 527 | 65 (12%) | 23 | 42 (8%) |
 | httpx | 446 | 78 (17%) | 62 | 16 (4%) |
 | flask | 367 | 82 (22%) | 15 | 67 (18%) |
 | rich | 911 | 206 (23%) | 162 | 44 (5%) |
 | pydantic | 1854 | 438 (24%) | 288 | 150 (8%) |
 
-With the Big Three handled, irradiate covers 92-96% of functions in most codebases (flask is an outlier at 82% due to heavy use of `@setupmethod`).
+With source-patching, irradiate now covers all decorated functions in these codebases.
 
 ## Why not source-patching for everything?
 
-Source-patching (writing a modified copy of the file with one mutation applied, running tests in a fresh subprocess) would handle all decorators correctly. But it's slower:
+Source-patching (writing a modified copy of the file with one mutation applied, running tests in a fresh subprocess) handles all decorators correctly. But it's slower:
 
 - Trampoline mode: amortize pytest startup across hundreds of mutants in one session
 - Source-patching: one subprocess per mutant (~1-3s overhead each)

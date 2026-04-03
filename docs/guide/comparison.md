@@ -19,7 +19,7 @@ irradiate is heavily inspired by mutmut and shares its trampoline architecture, 
 | **Orchestration**     | Python multiprocessing                   | Rust + tokio async                                                    |
 | **Incremental**       | --                                       | `--diff` with merge-base resolution                                   |
 | **Reports**           | Terminal only                            | JSON (Stryker v2), HTML, GitHub Actions annotations                   |
-| **Decorator support** | Skip all                                 | @property/@classmethod/@staticmethod handled                          |
+| **Decorator support** | Skip all                                 | All decorators handled (trampoline + source-patch) + `decorator_removal` operator |
 | **CI integration**    | Manual                                   | `--fail-under`, inline annotations, step summary                      |
 | **Isolation**         | Fork only                                | Warm-session + `--isolate` + `--verify-survivors`                     |
 | **Config**            | `[tool.mutmut]`                          | `[tool.irradiate]` (mutmut section accepted with deprecation warning) |
