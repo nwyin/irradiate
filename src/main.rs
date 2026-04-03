@@ -177,6 +177,22 @@ enum Commands {
 enum CacheCommands {
     /// Remove the local cache directory
     Clean,
+    /// Garbage-collect old or excess cache entries
+    Gc {
+        /// Maximum age for cache entries (e.g. "30d", "24h", "1h30m"). Default: "30d".
+        /// Overrides cache_max_age in pyproject.toml.
+        #[arg(long, default_value = None)]
+        max_age: Option<String>,
+
+        /// Maximum total cache size (e.g. "1gb", "500mb"). Default: "1gb".
+        /// Overrides cache_max_size in pyproject.toml.
+        #[arg(long, default_value = None)]
+        max_size: Option<String>,
+
+        /// Show what would be pruned without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -285,6 +301,59 @@ async fn main() -> Result<()> {
                     eprintln!(
                         "No local cache found at {}",
                         irradiate::cache::cache_dir(&project_dir).display()
+                    );
+                }
+                Ok(())
+            }
+            CacheCommands::Gc { max_age, max_size, dry_run } => {
+                let project_dir = std::env::current_dir()?;
+                let file_config = irradiate::config::load_config(&project_dir)?;
+
+                let age_str = max_age
+                    .or(file_config.cache_max_age)
+                    .unwrap_or_else(|| "30d".to_string());
+                let size_str = max_size
+                    .or(file_config.cache_max_size)
+                    .unwrap_or_else(|| "1gb".to_string());
+
+                let max_age_secs = irradiate::cache::parse_duration(&age_str)?;
+                let max_size_bytes = irradiate::cache::parse_size(&size_str)?;
+
+                let result = irradiate::cache::gc(&project_dir, max_age_secs, max_size_bytes, dry_run)?;
+
+                fn fmt_size(bytes: u64) -> String {
+                    if bytes >= 1024 * 1024 * 1024 {
+                        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                    } else if bytes >= 1024 * 1024 {
+                        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+                    } else if bytes >= 1024 {
+                        format!("{:.1} KB", bytes as f64 / 1024.0)
+                    } else {
+                        format!("{bytes} B")
+                    }
+                }
+
+                if result.pruned == 0 {
+                    eprintln!(
+                        "Cache is within limits. {} entries ({}).",
+                        result.remaining,
+                        fmt_size(result.remaining_bytes),
+                    );
+                } else if dry_run {
+                    eprintln!(
+                        "Would prune {} entries ({}). Cache: {} entries ({} total).",
+                        result.pruned,
+                        fmt_size(result.pruned_bytes),
+                        result.remaining + result.pruned,
+                        fmt_size(result.remaining_bytes + result.pruned_bytes),
+                    );
+                } else {
+                    eprintln!(
+                        "Pruned {} entries ({} freed). Cache: {} entries ({} remaining).",
+                        result.pruned,
+                        fmt_size(result.pruned_bytes),
+                        result.remaining,
+                        fmt_size(result.remaining_bytes),
                     );
                 }
                 Ok(())

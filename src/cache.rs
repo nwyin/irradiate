@@ -42,8 +42,171 @@ pub struct CacheEntry {
     pub status: MutantStatus,
 }
 
+/// Result of a garbage collection run.
+#[derive(Debug)]
+pub struct GcResult {
+    /// Number of entries that were (or would be) pruned.
+    pub pruned: usize,
+    /// Total bytes freed (or that would be freed).
+    pub pruned_bytes: u64,
+    /// Number of entries remaining after GC.
+    pub remaining: usize,
+    /// Total bytes remaining after GC.
+    pub remaining_bytes: u64,
+}
+
 pub fn cache_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".irradiate").join("cache")
+}
+
+/// Parse a human-readable duration string into seconds.
+///
+/// Supported formats: `30d`, `7d`, `24h`, `1h30m`, `90m`, `3600s`.
+/// Multiple units can be combined: `1d12h`, `2h30m`.
+pub fn parse_duration(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration string");
+    }
+    let mut total_secs: u64 = 0;
+    let mut num_buf = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else {
+            if num_buf.is_empty() {
+                anyhow::bail!("invalid duration format: '{s}' (expected number before '{ch}')");
+            }
+            let n: u64 = num_buf.parse().with_context(|| format!("invalid number in duration: '{s}'"))?;
+            num_buf.clear();
+            let multiplier = match ch {
+                'd' => 86400,
+                'h' => 3600,
+                'm' => 60,
+                's' => 1,
+                _ => anyhow::bail!("invalid duration unit '{ch}' in '{s}' (expected d/h/m/s)"),
+            };
+            total_secs += n * multiplier;
+        }
+    }
+    if !num_buf.is_empty() {
+        anyhow::bail!("invalid duration format: '{s}' (trailing number without unit)");
+    }
+    Ok(total_secs)
+}
+
+/// Parse a human-readable size string into bytes.
+///
+/// Supported formats: `500mb`, `1gb`, `100kb`, `1024b`.
+/// Case-insensitive.
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        anyhow::bail!("empty size string");
+    }
+    // Split into numeric prefix and unit suffix
+    let num_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    if num_end == 0 {
+        anyhow::bail!("invalid size format: '{s}' (expected number)");
+    }
+    let num_str = &s[..num_end];
+    let unit = &s[num_end..];
+    let n: f64 = num_str.parse().with_context(|| format!("invalid number in size: '{s}'"))?;
+    let multiplier: u64 = match unit {
+        "b" | "" => 1,
+        "kb" | "k" => 1024,
+        "mb" | "m" => 1024 * 1024,
+        "gb" | "g" => 1024 * 1024 * 1024,
+        _ => anyhow::bail!("invalid size unit '{unit}' in '{s}' (expected b/kb/mb/gb)"),
+    };
+    Ok((n * multiplier as f64) as u64)
+}
+
+/// Run garbage collection on the cache directory.
+///
+/// Prunes entries older than `max_age_secs` (by mtime), then evicts oldest entries
+/// until total size is under `max_size_bytes`. If `dry_run` is true, no files are deleted.
+pub fn gc(project_dir: &Path, max_age_secs: u64, max_size_bytes: u64, dry_run: bool) -> Result<GcResult> {
+    let dir = cache_dir(project_dir);
+    if !dir.exists() {
+        return Ok(GcResult { pruned: 0, pruned_bytes: 0, remaining: 0, remaining_bytes: 0 });
+    }
+
+    let now = SystemTime::now();
+
+    // Collect all cache entries with their metadata
+    let mut entries: Vec<(PathBuf, u64, SystemTime)> = Vec::new(); // (path, size, mtime)
+    for bucket in fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let bucket = bucket?;
+        if !bucket.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(bucket.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let meta = entry.metadata()?;
+                entries.push((path, meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)));
+            }
+        }
+    }
+
+    let mut pruned: usize = 0;
+    let mut pruned_bytes: u64 = 0;
+    let mut kept: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+
+    // Phase 1: Age-based pruning
+    for (path, size, mtime) in entries {
+        let age = now.duration_since(mtime).unwrap_or_default();
+        if age.as_secs() > max_age_secs {
+            pruned += 1;
+            pruned_bytes += size;
+            if !dry_run {
+                let _ = fs::remove_file(&path);
+            }
+        } else {
+            kept.push((path, size, mtime));
+        }
+    }
+
+    // Phase 2: Size-based eviction (oldest first)
+    let total_kept_bytes: u64 = kept.iter().map(|(_, s, _)| s).sum();
+    if total_kept_bytes > max_size_bytes {
+        // Sort oldest first (ascending mtime)
+        kept.sort_by_key(|(_, _, mtime)| *mtime);
+        let mut current_bytes = total_kept_bytes;
+        let mut still_kept = Vec::new();
+        for (path, size, mtime) in kept {
+            if current_bytes > max_size_bytes {
+                pruned += 1;
+                pruned_bytes += size;
+                current_bytes -= size;
+                if !dry_run {
+                    let _ = fs::remove_file(&path);
+                }
+            } else {
+                still_kept.push((path, size, mtime));
+            }
+        }
+        kept = still_kept;
+    }
+
+    // Clean up empty bucket directories
+    if !dry_run {
+        if let Ok(buckets) = fs::read_dir(&dir) {
+            for bucket in buckets.flatten() {
+                if bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    // remove_dir only removes empty dirs
+                    let _ = fs::remove_dir(bucket.path());
+                }
+            }
+        }
+    }
+
+    let remaining = kept.len();
+    let remaining_bytes: u64 = kept.iter().map(|(_, s, _)| s).sum();
+
+    Ok(GcResult { pruned, pruned_bytes, remaining, remaining_bytes })
 }
 
 pub fn clean(project_dir: &Path) -> Result<bool> {
@@ -569,5 +732,167 @@ mod tests {
         assert!(removed);
         assert!(!cache.exists());
         assert!(irr_dir.join("stats.json").exists());
+    }
+
+    // --- Duration parsing tests ---
+
+    #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration("30d").unwrap(), 30 * 86400);
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("24h").unwrap(), 24 * 3600);
+    }
+
+    #[test]
+    fn test_parse_duration_combined() {
+        assert_eq!(parse_duration("1h30m").unwrap(), 3600 + 30 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_complex() {
+        assert_eq!(parse_duration("1d12h").unwrap(), 86400 + 12 * 3600);
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("3600s").unwrap(), 3600);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_no_unit() {
+        assert!(parse_duration("30").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_unit() {
+        assert!(parse_duration("30x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+    }
+
+    // --- Size parsing tests ---
+
+    #[test]
+    fn test_parse_size_megabytes() {
+        assert_eq!(parse_size("500mb").unwrap(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_gigabytes() {
+        assert_eq!(parse_size("1gb").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_kilobytes() {
+        assert_eq!(parse_size("100kb").unwrap(), 100 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_case_insensitive() {
+        assert_eq!(parse_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("500MB").unwrap(), 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_invalid() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("100xx").is_err());
+    }
+
+    // --- GC tests ---
+
+    /// Helper: create a fake cache entry file in the proper bucket structure.
+    fn create_cache_file(project_dir: &Path, key: &str, content: &str) -> PathBuf {
+        let (prefix, rest) = key.split_at(2);
+        let dir = cache_dir(project_dir).join(prefix);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{rest}.json"));
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// Helper: backdate a file's mtime by the given number of seconds.
+    fn backdate_mtime(path: &Path, age_secs: u64) {
+        use std::time::Duration;
+        let mtime = SystemTime::now() - Duration::from_secs(age_secs);
+        let ft = filetime::FileTime::from_system_time(mtime);
+        filetime::set_file_mtime(path, ft).unwrap();
+    }
+
+    #[test]
+    fn test_gc_empty_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = gc(tmp.path(), 86400 * 30, 1024 * 1024 * 1024, false).unwrap();
+        assert_eq!(result.pruned, 0);
+        assert_eq!(result.remaining, 0);
+    }
+
+    #[test]
+    fn test_gc_max_age_prunes_old_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = create_cache_file(tmp.path(), "aabbcc", r#"{"schema_version":1}"#);
+        let _new = create_cache_file(tmp.path(), "ddee ff", r#"{"schema_version":1}"#);
+        // Make old entry 10 days old
+        backdate_mtime(&old, 10 * 86400);
+
+        let result = gc(tmp.path(), 7 * 86400, u64::MAX, false).unwrap();
+        assert_eq!(result.pruned, 1);
+        assert_eq!(result.remaining, 1);
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn test_gc_max_size_evicts_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(1000);
+        let p1 = create_cache_file(tmp.path(), "aabbcc", &content);
+        let p2 = create_cache_file(tmp.path(), "ddeeff", &content);
+        let p3 = create_cache_file(tmp.path(), "gghhii", &content);
+        // Make p1 oldest, p3 newest
+        backdate_mtime(&p1, 300);
+        backdate_mtime(&p2, 200);
+        // p3 is current
+
+        // Max size = 2500 bytes (fits 2 of 3 entries at 1000 each)
+        let result = gc(tmp.path(), u64::MAX, 2500, false).unwrap();
+        assert_eq!(result.pruned, 1);
+        assert_eq!(result.remaining, 2);
+        // Oldest should be evicted
+        assert!(!p1.exists());
+        assert!(p2.exists());
+        assert!(p3.exists());
+    }
+
+    #[test]
+    fn test_gc_dry_run_does_not_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = create_cache_file(tmp.path(), "aabbcc", "data");
+        backdate_mtime(&old, 100 * 86400);
+
+        let result = gc(tmp.path(), 1 * 86400, u64::MAX, true).unwrap();
+        assert_eq!(result.pruned, 1);
+        // File still exists
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn test_gc_max_age_zero_prunes_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p1 = create_cache_file(tmp.path(), "aabbcc", "data1");
+        let p2 = create_cache_file(tmp.path(), "ddeeff", "data2");
+        // Backdate both by 2 seconds to ensure they're older than max_age=0
+        backdate_mtime(&p1, 2);
+        backdate_mtime(&p2, 2);
+
+        let result = gc(tmp.path(), 0, u64::MAX, false).unwrap();
+        assert_eq!(result.pruned, 2);
+        assert_eq!(result.remaining, 0);
     }
 }
