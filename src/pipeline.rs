@@ -290,6 +290,128 @@ fn phase_generate(
     Ok(Some((generation, all_mutants, sampled_from)))
 }
 
+/// Phase 1.5: Run type checker to filter mutants caught by static analysis.
+///
+/// Returns the filtered mutant list and any TypeCheck results generated.
+/// Mutants caught by the type checker are removed from `all_mutants` and
+/// recorded as `MutantStatus::TypeCheck`.
+fn phase_type_check(
+    config: &RunConfig,
+    ctx: &mut PipelineCtx,
+    all_mutants: &mut Vec<MutantCacheDescriptor>,
+) -> Result<Vec<MutantResult>> {
+    let type_checker_spec = match config.type_checker {
+        Some(ref spec) => spec,
+        None => return Ok(vec![]),
+    };
+
+    let phase_start = ctx.trace.now_us();
+    let tool = crate::type_check::tool_name_from_spec(type_checker_spec);
+    eprintln!("Running type checker ({tool})...");
+
+    let cache_dir = crate::cache::cache_dir(&ctx.project_dir);
+
+    // Step 1: Baseline — run type checker on original source (or load from cache).
+    let source_hash = crate::type_check::compute_source_hash(&config.paths_to_mutate)?;
+    let baseline_errors = if let Some(cached) = crate::type_check::load_cached_baseline(&cache_dir, &source_hash) {
+        tracing::debug!("Using cached type check baseline ({} errors)", cached.len());
+        cached
+    } else {
+        let baseline_cmd = crate::type_check::resolve_command(type_checker_spec, &config.paths_to_mutate[0]);
+        match crate::type_check::run_type_checker(&baseline_cmd) {
+            Ok(errors) => {
+                tracing::debug!("Baseline type check: {} errors", errors.len());
+                if let Err(e) = crate::type_check::save_baseline_cache(&cache_dir, &source_hash, &errors) {
+                    tracing::warn!("Failed to save type check baseline cache: {e}");
+                }
+                errors
+            }
+            Err(e) => {
+                eprintln!("  Warning: baseline type check failed ({e}), skipping type check filter");
+                return Ok(vec![]);
+            }
+        }
+    };
+
+    // Step 2: Run type checker on mutants directory.
+    let mutant_cmd = crate::type_check::resolve_command(type_checker_spec, &ctx.mutants_dir);
+    let mutant_errors = match crate::type_check::run_type_checker(&mutant_cmd) {
+        Ok(errors) => errors,
+        Err(e) => {
+            eprintln!("  Warning: mutant type check failed ({e}), skipping type check filter");
+            return Ok(vec![]);
+        }
+    };
+
+    // Step 3: Diff — subtract baseline errors.
+    let new_errors = crate::type_check::diff_errors(&mutant_errors, &baseline_errors);
+    tracing::debug!(
+        "Type check: {} mutant errors, {} baseline errors, {} new errors",
+        mutant_errors.len(),
+        baseline_errors.len(),
+        new_errors.len(),
+    );
+
+    // Step 4: Map errors to mutant names.
+    let all_descriptors: Vec<MutantCacheDescriptor> = all_mutants.clone();
+    let caught_names = crate::type_check::map_errors_to_mutants(
+        &new_errors,
+        &all_descriptors,
+        &ctx.mutants_dir,
+    );
+
+    if caught_names.is_empty() {
+        eprintln!("  no mutants caught by type checker");
+        ctx.trace.phase("type_check", phase_start, Some(serde_json::json!({
+            "tool": tool,
+            "caught": 0,
+        })));
+        return Ok(vec![]);
+    }
+
+    // Step 5: Build results for caught mutants.
+    let caught_set: std::collections::HashSet<&str> = caught_names.iter().map(|s| s.as_str()).collect();
+    let mut type_check_results = Vec::new();
+    for name in &caught_names {
+        type_check_results.push(crate::protocol::MutantResult {
+            mutant_name: name.clone(),
+            exit_code: 37,
+            duration: 0.0,
+            status: crate::protocol::MutantStatus::TypeCheck,
+        });
+
+        // Also store in cache so `irradiate results` sees them.
+        if !config.no_cache {
+            // Build a simple cache key for type-check results
+            crate::cache::store_entry(
+                &ctx.project_dir,
+                &format!("typecheck-{name}"),
+                37,
+                0.0,
+                crate::protocol::MutantStatus::TypeCheck,
+            )?;
+        }
+
+        tracing::debug!("  type check caught: {name}");
+    }
+
+    // Step 6: Remove caught mutants from the work list.
+    all_mutants.retain(|m| !caught_set.contains(m.mutant_name.as_str()));
+
+    eprintln!(
+        "  {} mutants caught by type checker ({tool})",
+        caught_names.len()
+    );
+
+    ctx.trace.phase("type_check", phase_start, Some(serde_json::json!({
+        "tool": tool,
+        "caught": caught_names.len(),
+        "remaining": all_mutants.len(),
+    })));
+
+    Ok(type_check_results)
+}
+
 /// Phase 2: Collect stats + validate, optionally pre-spawn workers.
 async fn phase_stats(
     config: &RunConfig,
@@ -806,10 +928,14 @@ pub async fn run(config: RunConfig) -> Result<()> {
     };
 
     // Phase 1: Generate mutations
-    let Some((generation, all_mutants, sampled_from)) = phase_generate(&config, &mut ctx)? else {
+    let Some((generation, mut all_mutants, sampled_from)) = phase_generate(&config, &mut ctx)? else {
         return Ok(()); // no mutants found or all filtered out
     };
-    let total_mutants = all_mutants.len();
+
+    // Phase 1.5: Type check filter (between generation and stats)
+    let type_check_results = phase_type_check(&config, &mut ctx, &mut all_mutants)?;
+
+    let remaining_mutants = all_mutants.len();
 
     // Cache pre-sync hook (before stats — stats reads cached entries)
     if let Some(ref cmd) = config.cache_pre_sync {
@@ -818,12 +944,15 @@ pub async fn run(config: RunConfig) -> Result<()> {
 
     // Phase 2: Stats + validation (+ pre-spawn workers)
     let (test_stats, pre_spawned) =
-        phase_stats(&config, &mut ctx, total_mutants, !all_mutants.is_empty(), python_version).await?;
+        phase_stats(&config, &mut ctx, remaining_mutants, !all_mutants.is_empty(), python_version).await?;
 
     // Phase 3+4: Schedule + execute
     let start = Instant::now();
     let (mut results, cache_counts, covered_work) =
-        phase_execute(&config, &mut ctx, &all_mutants, &test_stats, pre_spawned, total_mutants).await?;
+        phase_execute(&config, &mut ctx, &all_mutants, &test_stats, pre_spawned, remaining_mutants).await?;
+
+    // Prepend type-check results so they appear in the final output
+    results.extend(type_check_results);
 
     // Phase 4b: Verify survivors
     phase_verify_survivors(&config, &ctx, &mut results, &covered_work, &test_stats).await?;

@@ -258,7 +258,8 @@ fn stryker_status(status: MutantStatus) -> &'static str {
         MutantStatus::Survived => "Survived",
         MutantStatus::NoTests => "NoCoverage",
         MutantStatus::Timeout => "Timeout",
-        MutantStatus::TypeCheck | MutantStatus::Error => "RuntimeError",
+        MutantStatus::TypeCheck => "Killed",
+        MutantStatus::Error => "RuntimeError",
     }
 }
 
@@ -489,6 +490,7 @@ fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResu
     let mut survived = 0usize;
     let mut no_tests = 0usize;
     let mut timeout = 0usize;
+    let mut type_check = 0usize;
     let mut errors = 0usize;
     let mut mutants = Vec::new();
 
@@ -499,7 +501,8 @@ fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResu
             MutantStatus::Survived => survived += 1,
             MutantStatus::NoTests => no_tests += 1,
             MutantStatus::Timeout => timeout += 1,
-            _ => errors += 1,
+            MutantStatus::TypeCheck => type_check += 1,
+            MutantStatus::Error => errors += 1,
         }
         if show_all || status == MutantStatus::Survived {
             mutants.push(JsonMutantEntry { name: name.clone(), status });
@@ -507,9 +510,11 @@ fn build_json_results(all_results: &[(String, i32)], show_all: bool) -> JsonResu
     }
 
     let total = all_results.len();
-    let denominator = (killed + survived) as f64;
+    // TypeCheck mutants count as killed in the mutation score.
+    let effective_killed = killed + type_check;
+    let denominator = (effective_killed + survived) as f64;
     let mutation_score_pct = if denominator > 0.0 {
-        ((killed as f64 / denominator * 100.0) * 10.0).round() / 10.0
+        ((effective_killed as f64 / denominator * 100.0) * 10.0).round() / 10.0
     } else {
         0.0
     };
@@ -582,6 +587,7 @@ pub fn results(
     let mut killed = 0;
     let mut no_tests = 0;
     let mut timeout = 0;
+    let mut type_check = 0;
     let mut errors = 0;
 
     for (name, exit_code) in &all_results {
@@ -591,7 +597,8 @@ pub fn results(
             MutantStatus::Killed => killed += 1,
             MutantStatus::NoTests => no_tests += 1,
             MutantStatus::Timeout => timeout += 1,
-            _ => errors += 1,
+            MutantStatus::TypeCheck => type_check += 1,
+            MutantStatus::Error => errors += 1,
         }
         if show_all {
             let emoji = status_emoji(status);
@@ -607,8 +614,13 @@ pub fn results(
     }
 
     let total = all_results.len();
+    let type_check_str = if type_check > 0 {
+        format!("  TypeCheck: {type_check}")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "\nTotal: {total}  Killed: {killed}  Survived: {}  No tests: {no_tests}  Timeout: {timeout}  Errors: {errors}",
+        "\nTotal: {total}  Killed: {killed}{type_check_str}  Survived: {}  No tests: {no_tests}  Timeout: {timeout}  Errors: {errors}",
         survived.len()
     );
 
@@ -789,6 +801,7 @@ pub fn print_summary(
     let mut survived = 0usize;
     let mut no_tests = 0usize;
     let mut timeout = 0usize;
+    let mut type_check = 0usize;
     let mut errors = 0usize;
 
     for r in results {
@@ -797,9 +810,13 @@ pub fn print_summary(
             MutantStatus::Survived => survived += 1,
             MutantStatus::NoTests => no_tests += 1,
             MutantStatus::Timeout => timeout += 1,
-            _ => errors += 1,
+            MutantStatus::TypeCheck => type_check += 1,
+            MutantStatus::Error => errors += 1,
         }
     }
+
+    // TypeCheck mutants count as killed in the mutation score.
+    let effective_killed = killed + type_check;
 
     let total = results.len();
     let rate = if elapsed_secs > 0.0 {
@@ -809,9 +826,9 @@ pub fn print_summary(
     };
 
     // INV-5: Mutation score is always printed in summary output.
-    let tested = killed + survived;
+    let tested = effective_killed + survived;
     let score_str = if tested > 0 {
-        format!("{:.1}%", killed as f64 / tested as f64 * 100.0)
+        format!("{:.1}%", effective_killed as f64 / tested as f64 * 100.0)
     } else {
         "N/A".to_string()
     };
@@ -829,6 +846,9 @@ pub fn print_summary(
     eprintln!("  Cache hits: {0}", cache_counts.hits);
     eprintln!("  Cache misses: {0}", cache_counts.misses);
     eprintln!("  Killed:    {killed}");
+    if type_check > 0 {
+        eprintln!("  TypeCheck: {type_check}");
+    }
     eprintln!("  Survived:  {survived}");
     if no_tests > 0 {
         eprintln!("  No tests:  {no_tests}");
@@ -859,7 +879,7 @@ pub fn print_summary(
                 .map(|d| d.operator.as_str())
                 .unwrap_or("unknown");
             *operator_tested.entry(op).or_default() += 1;
-            if r.status == MutantStatus::Killed || r.status == MutantStatus::Timeout {
+            if r.status == MutantStatus::Killed || r.status == MutantStatus::Timeout || r.status == MutantStatus::TypeCheck {
                 *operator_killed.entry(op).or_default() += 1;
             }
         }
@@ -928,7 +948,7 @@ pub fn print_summary(
         }
     }
 
-    (killed, survived)
+    (effective_killed, survived)
 }
 
 fn status_emoji(status: MutantStatus) -> &'static str {
@@ -1198,7 +1218,7 @@ mod tests {
         assert_eq!(stryker_status(MutantStatus::NoTests), "NoCoverage");
         assert_eq!(stryker_status(MutantStatus::Timeout), "Timeout");
         assert_eq!(stryker_status(MutantStatus::Error), "RuntimeError");
-        assert_eq!(stryker_status(MutantStatus::TypeCheck), "RuntimeError");
+        assert_eq!(stryker_status(MutantStatus::TypeCheck), "Killed");
     }
 
     /// INV-3: Location line/column values are 1-indexed.
