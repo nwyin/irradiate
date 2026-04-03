@@ -735,6 +735,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         worker_ready_timeout: 30,
         cache_pre_sync: None,
         cache_post_sync: None,
+        type_checker: None,
     }
 }
 

@@ -139,6 +139,12 @@ enum Commands {
         /// Overrides cache_post_sync in pyproject.toml.
         #[arg(long)]
         cache_post_sync: Option<String>,
+
+        /// Run a type checker to filter mutants caught by static analysis.
+        /// Accepts a preset name (mypy, pyright, ty) or a raw command string.
+        /// Mutants that introduce type errors are marked as killed (exit code 37).
+        #[arg(long)]
+        type_checker: Option<String>,
     },
 
     /// Display mutation testing results
@@ -230,6 +236,7 @@ async fn main() -> Result<()> {
             worker_timeout,
             cache_pre_sync,
             cache_post_sync,
+            type_checker,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -282,6 +289,7 @@ async fn main() -> Result<()> {
                 worker_ready_timeout: worker_timeout,
                 cache_pre_sync: cache_pre_sync.or(file_config.cache_pre_sync),
                 cache_post_sync: cache_post_sync.or(file_config.cache_post_sync),
+                type_checker: type_checker.or(file_config.type_checker),
             })
             .await
         }

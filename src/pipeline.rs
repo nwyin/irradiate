@@ -65,6 +65,9 @@ pub struct RunConfig {
     pub cache_pre_sync: Option<String>,
     /// Shell command to run after the mutation testing run (e.g. upload remote cache).
     pub cache_post_sync: Option<String>,
+    /// Type checker preset or command string. When set, mutants that introduce type errors
+    /// are filtered out before test execution and marked as `TypeCheck`.
+    pub type_checker: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2870,6 +2873,7 @@ index 000..abc
             worker_ready_timeout: 30,
             cache_pre_sync: None,
             cache_post_sync: None,
+            type_checker: None,
         }
     }
 

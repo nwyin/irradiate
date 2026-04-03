@@ -44,6 +44,10 @@ pub struct IrradiateConfig {
     pub cache_max_age: Option<String>,
     /// Maximum total cache size when running `irradiate cache gc` (e.g. "1gb", "500mb").
     pub cache_max_size: Option<String>,
+    /// Type checker preset or command string.
+    /// Preset names: "mypy", "pyright", "ty".
+    /// Or a raw command string (whitespace-separated, `mutants/` is substituted).
+    pub type_checker: Option<String>,
 }
 
 /// Deserialize a field that accepts either a TOML string or array of strings.
