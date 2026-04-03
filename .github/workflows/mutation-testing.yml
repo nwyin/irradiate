@@ -1,0 +1,54 @@
+name: Mutation Testing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-mutants-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-mutants-
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@cargo-mutants
+
+      - name: Generate diff
+        run: git diff HEAD~1..HEAD > diff.patch
+
+      - name: Run cargo-mutants on diff
+        run: |
+          if [ ! -s diff.patch ]; then
+            echo "Empty diff, skipping mutation testing"
+            exit 0
+          fi
+          cargo mutants --in-diff diff.patch --output mutants-out -- --lib 2>&1 | tee mutants.log
+          # Report results but don't fail CI yet — let the team calibrate first
+          echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
+          tail -20 mutants.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants-out/
