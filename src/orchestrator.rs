@@ -73,6 +73,19 @@ enum WorkerEvent {
     Ready {
         worker_id: usize,
     },
+    /// A new worker connected and completed the handshake (ready message received).
+    /// Sent by background accept tasks to parallelize worker startup.
+    Connected {
+        worker_id: usize,
+        pid: u32,
+        reader: tokio::net::unix::OwnedReadHalf,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    },
+    /// Accept/handshake failed for a worker.
+    AcceptFailed {
+        worker_id: usize,
+        message: String,
+    },
     Result {
         worker_id: usize,
         result: MutantResult,
@@ -655,77 +668,7 @@ impl<'a> DispatchState<'a> {
         true
     }
 
-    /// Handle an accepted worker connection: read the ready message, register the worker.
-    async fn handle_accept(&mut self, stream: tokio::net::UnixStream) {
-        let worker_id = self.next_worker_id;
-        self.next_worker_id += 1;
-
-        let (reader, writer) = stream.into_split();
-        let mut buf_reader = BufReader::new(reader);
-
-        let mut line = String::new();
-        let ready_timeout = Duration::from_secs(self.config.worker_ready_timeout);
-        match timeout(ready_timeout, buf_reader.read_line(&mut line)).await {
-            Ok(Ok(0)) => {
-                error!(
-                    "Worker {worker_id}: disconnected before sending ready message. \
-                     Common causes: import error in your source code, missing dependency, \
-                     or incompatible pytest plugin."
-                );
-            }
-            Ok(Ok(_)) => {
-                match serde_json::from_str::<WorkerMessage>(line.trim()) {
-                    Ok(WorkerMessage::Ready { pid, .. }) => {
-                        info!("Worker {worker_id} (pid {pid}) connected and ready");
-
-                        // Trace: worker startup span
-                        if let Some(&spawn_us) = self.spawn_times.get(&worker_id) {
-                            let now = self.trace.now_us();
-                            self.trace.complete(
-                                "worker_startup".to_string(),
-                                "lifecycle",
-                                spawn_us,
-                                now.saturating_sub(spawn_us),
-                                worker_id,
-                                Some(serde_json::json!({"pid": pid})),
-                            );
-                        }
-
-                        self.worker_pids.insert(worker_id, pid);
-                        let msg_tx = spawn_worker_task(
-                            worker_id,
-                            buf_reader.into_inner(),
-                            writer,
-                            self.event_tx.clone(),
-                            self.config.default_timeout,
-                            self.config.timeout_multiplier,
-                        );
-                        self.worker_senders.insert(worker_id, msg_tx);
-                        self.idle_workers.push(worker_id);
-                    }
-                    Ok(other) => {
-                        warn!("Worker {worker_id}: unexpected first message: {other:?}");
-                    }
-                    Err(e) => {
-                        error!("Worker {worker_id}: failed to parse ready message: {e}");
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                error!("Worker {worker_id}: error reading ready message: {e}");
-            }
-            Err(_) => {
-                error!(
-                    "Worker {worker_id}: timeout reading ready message ({}s). \
-                     This usually means test collection is very slow or the worker is stuck. \
-                     Try increasing with --worker-timeout (e.g. --worker-timeout 120).",
-                    self.config.worker_ready_timeout,
-                );
-            }
-        }
-    }
-
-    /// Handle a worker event (ready, result, error, disconnected).
+    /// Handle a worker event (ready, connected, result, error, disconnected).
     async fn handle_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Ready { worker_id } => {
@@ -733,6 +676,37 @@ impl<'a> DispatchState<'a> {
                 if !self.idle_workers.contains(&worker_id) {
                     self.idle_workers.push(worker_id);
                 }
+            }
+            WorkerEvent::Connected { worker_id, pid, reader, writer } => {
+                self.pending_accepts -= 1;
+                // Trace worker startup
+                if let Some(&spawn_us) = self.spawn_times.get(&worker_id) {
+                    let now = self.trace.now_us();
+                    self.trace.complete(
+                        "worker_startup".to_string(),
+                        "lifecycle",
+                        spawn_us,
+                        now.saturating_sub(spawn_us),
+                        worker_id,
+                        Some(serde_json::json!({"pid": pid})),
+                    );
+                }
+
+                self.worker_pids.insert(worker_id, pid);
+                let msg_tx = spawn_worker_task(
+                    worker_id,
+                    reader,
+                    writer,
+                    self.event_tx.clone(),
+                    self.config.default_timeout,
+                    self.config.timeout_multiplier,
+                );
+                self.worker_senders.insert(worker_id, msg_tx);
+                self.idle_workers.push(worker_id);
+            }
+            WorkerEvent::AcceptFailed { worker_id, message } => {
+                self.pending_accepts -= 1;
+                error!("Worker {worker_id}: {message}");
             }
             WorkerEvent::Result { worker_id, result } => {
                 self.handle_result(worker_id, result).await;
@@ -898,6 +872,72 @@ impl<'a> DispatchState<'a> {
     }
 }
 
+/// Perform the accept handshake in a background task.
+/// Reads the worker's ready message and sends a Connected event back to the main loop.
+async fn accept_handshake(
+    stream: tokio::net::UnixStream,
+    worker_id: usize,
+    event_tx: mpsc::Sender<WorkerEvent>,
+    ready_timeout_secs: u64,
+) {
+    let (reader, writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    let ready_timeout = Duration::from_secs(ready_timeout_secs);
+
+    match timeout(ready_timeout, buf_reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => {
+            let _ = event_tx.send(WorkerEvent::AcceptFailed {
+                worker_id,
+                message: "disconnected before sending ready message. \
+                     Common causes: import error in your source code, missing dependency, \
+                     or incompatible pytest plugin.".to_string(),
+            }).await;
+        }
+        Ok(Ok(_)) => {
+            match serde_json::from_str::<WorkerMessage>(line.trim()) {
+                Ok(WorkerMessage::Ready { pid, .. }) => {
+                    info!("Worker {worker_id} (pid {pid}) connected and ready");
+                    let _ = event_tx.send(WorkerEvent::Connected {
+                        worker_id,
+                        pid,
+                        reader: buf_reader.into_inner(),
+                        writer,
+                    }).await;
+                }
+                Ok(other) => {
+                    let _ = event_tx.send(WorkerEvent::AcceptFailed {
+                        worker_id,
+                        message: format!("unexpected first message: {other:?}"),
+                    }).await;
+                }
+                Err(e) => {
+                    let _ = event_tx.send(WorkerEvent::AcceptFailed {
+                        worker_id,
+                        message: format!("failed to parse ready message: {e}"),
+                    }).await;
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = event_tx.send(WorkerEvent::AcceptFailed {
+                worker_id,
+                message: format!("error reading ready message: {e}"),
+            }).await;
+        }
+        Err(_) => {
+            let _ = event_tx.send(WorkerEvent::AcceptFailed {
+                worker_id,
+                message: format!(
+                    "timeout reading ready message ({ready_timeout_secs}s). \
+                     This usually means test collection is very slow or the worker is stuck. \
+                     Try increasing with --worker-timeout (e.g. --worker-timeout 120)."
+                ),
+            }).await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_work(
     listener: UnixListener,
@@ -931,20 +971,42 @@ async fn dispatch_work(
 
         tokio::select! {
             r = timeout(accept_timeout, listener.accept()), if state.pending_accepts > 0 => {
-                state.pending_accepts -= 1;
                 match r {
-                    Ok(Ok((stream, _))) => state.handle_accept(stream).await,
-                    Ok(Err(e)) => error!("Failed to accept worker connection: {e}"),
-                    Err(_) => error!(
-                        "Timeout waiting for worker connection (30s). \
-                         The worker process may have crashed during startup."
-                    ),
+                    Ok(Ok((stream, _))) => {
+                        // Spawn handshake in background so we can accept the next
+                        // worker immediately instead of blocking on read_line.
+                        // Don't decrement pending_accepts here — do it when we
+                        // receive Connected/AcceptFailed to avoid premature is_done().
+                        let worker_id = state.next_worker_id;
+                        state.next_worker_id += 1;
+                        let event_tx = state.event_tx.clone();
+                        let ready_timeout_secs = config.worker_ready_timeout;
+                        tokio::spawn(async move {
+                            accept_handshake(stream, worker_id, event_tx, ready_timeout_secs).await;
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        state.pending_accepts -= 1;
+                        error!("Failed to accept worker connection: {e}");
+                    }
+                    Err(_) => {
+                        state.pending_accepts -= 1;
+                        error!(
+                            "Timeout waiting for worker connection (30s). \
+                             The worker process may have crashed during startup."
+                        );
+                    }
                 }
             }
 
             event = event_rx.recv() => {
                 match event {
-                    Some(e) => state.handle_event(e).await,
+                    Some(e) => {
+                        state.handle_event(e).await;
+                        // Eagerly dispatch to newly idle workers instead of
+                        // waiting for the next loop iteration.
+                        state.dispatch_pending().await;
+                    }
                     None => {
                         warn!("All worker tasks finished");
                         let orphaned: Vec<String> = state.active_mutants.drain().map(|(_, n)| n).collect();
