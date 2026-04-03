@@ -8,13 +8,11 @@
 
 use crate::cache::MutantCacheDescriptor;
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A single type checking error reported by the type checker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeCheckError {
     pub file: PathBuf,
     pub line: usize,
@@ -229,132 +227,6 @@ pub fn parse_ty_output(stdout: &str) -> Result<Vec<TypeCheckError>> {
         });
     }
     Ok(errors)
-}
-
-// --- Baseline caching ---
-
-/// Compute a SHA256 hash of the contents of all source files.
-/// Files are sorted by path for determinism.
-pub fn compute_source_hash(paths: &[PathBuf]) -> Result<String> {
-    let mut all_files: Vec<PathBuf> = Vec::new();
-    for p in paths {
-        if p.is_file() {
-            all_files.push(p.to_path_buf());
-        } else if p.is_dir() {
-            collect_python_files(p, &mut all_files)?;
-        }
-    }
-    all_files.sort();
-
-    let mut hasher = Sha256::new();
-    for f in &all_files {
-        let content = std::fs::read(f)
-            .with_context(|| format!("Failed to read source file: {}", f.display()))?;
-        // Include path in hash so renames are detected
-        let rel = f.display().to_string();
-        hasher.update((rel.len() as u64).to_le_bytes());
-        hasher.update(rel.as_bytes());
-        hasher.update((content.len() as u64).to_le_bytes());
-        hasher.update(&content);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn collect_python_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_python_files(&path, out)?;
-        } else if path.extension().is_some_and(|e| e == "py") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// Baseline cache file path within the irradiate cache directory.
-fn baseline_cache_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("type_check_baseline.json")
-}
-
-/// Cached baseline data.
-#[derive(Debug, Serialize, Deserialize)]
-struct BaselineCache {
-    source_hash: String,
-    errors: Vec<TypeCheckError>,
-}
-
-/// Load a cached baseline if the source hash matches.
-pub fn load_cached_baseline(
-    cache_dir: &Path,
-    source_hash: &str,
-) -> Option<Vec<TypeCheckError>> {
-    let path = baseline_cache_path(cache_dir);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let cached: BaselineCache = serde_json::from_str(&content).ok()?;
-    if cached.source_hash == source_hash {
-        Some(cached.errors)
-    } else {
-        None
-    }
-}
-
-/// Save baseline errors to cache.
-pub fn save_baseline_cache(
-    cache_dir: &Path,
-    source_hash: &str,
-    errors: &[TypeCheckError],
-) -> Result<()> {
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("Failed to create cache dir: {}", cache_dir.display()))?;
-    let cached = BaselineCache {
-        source_hash: source_hash.to_string(),
-        errors: errors.to_vec(),
-    };
-    let data = serde_json::to_string_pretty(&cached)?;
-    std::fs::write(baseline_cache_path(cache_dir), data)?;
-    Ok(())
-}
-
-// --- Error diffing ---
-
-/// Subtract baseline errors from mutant errors.
-///
-/// Matches by (file basename, line, message) so that pre-existing type errors
-/// in the user's codebase don't cause false suppression.
-pub fn diff_errors(
-    mutant_errors: &[TypeCheckError],
-    baseline_errors: &[TypeCheckError],
-) -> Vec<TypeCheckError> {
-    let baseline_set: HashSet<(String, usize, &str)> = baseline_errors
-        .iter()
-        .map(|e| {
-            let basename = e
-                .file
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            (basename, e.line, e.message.as_str())
-        })
-        .collect();
-
-    mutant_errors
-        .iter()
-        .filter(|e| {
-            let basename = e
-                .file
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            !baseline_set.contains(&(basename, e.line, e.message.as_str()))
-        })
-        .cloned()
-        .collect()
 }
 
 // --- Harness stub ---
@@ -766,56 +638,6 @@ mod tests {
         assert_eq!(errors.len(), 3);
     }
 
-    // --- Baseline diffing ---
-
-    #[test]
-    fn test_diff_errors_subtracts_baseline() {
-        let baseline = vec![
-            TypeCheckError {
-                file: PathBuf::from("src/foo.py"),
-                line: 10,
-                message: "Pre-existing error".into(),
-            },
-        ];
-        let mutant_errors = vec![
-            TypeCheckError {
-                file: PathBuf::from("mutants/foo.py"),
-                line: 10,
-                message: "Pre-existing error".into(),
-            },
-            TypeCheckError {
-                file: PathBuf::from("mutants/foo.py"),
-                line: 15,
-                message: "New mutation error".into(),
-            },
-        ];
-        let diff = diff_errors(&mutant_errors, &baseline);
-        assert_eq!(diff.len(), 1);
-        assert_eq!(diff[0].message, "New mutation error");
-    }
-
-    #[test]
-    fn test_diff_errors_empty_baseline() {
-        let errors = vec![TypeCheckError {
-            file: PathBuf::from("a.py"),
-            line: 1,
-            message: "err".into(),
-        }];
-        let diff = diff_errors(&errors, &[]);
-        assert_eq!(diff.len(), 1);
-    }
-
-    #[test]
-    fn test_diff_errors_all_baseline() {
-        let errors = vec![TypeCheckError {
-            file: PathBuf::from("a.py"),
-            line: 1,
-            message: "err".into(),
-        }];
-        let diff = diff_errors(&errors, &errors);
-        assert!(diff.is_empty());
-    }
-
     // --- Trampoline parsing ---
 
     #[test]
@@ -985,64 +807,6 @@ def x_add__irradiate_1(a: int, b: int) -> int:
         assert!(content.contains("ProgrammaticFailException"));
         assert!(content.contains("record_hit"));
         assert!(content.contains("get_hits"));
-    }
-
-    // --- Baseline cache round-trip ---
-
-    #[test]
-    fn test_baseline_cache_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let errors = vec![TypeCheckError {
-            file: PathBuf::from("a.py"),
-            line: 1,
-            message: "err".into(),
-        }];
-        save_baseline_cache(tmp.path(), "abc123", &errors).unwrap();
-        let loaded = load_cached_baseline(tmp.path(), "abc123").unwrap();
-        assert_eq!(loaded, errors);
-    }
-
-    #[test]
-    fn test_baseline_cache_hash_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let errors = vec![TypeCheckError {
-            file: PathBuf::from("a.py"),
-            line: 1,
-            message: "err".into(),
-        }];
-        save_baseline_cache(tmp.path(), "abc123", &errors).unwrap();
-        let loaded = load_cached_baseline(tmp.path(), "different_hash");
-        assert!(loaded.is_none());
-    }
-
-    #[test]
-    fn test_baseline_cache_missing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let loaded = load_cached_baseline(tmp.path(), "abc123");
-        assert!(loaded.is_none());
-    }
-
-    // --- Source hash ---
-
-    #[test]
-    fn test_compute_source_hash_deterministic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("a.py");
-        std::fs::write(&f, "x = 1\n").unwrap();
-        let h1 = compute_source_hash(&[f.clone()]).unwrap();
-        let h2 = compute_source_hash(&[f]).unwrap();
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_compute_source_hash_changes_with_content() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = tmp.path().join("a.py");
-        std::fs::write(&f, "x = 1\n").unwrap();
-        let h1 = compute_source_hash(&[f.clone()]).unwrap();
-        std::fs::write(&f, "x = 2\n").unwrap();
-        let h2 = compute_source_hash(&[f]).unwrap();
-        assert_ne!(h1, h2);
     }
 
     // --- Tool name ---

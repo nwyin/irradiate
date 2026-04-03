@@ -354,18 +354,6 @@ fn phase_type_check(
             status: crate::protocol::MutantStatus::TypeCheck,
         });
 
-        // Also store in cache so `irradiate results` sees them.
-        if !config.no_cache {
-            // Build a simple cache key for type-check results
-            crate::cache::store_entry(
-                &ctx.project_dir,
-                &format!("typecheck-{name}"),
-                37,
-                0.0,
-                crate::protocol::MutantStatus::TypeCheck,
-            )?;
-        }
-
         tracing::debug!("  type check caught: {name}");
     }
 
@@ -925,7 +913,6 @@ pub async fn run(config: RunConfig) -> Result<()> {
     let (mut results, cache_counts, covered_work) =
         phase_execute(&config, &mut ctx, &all_mutants, &test_stats, pre_spawned, remaining_mutants).await?;
 
-    // Prepend type-check results so they appear in the final output
     results.extend(type_check_results);
 
     // Phase 4b: Verify survivors
