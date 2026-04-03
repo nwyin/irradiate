@@ -301,6 +301,8 @@ pub fn build_stryker_report(
         let covered_by: Vec<serde_json::Value> = if let Some(s) = stats {
             let func_key = name
                 .rsplit_once("__irradiate_")
+                .or_else(|| name.rsplit_once("__sp_"))
+                .or_else(|| name.rsplit_once("__decrem_"))
                 .map(|(prefix, _)| prefix)
                 .unwrap_or(name);
             s.tests_for_function(func_key)

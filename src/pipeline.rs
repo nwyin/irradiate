@@ -1096,17 +1096,58 @@ async fn run_source_patches(
 
     let pythonpath = build_pythonpath(harness_dir, &config.paths_to_mutate);
     let mut results = Vec::new();
+    let mut resolved_test_paths: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut test_file_hashes: HashMap<PathBuf, String> = HashMap::new();
 
     for sp in patches {
         let mutant_name = &sp.patch.mutant_name;
 
-        // Read the file in mutants/ (this is either trampolined or verbatim original).
+        // Determine test IDs using the func_key prefix (strip __sp_N or __decrem_N suffix).
+        let test_ids: Vec<String> = if let Some(ref stats) = test_stats {
+            let func_key = mutant_name
+                .rsplit_once("__sp_")
+                .or_else(|| mutant_name.rsplit_once("__decrem_"))
+                .map(|(prefix, _)| prefix)
+                .unwrap_or(mutant_name);
+            let tests = stats.tests_for_function_by_duration(func_key);
+            if tests.is_empty() && config.covered_only {
+                results.push(MutantResult {
+                    mutant_name: mutant_name.clone(),
+                    exit_code: 33,
+                    duration: 0.0,
+                    status: MutantStatus::NoTests,
+                });
+                continue;
+            }
+            tests
+        } else {
+            vec![]
+        };
+
+        // Check cache.
+        if !config.no_cache {
+            if let Some(key) = cache::build_cache_key(
+                project_dir, &sp.patch.descriptor, &test_ids,
+                &mut resolved_test_paths, &mut test_file_hashes,
+            )? {
+                if let Some(entry) = cache::load_entry(project_dir, &key)? {
+                    results.push(MutantResult {
+                        mutant_name: mutant_name.clone(),
+                        exit_code: entry.exit_code,
+                        duration: entry.duration,
+                        status: entry.status,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // Read the file in mutants/ (trampolined or verbatim).
         let mutants_file = mutants_dir.join(&sp.rel_path);
         let original_content = std::fs::read_to_string(&mutants_file)
             .with_context(|| format!("Failed to read {} for source-patching", mutants_file.display()))?;
 
-        // We need to patch the ORIGINAL source file, not the trampolined one.
-        // Read the original and apply the byte-range mutation.
+        // Patch the ORIGINAL source file (not the trampolined version).
         let orig_source = std::fs::read_to_string(&sp.original_file)
             .with_context(|| format!("Failed to read original source {}", sp.original_file.display()))?;
 
@@ -1117,44 +1158,9 @@ async fn run_source_patches(
             &orig_source[sp.patch.file_byte_end..],
         );
 
-        // Write the patched content to mutants/ (replacing the trampolined version temporarily).
+        // Write the patched content to mutants/ temporarily.
         std::fs::write(&mutants_file, &patched)
             .with_context(|| format!("Failed to write patch to {}", mutants_file.display()))?;
-
-        // Determine test IDs. For source-patch mutants, we look up by function qualname
-        // in the fast_stats test mapping (same as trampoline path). If no coverage info
-        // is available, run all tests.
-        let test_ids: Vec<String> = if let Some(ref stats) = test_stats {
-            // Try the func key pattern used by the fast stats plugin.
-            let qualname = match &sp.patch.descriptor.source_file.rsplit_once('.') {
-                Some(_) => {
-                    // Module-qualified: just use the function name directly
-                    sp.patch.descriptor.mutant_name
-                        .rsplit_once("__sp_")
-                        .or_else(|| sp.patch.descriptor.mutant_name.rsplit_once("__decrem_"))
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or(&sp.patch.descriptor.mutant_name)
-                        .to_string()
-                }
-                None => sp.patch.descriptor.mutant_name.clone(),
-            };
-            let tests = stats.tests_for_function_by_duration(&qualname);
-            if tests.is_empty() && config.covered_only {
-                // Skip this mutant — no coverage data available.
-                results.push(MutantResult {
-                    mutant_name: mutant_name.clone(),
-                    exit_code: 33,
-                    duration: 0.0,
-                    status: MutantStatus::NoTests,
-                });
-                // Restore the original file in mutants/.
-                std::fs::write(&mutants_file, &original_content)?;
-                continue;
-            }
-            tests
-        } else {
-            vec![]
-        };
 
         let estimated_secs = test_stats
             .as_ref()
@@ -1208,11 +1214,23 @@ async fn run_source_patches(
         // Restore the original file in mutants/.
         std::fs::write(&mutants_file, &original_content)?;
 
+        let status = MutantStatus::from_exit_code(exit_code, timed_out);
+
+        // Store in cache.
+        if !config.no_cache {
+            if let Some(key) = cache::build_cache_key(
+                project_dir, &sp.patch.descriptor, &test_ids,
+                &mut resolved_test_paths, &mut test_file_hashes,
+            )? {
+                cache::store_entry(project_dir, &key, exit_code, duration, status)?;
+            }
+        }
+
         results.push(MutantResult {
             mutant_name: mutant_name.clone(),
             exit_code,
             duration,
-            status: MutantStatus::from_exit_code(exit_code, timed_out),
+            status,
         });
     }
 
@@ -1571,6 +1589,21 @@ fn generate_mutants(
             }
             all_names.insert(module, names);
         }
+    }
+
+    // Add source-patch descriptors so they appear in reports and cache.
+    // Also add their names to names_by_module so write_meta_files includes them.
+    for sp in &all_source_patches {
+        descriptors_by_name.insert(
+            sp.patch.mutant_name.clone(),
+            sp.patch.descriptor.clone(),
+        );
+        // Derive module name from the source_file path in the descriptor.
+        let module = path_to_module(&sp.rel_path);
+        all_names
+            .entry(module)
+            .or_default()
+            .push(sp.patch.mutant_name.clone());
     }
 
     // Write the function map for the fast stats plugin (sys.monitoring / sys.settrace).
