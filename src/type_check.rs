@@ -376,11 +376,22 @@ pub fn map_errors_to_mutants(
     let mut caught: HashSet<String> = HashSet::new();
 
     for (file_path, file_errors) in &errors_by_file {
-        // Resolve the trampolined file path (may be absolute or relative to mutants_dir)
-        let trampoline_path = if file_path.is_absolute() {
+        // Resolve the trampolined file path.
+        // Type checker paths may be absolute, relative to cwd, or relative to mutants_dir.
+        // Try the path as-is first, then joined with mutants_dir, then try stripping
+        // a leading "mutants/" prefix (since the type checker runs on the mutants dir,
+        // it may report paths like "mutants/pkg/__init__.py" which are relative to cwd).
+        let trampoline_path = if file_path.exists() {
             file_path.clone()
         } else {
-            mutants_dir.join(file_path)
+            let joined = mutants_dir.join(file_path);
+            if joined.exists() {
+                joined
+            } else if let Ok(stripped) = file_path.strip_prefix(mutants_dir.file_name().unwrap_or_default()) {
+                mutants_dir.join(stripped)
+            } else {
+                mutants_dir.join(file_path)
+            }
         };
 
         let content = match std::fs::read_to_string(&trampoline_path) {

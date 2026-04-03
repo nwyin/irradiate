@@ -397,5 +397,70 @@ if [ "$REGEX_KILLED" -lt 1 ]; then
 fi
 echo "  regex_project killed mutants: OK"
 
+# -------------------------------------------------------------------
+echo ""
+echo "=== E2E: typed_project (type-check filter) ==="
+TYPED_FIXTURE="$SCRIPT_DIR/fixtures/typed_project"
+
+# Ensure venv exists with mypy
+if [ ! -d "$TYPED_FIXTURE/.venv" ]; then
+    echo "Setting up Python venv..."
+    (cd "$TYPED_FIXTURE" && uv venv --python 3.12 && uv pip install pytest mypy)
+fi
+# Ensure mypy is installed even if venv already existed
+if ! "$TYPED_FIXTURE/.venv/bin/python3" -m mypy --version >/dev/null 2>&1; then
+    (cd "$TYPED_FIXTURE" && uv pip install mypy)
+fi
+
+# Clean previous run
+rm -rf "$TYPED_FIXTURE/mutants" "$TYPED_FIXTURE/.irradiate"
+
+# Run with --type-checker using the venv's mypy (raw command form since mypy isn't on PATH)
+MYPY="$TYPED_FIXTURE/.venv/bin/mypy"
+TC_OUTPUT=$( cd "$TYPED_FIXTURE" && "$BINARY" run --python .venv/bin/python3 --type-checker "$MYPY --output json mutants/" --no-cache 2>&1 )
+echo "$TC_OUTPUT"
+
+# Verify type checker ran
+if ! echo "$TC_OUTPUT" | grep -q "type checker"; then
+    echo "FAIL: Expected 'type checker' in output"
+    exit 1
+fi
+echo "  type checker ran: OK"
+
+# Verify some mutants were caught by type checking
+TC_CAUGHT=$(echo "$TC_OUTPUT" | grep -oE '[0-9]+ mutants caught by type checker' | awk '{print $1}')
+if [ -z "${TC_CAUGHT:-}" ] || [ "$TC_CAUGHT" -lt 1 ]; then
+    echo "FAIL: Expected at least 1 mutant caught by type checker, got '${TC_CAUGHT:-0}'"
+    exit 1
+fi
+echo "  type checker caught $TC_CAUGHT mutants: OK"
+
+# Verify TypeCheck appears in the summary
+if echo "$TC_OUTPUT" | grep -q "TypeCheck:"; then
+    echo "  TypeCheck in summary: OK"
+else
+    echo "FAIL: Expected 'TypeCheck:' in summary output"
+    exit 1
+fi
+
+# Verify mutation score is still computed (pipeline didn't break)
+if ! echo "$TC_OUTPUT" | grep -qE "Score:.*%"; then
+    echo "FAIL: Expected mutation score in output"
+    exit 1
+fi
+echo "  mutation score present: OK"
+
+# Run WITHOUT --type-checker and verify no type check output
+rm -rf "$TYPED_FIXTURE/mutants" "$TYPED_FIXTURE/.irradiate"
+NO_TC_OUTPUT=$( cd "$TYPED_FIXTURE" && "$BINARY" run --python .venv/bin/python3 --no-cache 2>&1 )
+if echo "$NO_TC_OUTPUT" | grep -q "type checker"; then
+    echo "FAIL: type checker should not run without --type-checker flag"
+    exit 1
+fi
+echo "  no type checker without flag: OK"
+
+# Clean up
+rm -rf "$TYPED_FIXTURE/mutants" "$TYPED_FIXTURE/.irradiate"
+
 echo ""
 echo "=== E2E tests: PASS ==="
