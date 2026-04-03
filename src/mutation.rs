@@ -92,6 +92,9 @@ pub struct SourcePatchMutation {
     pub start_line: usize,
     /// 1-indexed end line of the function.
     pub end_line: usize,
+    /// For decorator_removal mutations, the decorator text (e.g., "@cache").
+    /// None for body mutations.
+    pub decorator_text: Option<String>,
 }
 
 /// Result of collecting all mutations from a source file.

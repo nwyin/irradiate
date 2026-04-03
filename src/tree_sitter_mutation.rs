@@ -323,6 +323,16 @@ fn collect_decorated_definition(
         }
     }
 
+    // Collect decorator_removal mutations for ALL decorators (both descriptor and non-descriptor).
+    collect_decorator_removal_mutations(
+        decorated_node,
+        definition,
+        class_name,
+        source,
+        ignored_lines,
+        source_patch_results,
+    );
+
     if has_non_descriptor {
         // Non-descriptor decorator: collect body mutations as source patches.
         collect_source_patches_from_function(
@@ -338,6 +348,78 @@ fn collect_decorated_definition(
         if let Some(fm) = collect_function_mutations(definition, class_name, source, ignored_lines, Some(kind)) {
             trampoline_results.push(fm);
         }
+    }
+}
+
+/// Collect decorator_removal mutations: each decorator on a function is a separate mutant
+/// where that decorator line is removed entirely.
+fn collect_decorator_removal_mutations(
+    decorated_node: Node<'_>,
+    function_node: Node<'_>,
+    class_name: Option<&str>,
+    source: &str,
+    ignored_lines: &std::collections::HashSet<usize>,
+    results: &mut Vec<SourcePatchMutation>,
+) {
+    let name_node = match function_node.child_by_field_name("name") {
+        Some(n) => n,
+        None => return,
+    };
+    let name = node_text(source, name_node).to_string();
+    let fn_start = function_node.start_byte();
+    let fn_end = function_node.end_byte();
+    let func_source = &source[fn_start..fn_end];
+
+    let start_line = decorated_node.start_position().row + 1;
+    let end_line = decorated_node.end_position().row + 1;
+
+    let mut cursor = decorated_node.walk();
+    for child in decorated_node.children(&mut cursor) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+
+        let dec_line = child.start_position().row + 1;
+        if ignored_lines.contains(&dec_line) {
+            continue;
+        }
+
+        // The decorator node spans from `@` to the end of the decorator expression/arguments.
+        // We need to remove from the start of the decorator to the start of the next line.
+        let dec_start = child.start_byte();
+        let dec_end_byte = child.end_byte();
+
+        // Find the end of the decorator line (include the trailing newline).
+        let line_end = source[dec_end_byte..]
+            .find('\n')
+            .map(|pos| dec_end_byte + pos + 1)
+            .unwrap_or(dec_end_byte);
+
+        // Also include any leading whitespace (indentation) on the decorator line.
+        let line_start = source[..dec_start]
+            .rfind('\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+
+        let original = source[line_start..line_end].to_string();
+
+        // Get a readable name for the decorator (e.g., "@cache", "@app.route(...)")
+        let dec_text = node_text(source, child).to_string();
+
+        results.push(SourcePatchMutation {
+            file_byte_start: line_start,
+            file_byte_end: line_end,
+            original,
+            replacement: String::new(),
+            operator: "decorator_removal",
+            function_name: name.clone(),
+            class_name: class_name.map(ToOwned::to_owned),
+            function_source: func_source.to_string(),
+            fn_byte_offset: fn_start,
+            start_line,
+            end_line,
+            decorator_text: Some(dec_text),
+        });
     }
 }
 
@@ -403,6 +485,7 @@ fn collect_source_patches_from_function(
             fn_byte_offset: fn_start,
             start_line,
             end_line,
+            decorator_text: None,
         });
     }
 }
@@ -3047,9 +3130,15 @@ class Foo:
             !result.trampoline.is_empty(),
             "@property should use trampoline path"
         );
+        // Body mutations go through trampoline; only decorator_removal goes through source-patch.
+        let non_removal: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator != "decorator_removal")
+            .collect();
         assert!(
-            result.source_patches.is_empty(),
-            "@property should not produce source-patch mutations"
+            non_removal.is_empty(),
+            "@property body mutations should not be source-patched"
         );
     }
 
@@ -3073,12 +3162,27 @@ class Svc:
             "only @property method goes through trampoline"
         );
         assert_eq!(result.trampoline[0].name, "name");
+
+        // Body mutations for @custom_decorator go through source-patch.
+        let body_patches: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator != "decorator_removal")
+            .collect();
         assert!(
-            !result.source_patches.is_empty(),
-            "@custom_decorator method should produce source-patch mutations"
+            !body_patches.is_empty(),
+            "@custom_decorator method should produce source-patch body mutations"
         );
-        assert!(result.source_patches.iter().all(|sp| sp.function_name == "process"));
-        assert!(result.source_patches.iter().all(|sp| sp.class_name.as_deref() == Some("Svc")));
+        assert!(body_patches.iter().all(|sp| sp.function_name == "process"));
+        assert!(body_patches.iter().all(|sp| sp.class_name.as_deref() == Some("Svc")));
+
+        // Decorator removal mutations exist for both decorators.
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 2, "both @property and @custom_decorator get removal mutations");
     }
 
     #[test]
@@ -3117,6 +3221,114 @@ def compute(x):
         // Start line should include the first decorator.
         let first = &result.source_patches[0];
         assert_eq!(first.start_line, 1, "start_line should include decorator lines");
+    }
+
+    // --- Decorator removal tests ---
+
+    #[test]
+    fn decorator_removal_single_decorator() {
+        let source = "\
+@cache
+def compute(x):
+    return x * 2
+";
+        let result = collect_all_mutations(source);
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 1, "should produce 1 decorator_removal mutation");
+        assert_eq!(removals[0].replacement, "");
+        assert!(removals[0].original.contains("@cache"));
+        assert_eq!(
+            removals[0].decorator_text.as_deref(),
+            Some("@cache")
+        );
+    }
+
+    #[test]
+    fn decorator_removal_multiple_decorators() {
+        let source = "\
+@login_required
+@cache
+def get_user(user_id):
+    return user_id + 1
+";
+        let result = collect_all_mutations(source);
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 2, "each decorator should be a separate removal mutant");
+        // Verify the decorators are distinct.
+        let texts: Vec<_> = removals.iter().map(|r| r.decorator_text.as_deref().unwrap()).collect();
+        assert!(texts.contains(&"@login_required"));
+        assert!(texts.contains(&"@cache"));
+    }
+
+    #[test]
+    fn decorator_removal_with_arguments() {
+        let source = "\
+@app.route(\"/users\")
+def list_users():
+    return 1 + 2
+";
+        let result = collect_all_mutations(source);
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 1);
+        // The entire decorator line including arguments should be removed.
+        assert!(removals[0].original.contains("@app.route"));
+        assert!(removals[0].original.contains("\"/users\""));
+    }
+
+    #[test]
+    fn decorator_removal_multiline_decorator() {
+        let source = "\
+@pytest.mark.parametrize(
+    \"x\", [1, 2, 3]
+)
+def test_add(x):
+    return x + 1
+";
+        let result = collect_all_mutations(source);
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 1, "multi-line decorator should be a single removal");
+        // The removal should span from the @ to the closing paren line.
+        let removed = &removals[0].original;
+        assert!(removed.contains("@pytest.mark.parametrize"));
+        assert!(removed.contains("[1, 2, 3]"));
+    }
+
+    #[test]
+    fn decorator_removal_also_applies_to_descriptor_decorators() {
+        // Removing @property is a valid mutation (the trampoline handles the body,
+        // but decorator_removal is a source-patch operation).
+        let source = "\
+class Foo:
+    @property
+    def bar(self):
+        return 42
+";
+        let result = collect_all_mutations(source);
+        let removals: Vec<_> = result
+            .source_patches
+            .iter()
+            .filter(|sp| sp.operator == "decorator_removal")
+            .collect();
+        assert_eq!(removals.len(), 1);
+        assert!(removals[0].original.contains("@property"));
+        // The body mutations should still go through trampoline.
+        assert!(!result.trampoline.is_empty());
     }
 
     #[test]
