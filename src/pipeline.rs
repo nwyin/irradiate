@@ -904,9 +904,87 @@ fn run_sync_hook(label: &str, command: &str, project_dir: &Path) {
     }
 }
 
+/// Get total physical RAM in megabytes. Returns None if detection fails.
+fn get_total_ram_mb() -> Option<u64> {
+    get_total_ram_mb_native()
+}
+
+#[cfg(target_os = "macos")]
+fn get_total_ram_mb_native() -> Option<u64> {
+    let mut memsize: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_ptr() as *mut _,
+            2,
+            &mut memsize as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret == 0 {
+        Some(memsize / (1024 * 1024))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_total_ram_mb_native() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = content.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_total_ram_mb_native() -> Option<u64> {
+    None
+}
+
+/// Print system info at startup and warn about low memory.
+fn print_system_info(config: &RunConfig) {
+    let ram_mb = get_total_ram_mb();
+    let ram_str = ram_mb
+        .map(|mb| format!("{:.0} GB RAM", mb as f64 / 1024.0))
+        .unwrap_or_else(|| "unknown RAM".to_string());
+
+    let mem_str = if config.max_worker_memory_mb > 0 {
+        format!(", {}MB memory limit", config.max_worker_memory_mb)
+    } else {
+        String::new()
+    };
+
+    let fork_str = if config.no_fork { ", no-fork" } else { "" };
+
+    eprintln!(
+        "irradiate: {} workers, {}{mem_str}{fork_str}",
+        config.workers, ram_str,
+    );
+
+    // Warn if estimated peak memory exceeds 80% of physical RAM.
+    if let Some(ram_mb) = ram_mb {
+        let estimated_peak_mb = (config.workers as u64) * 200 + 500;
+        let threshold = ram_mb * 80 / 100;
+        if estimated_peak_mb > threshold {
+            let suggested = ((threshold.saturating_sub(500)) / 200).max(1);
+            eprintln!(
+                "warning: {} workers may exceed available memory ({} GB). \
+                 Consider --workers {} or adding workers = {} to pyproject.toml.",
+                config.workers,
+                ram_mb / 1024,
+                suggested,
+                suggested,
+            );
+        }
+    }
+}
+
 /// Run the full mutation testing pipeline.
 pub async fn run(config: RunConfig) -> Result<()> {
     let python_version = validate_environment(&config)?;
+    print_system_info(&config);
 
     let project_dir = std::env::current_dir()?;
     let mutants_dir = project_dir.join("mutants");

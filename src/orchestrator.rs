@@ -460,6 +460,10 @@ struct DispatchState<'a> {
     worker_pids: HashMap<usize, u32>,
     workers_pending_memory_recycle: HashSet<usize>,
 
+    // Crash budget: stop respawning after too many unexpected crashes
+    crash_count: usize,
+    max_crashes: usize,
+
     // Tracing
     spawn_times: HashMap<usize, u64>,
     dispatch_times: HashMap<usize, (u64, String)>,
@@ -508,6 +512,8 @@ impl<'a> DispatchState<'a> {
             pending_accepts,
             worker_pids: HashMap::new(),
             workers_pending_memory_recycle: HashSet::new(),
+            crash_count: 0,
+            max_crashes: processes.len() * 3,
             spawn_times,
             dispatch_times: HashMap::new(),
             trace,
@@ -797,16 +803,22 @@ impl<'a> DispatchState<'a> {
         if !self.worker_senders.contains_key(&worker_id) && !self.active_mutants.contains_key(&worker_id) {
             debug!("Worker {worker_id}: disconnected cleanly");
         } else {
-            warn!(
-                "Worker {worker_id} crashed. \
-                 If this keeps happening, try reducing parallelism with --workers."
-            );
+            self.crash_count += 1;
             self.record_worker_error(worker_id);
             self.worker_senders.remove(&worker_id);
 
-            if !self.work_queue.is_empty() {
-                info!(
-                    "Respawning worker to replace crashed {worker_id}"
+            if self.crash_count >= self.max_crashes {
+                warn!(
+                    "Worker {worker_id} crashed ({}/{} crash budget exhausted). \
+                     Not replacing — pool shrinking to {} workers. \
+                     Reduce --workers or add workers = N to pyproject.toml.",
+                    self.crash_count, self.max_crashes,
+                    self.worker_senders.len(),
+                );
+            } else if !self.work_queue.is_empty() {
+                warn!(
+                    "Worker {worker_id} crashed ({}/{}). Respawning.",
+                    self.crash_count, self.max_crashes,
                 );
                 self.respawn_worker();
             }
@@ -823,12 +835,14 @@ impl<'a> DispatchState<'a> {
         for (worker_id, pid) in active_pids {
             if !is_process_alive(pid) {
                 warn!("Worker {worker_id} (pid {pid}) died — marking active mutant as error");
+                self.crash_count += 1;
                 self.record_worker_error(worker_id);
                 self.worker_senders.remove(&worker_id);
                 self.worker_pids.remove(&worker_id);
 
-                if !self.work_queue.is_empty() {
-                    info!("Respawning worker to replace dead {worker_id}");
+                if !self.work_queue.is_empty() && self.crash_count < self.max_crashes {
+                    info!("Respawning worker to replace dead {worker_id} ({}/{})",
+                        self.crash_count, self.max_crashes);
                     self.respawn_worker();
                 }
             }

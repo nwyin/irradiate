@@ -48,6 +48,11 @@ pub struct IrradiateConfig {
     /// Preset names: "mypy", "pyright", "ty".
     /// Or a raw command string (whitespace-separated, `mutants/` is substituted).
     pub type_checker: Option<String>,
+    /// Number of worker processes. Defaults to CPU count when absent.
+    pub workers: Option<usize>,
+    /// Recycle workers whose RSS exceeds this many megabytes. 0 = disabled.
+    /// Defaults to 512 on macOS (no OOM killer), 0 on Linux.
+    pub max_worker_memory_mb: Option<usize>,
 }
 
 /// Deserialize a field that accepts either a TOML string or array of strings.
@@ -394,6 +399,31 @@ paths_to_mutate = "src"
         .unwrap();
         let cfg = load_config(tmp.path()).unwrap();
         assert_eq!(cfg.paths_to_mutate, Some(vec!["irr_src".to_string()]));
+    }
+
+    #[test]
+    fn test_workers_and_memory_config() {
+        let toml_str = r#"
+[tool.irradiate]
+workers = 4
+max_worker_memory_mb = 256
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert_eq!(irr.workers, Some(4));
+        assert_eq!(irr.max_worker_memory_mb, Some(256));
+    }
+
+    #[test]
+    fn test_workers_and_memory_absent() {
+        let toml_str = r#"
+[tool.irradiate]
+paths_to_mutate = "src"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert!(irr.workers.is_none());
+        assert!(irr.max_worker_memory_mb.is_none());
     }
 
     #[test]

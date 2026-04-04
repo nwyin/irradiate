@@ -102,9 +102,10 @@ enum Commands {
         #[arg(long)]
         python: Option<String>,
 
-        /// Recycle workers whose RSS exceeds this threshold in megabytes (0 to disable)
-        #[arg(long, default_value_t = 0)]
-        max_worker_memory: usize,
+        /// Recycle workers whose RSS exceeds this threshold in megabytes.
+        /// Default: 512 on macOS, 0 (unlimited) on Linux. Pass 0 to disable.
+        #[arg(long)]
+        max_worker_memory: Option<usize>,
 
         /// Disable fork-per-mutant in workers (default on macOS to avoid kernel panics
         /// from memory pressure). Slightly less isolation but avoids fork() overhead.
@@ -322,7 +323,7 @@ async fn main() -> Result<()> {
                 tests_dir: tests_dir
                     .or(file_config.tests_dir)
                     .unwrap_or_else(|| "tests".to_string()),
-                workers: workers.unwrap_or_else(num_cpus::get),
+                workers: workers.or(file_config.workers).unwrap_or_else(num_cpus::get),
                 timeout_multiplier,
                 no_stats,
                 covered_only,
@@ -332,7 +333,9 @@ async fn main() -> Result<()> {
                 } else {
                     Some(mutant)
                 },
-                max_worker_memory_mb: max_worker_memory,
+                max_worker_memory_mb: max_worker_memory
+                    .or(file_config.max_worker_memory_mb)
+                    .unwrap_or(if cfg!(target_os = "macos") { 512 } else { 0 }),
                 isolate,
                 verify_survivors,
                 do_not_mutate,

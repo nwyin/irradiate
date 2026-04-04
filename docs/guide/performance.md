@@ -85,7 +85,7 @@ For projects with 1000+ mutants, irradiate's bounded memory and duration-aware s
 
 For projects with pre-existing test failures or complex layouts (src-layout, namespace packages), irradiate is more likely to work out of the box. mutmut's stats phase hard-exits on any test failure.
 
-On macOS, mutmut has known fork crashes on macOS 13.2+ ([boxed/mutmut#446](https://github.com/boxed/mutmut/issues/446)). irradiate's worker architecture avoids this.
+On macOS, mutmut has known fork crashes on macOS 13.2+ ([boxed/mutmut#446](https://github.com/boxed/mutmut/issues/446)). irradiate defaults to `--no-fork` mode on macOS, running tests in-process within each worker instead of forking per mutant. This avoids the memory pressure that can cause macOS kernel panics (macOS has no OOM killer — exhausting memory crashes the entire system). Workers are also recycled at 512MB RSS by default on macOS. Use `--fork` to override if your project needs fork isolation and you have sufficient RAM.
 
 For CI pipelines, irradiate provides `--fail-under`, GitHub Actions annotations, Stryker JSON reports, and `--diff` for incremental runs.
 
