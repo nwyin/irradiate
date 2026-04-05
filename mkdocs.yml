@@ -70,6 +70,7 @@ nav:
     - Quick Start: getting-started/quickstart.md
     - Configuration: getting-started/configuration.md
   - Guide:
+    - When to Use: guide/when-to-use.md
     - Understanding Results: guide/understanding-results.md
     - Surviving Mutants: guide/surviving-mutants.md
     - CI Integration: guide/ci-integration.md
