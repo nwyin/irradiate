@@ -5,13 +5,13 @@ description: Where mutation testing pays for itself and where it doesn't. A prac
 
 # When Mutation Testing Is Worth It
 
-Mutation testing is not a tool you run on every file in every project. It has real compute cost (O(mutants x test suite time)) and the value of what it finds varies dramatically depending on what kind of code you're testing. This page helps you decide where to invest that budget.
+Mutation testing is not a tool you run on every file in every project. It has real compute cost (O(mutants x test suite time)), and the value of what it finds varies dramatically depending on what kind of code you're testing.
 
 ## The three conditions
 
 Mutation testing pays for itself when three things converge:
 
-1. The code has a precise correctness contract. There's a clear definition of "right" and "wrong," not "it roughly works" or "the loss goes down." If you can write a spec for the function's behavior, mutations to that behavior are meaningful. If correctness is fuzzy, mutations generate noise.
+1. The code has a precise correctness contract. There's a clear definition of "right" and "wrong," not "it roughly works." If you can write a spec for the function's behavior, mutations to that behavior are meaningful. If correctness is fuzzy, mutations generate noise.
 
 2. The test suite is deterministic and reasonably fast. Mutation testing multiplies your test suite runtime by the number of mutants. Flaky tests produce false kills (or false survivals). Slow suites make the whole process impractical. The sweet spot is a module with 50-500 fast, deterministic tests.
 
@@ -35,7 +35,7 @@ Transformation passes, type inference rules, optimization correctness, AST rewri
 
 ### Core algorithm libraries
 
-Crypto primitives, consensus protocol implementations, scheduling algorithms, financial calculation engines, constraint solvers. The spec is precise, the consequences of subtle incorrectness are high, and the code is relatively small but dense with conditional logic. A surviving mutant in a Raft implementation or an order matching engine is genuinely scary.
+Crypto primitives, consensus protocol implementations, scheduling algorithms, financial calculation engines, constraint solvers. The spec is precise, the consequences of subtle incorrectness are high, and the code is relatively small but dense with conditional logic.
 
 ### Protocol implementations
 
@@ -49,9 +49,7 @@ Input validation functions, permission checks, rate limiters, auth middleware. T
 
 ### Network and HTTP client libraries
 
-The framing and encoding layers benefit (see above), but as you move up the stack, tests become more integration-style. Mutations start testing "did my mock get called correctly" rather than real correctness properties. We ran irradiate on httpx and found real gaps in the decoder layer (chunking boundaries, line decoding, compression edge cases), but the client-level code was mostly well-covered by existing integration tests.
-
-Test suite speed matters here too. httpx has 1,400 tests that take ~3s per full run. That's workable for targeted mutation testing on specific modules, but expensive for a full-codebase sweep.
+The framing and encoding layers benefit (see above), but as you move up the stack, tests become more integration-style. Mutations start testing "did my mock get called correctly" rather than real correctness properties.
 
 ### Utility libraries
 
@@ -61,17 +59,11 @@ Collections, itertools-style helpers, string manipulation, date/time wrappers. T
 
 ### CRUD apps and web backends
 
-The business logic in a typical web app is often thin. The interesting bugs are integration issues: wrong database query, auth misconfiguration, race conditions between services. Mutation testing operates at the unit level. It can tell you that your `calculate_discount` function isn't fully tested, but it won't find that your checkout endpoint calls the wrong service under load.
+The business logic in a typical web app is often thin. The interesting bugs are integration issues: wrong database query, auth misconfiguration, race conditions between services. Mutation testing operates at the unit level.
 
 The test suites are also typically slow (database-backed, API round-trips) and sometimes flaky, which makes mutation testing expensive and noisy. The findings tend to be things like "you didn't assert the HTTP status code," which is real but low-value relative to the compute cost.
 
-If you do use mutation testing on a web app, scope it to the algorithmic core: the pricing engine, the permission model, the query builder. Leave the view layer alone.
-
-### Deep learning and training code
-
-Training loops don't have precise correctness contracts. You're optimizing a loss function, and the test suite is typically checking tensor shapes and smoke-running a forward pass. Mutating a learning rate schedule or a normalization epsilon doesn't produce a clean "this is wrong" signal because nothing in the test suite verifies converged model quality.
-
-Inference code and data preprocessing pipelines are a better fit since they have deterministic inputs and outputs. But the training loop itself is not a good mutation testing target.
+If you do use mutation testing on a web app, scope it to the algorithmic core: the pricing engine, the permission model, the query builder.
 
 ### Glue code and configuration
 
