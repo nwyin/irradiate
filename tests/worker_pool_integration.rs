@@ -870,6 +870,120 @@ async fn test_run_isolated_multiple_items() {
     assert_eq!(results[1].status, MutantStatus::Survived, "Second mutant must survive");
 }
 
+/// Timeouts from infinite-loop mutants must not exhaust the crash budget.
+///
+/// Parser mutations commonly create infinite loops (e.g. `while i < n` → `while i > n`).
+/// These cause per-mutant timeouts. Previously, each timeout counted as a "crash" toward
+/// the crash budget (workers * 3), killing the entire pool on timeout-heavy workloads.
+/// Now timeouts produce MutantStatus::Timeout and the worker is respawned without
+/// consuming crash budget.
+#[tokio::test]
+async fn test_timeout_does_not_exhaust_crash_budget() {
+    let timeout_project = project_root().join("tests/fixtures/timeout_project");
+    let python = fixture_python();
+
+    let (_tmp, mutant_names) = generate_mutants_for_project(
+        &timeout_project,
+        "src/timeout_lib/__init__.py",
+        "timeout_lib",
+    );
+
+    let harness_dir = harness::extract_harness(&timeout_project).expect("harness extraction");
+    let pythonpath = pipeline::build_pythonpath(&harness_dir, &[timeout_project.join("src")]);
+    let mutants_dir = _tmp.path().to_path_buf();
+
+    let test_stats = stats::collect_stats(
+        &python,
+        &timeout_project,
+        &pythonpath,
+        &mutants_dir,
+        "tests",
+        &[],
+        300,
+    )
+    .expect("Stats collection should succeed");
+
+    // Find test IDs
+    let test_ids: Vec<String> = test_stats.duration_by_test.keys().cloned().collect();
+
+    // Find mutants for count_up_to (will include compop_swap that creates infinite loops)
+    let count_mutants: Vec<String> = mutant_names
+        .iter()
+        .filter(|n| n.contains("count_up_to"))
+        .cloned()
+        .collect();
+
+    // Find an add mutant (should be killed normally, no timeout)
+    let add_mutant = mutant_names
+        .iter()
+        .find(|n| n.contains("x_add__irradiate_"))
+        .expect("Should have an add mutant");
+
+    // Build work items: count_up_to mutants first (some will timeout),
+    // then add mutant last (must still be processed — proves pool survived).
+    let mut work_items: Vec<WorkItem> = count_mutants
+        .iter()
+        .map(|name| WorkItem {
+            mutant_name: name.clone(),
+            test_ids: test_ids.clone(),
+            estimated_duration_secs: 0.1,
+            timeout_secs: 2.0, // 2 second timeout — infinite loops hit this fast
+        })
+        .collect();
+
+    work_items.push(WorkItem {
+        mutant_name: add_mutant.clone(),
+        test_ids: test_ids.clone(),
+        estimated_duration_secs: 0.1,
+        timeout_secs: 30.0,
+    });
+
+    let total_items = work_items.len();
+
+    let config = PoolConfig {
+        num_workers: 1,
+        python,
+        project_dir: timeout_project.clone(),
+        mutants_dir,
+        tests_dir: timeout_project.join("tests"),
+        timeout_multiplier: 1.0,
+        pythonpath,
+        ..Default::default()
+    };
+
+    let (results, _trace) = run_worker_pool(&config, work_items, None)
+        .await
+        .expect("Worker pool must complete even with timeout-heavy mutants");
+
+    assert_eq!(
+        results.len(),
+        total_items,
+        "All mutants must produce results (pool must not die from timeouts)"
+    );
+
+    // At least one timeout should have occurred (from infinite loop mutants)
+    let timeout_count = results
+        .iter()
+        .filter(|r| r.status == MutantStatus::Timeout)
+        .count();
+    assert!(
+        timeout_count > 0,
+        "At least one count_up_to mutant should timeout (infinite loop)"
+    );
+
+    // The add mutant at the end must have been processed (not marked as Error from pool death)
+    let add_result = results
+        .iter()
+        .find(|r| r.mutant_name == *add_mutant)
+        .expect("Add mutant must have a result");
+    assert_eq!(
+        add_result.status,
+        MutantStatus::Killed,
+        "Add mutant must be killed (proves pool survived past timeouts), got {:?}",
+        add_result.status
+    );
+}
+
 /// INV-2 + INV-3: The verify-survivors cache correction pipeline.
 ///
 /// When verify-survivors detects a false negative (a mutant that survived the warm
