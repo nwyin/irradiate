@@ -51,7 +51,7 @@ pub struct IrradiateConfig {
     /// Number of worker processes. Defaults to CPU count when absent.
     pub workers: Option<usize>,
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = disabled.
-    /// Defaults to 512 on macOS (no OOM killer), 0 on Linux.
+    /// Defaults to 1024 on macOS (no OOM killer), 0 on Linux.
     pub max_worker_memory_mb: Option<usize>,
 }
 

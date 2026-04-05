@@ -39,7 +39,7 @@ irradiate run [OPTIONS] [PATHS]...
 | `--no-stats` | -- | Skip stats collection, test all mutants against all tests |
 | `--covered-only` | -- | Skip mutants with no test coverage |
 | `--python <PYTHON>` | -- | Python interpreter path (auto-detected from venv if not set) |
-| `--max-worker-memory <MAX_WORKER_MEMORY>` | -- | Recycle workers whose RSS exceeds this threshold in megabytes. Default: 512 on macOS, 0 (unlimited) on Linux. Pass 0 to disable |
+| `--max-worker-memory <MAX_WORKER_MEMORY>` | -- | Recycle workers whose RSS exceeds this threshold in megabytes. Default: 1024 on macOS, 0 (unlimited) on Linux. Pass 0 to disable |
 | `--no-fork` | -- | Disable fork-per-mutant in workers (default on macOS to avoid kernel panics from memory pressure). Slightly less isolation but avoids fork() overhead |
 | `--fork` | -- | Force fork-per-mutant even on macOS (overrides --no-fork and the macOS default) |
 | `--isolate` | -- | Run each mutant in a fresh subprocess (slower, better isolation) |

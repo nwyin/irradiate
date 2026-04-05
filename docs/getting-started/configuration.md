@@ -33,7 +33,7 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 | `cache_max_size`      | string          | `"1gb"`   | Default max-size for `irradiate cache gc` |
 | `type_checker`        | string          | --        | Type checker preset (`mypy`, `pyright`, `ty`) or raw command |
 | `workers`             | integer         | CPU count | Number of worker processes |
-| `max_worker_memory_mb`| integer         | 512 (macOS), 0 (Linux) | Recycle workers exceeding this RSS in MB. 0 = off |
+| `max_worker_memory_mb`| integer         | 1024 (macOS), 0 (Linux) | Recycle workers exceeding this RSS in MB. 0 = off |
 
 The `do_not_mutate` patterns can also be passed from the CLI with `--ignore` (merged with config values):
 
@@ -90,7 +90,7 @@ All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 ```
 --workers <N>                   Number of worker processes [default: CPU count]
 --timeout-multiplier <FLOAT>    Per-mutant timeout multiplier [default: 10.0]
---max-worker-memory <MB>        Recycle workers exceeding this RSS [default: 512 on macOS, 0 on Linux]
+--max-worker-memory <MB>        Recycle workers exceeding this RSS [default: 1024 on macOS, 0 on Linux]
 --no-fork                       Run tests in-process within workers [default on macOS]
 --fork                          Force fork-per-mutant even on macOS
 --isolate                       Fresh subprocess per mutant (slower, fully isolated)
@@ -99,7 +99,7 @@ All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 
 ### Memory management
 
-On macOS, irradiate defaults to `--no-fork` mode and sets a 512MB per-worker memory limit. These defaults prevent kernel panics from memory exhaustion (macOS has no OOM killer — when memory runs out, the entire system crashes). On Linux, fork mode is enabled and memory limits are off by default since the OOM killer provides a safety net.
+On macOS, irradiate defaults to `--no-fork` mode and sets a 1024MB per-worker memory limit. These defaults prevent kernel panics from memory exhaustion (macOS has no OOM killer — when memory runs out, the entire system crashes). On Linux, fork mode is enabled and memory limits are off by default since the OOM killer provides a safety net.
 
 To tune for your machine:
 

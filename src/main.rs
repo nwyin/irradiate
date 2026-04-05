@@ -103,7 +103,7 @@ enum Commands {
         python: Option<String>,
 
         /// Recycle workers whose RSS exceeds this threshold in megabytes.
-        /// Default: 512 on macOS, 0 (unlimited) on Linux. Pass 0 to disable.
+        /// Default: 1024 on macOS, 0 (unlimited) on Linux. Pass 0 to disable.
         #[arg(long)]
         max_worker_memory: Option<usize>,
 
@@ -335,7 +335,7 @@ async fn main() -> Result<()> {
                 },
                 max_worker_memory_mb: max_worker_memory
                     .or(file_config.max_worker_memory_mb)
-                    .unwrap_or(if cfg!(target_os = "macos") { 512 } else { 0 }),
+                    .unwrap_or(if cfg!(target_os = "macos") { 1024 } else { 0 }),
                 isolate,
                 verify_survivors,
                 do_not_mutate,
