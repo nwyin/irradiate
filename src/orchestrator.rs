@@ -110,7 +110,7 @@ enum WorkerEvent {
 /// collection) in parallel with stats collection or other pipeline phases.
 pub struct PreSpawnedPool {
     listener: UnixListener,
-    processes: Vec<Child>,
+    processes: HashMap<usize, Child>,
     socket_path: PathBuf,
     harness_dir: PathBuf,
 }
@@ -140,10 +140,10 @@ pub fn pre_spawn_pool(
         .with_context(|| format!("Failed to bind unix socket at {}", socket_path.display()))?;
     info!("Pre-spawning {num_workers} workers on {}", socket_path.display());
 
-    let mut processes: Vec<Child> = Vec::new();
+    let mut processes: HashMap<usize, Child> = HashMap::new();
     for i in 0..num_workers {
         let child = spawn_worker(i, config, harness_dir, &socket_path)?;
-        processes.push(child);
+        processes.insert(i, child);
     }
 
     Ok(PreSpawnedPool {
@@ -470,7 +470,7 @@ struct DispatchState<'a> {
     trace: &'a mut TraceLog,
 
     // Resources (owned by the dispatch loop, passed through for respawning)
-    processes: Vec<Child>,
+    processes: HashMap<usize, Child>,
     progress: Option<crate::progress::ProgressBar>,
     event_tx: mpsc::Sender<WorkerEvent>,
 
@@ -484,7 +484,7 @@ impl<'a> DispatchState<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         work_items: Vec<WorkItem>,
-        processes: Vec<Child>,
+        processes: HashMap<usize, Child>,
         progress: Option<crate::progress::ProgressBar>,
         event_tx: mpsc::Sender<WorkerEvent>,
         config: &'a PoolConfig,
@@ -497,8 +497,8 @@ impl<'a> DispatchState<'a> {
         let initial_spawn_us = trace.now_us();
 
         let mut spawn_times = HashMap::new();
-        for i in 0..processes.len() {
-            spawn_times.insert(i, initial_spawn_us);
+        for &id in processes.keys() {
+            spawn_times.insert(id, initial_spawn_us);
         }
 
         Self {
@@ -561,7 +561,7 @@ impl<'a> DispatchState<'a> {
         let spawn_id = self.next_worker_id;
         match spawn_worker(spawn_id, self.config, self.harness_dir, self.socket_path) {
             Ok(child) => {
-                self.processes.push(child);
+                self.processes.insert(spawn_id, child);
                 self.pending_accepts += 1;
                 self.spawn_times.insert(spawn_id, self.trace.now_us());
                 info!("Spawned replacement worker {spawn_id}");
@@ -625,7 +625,7 @@ impl<'a> DispatchState<'a> {
 
         // Try to capture stderr from crashed worker processes for diagnostics
         let mut stderr_snippet = String::new();
-        for proc in self.processes.iter_mut() {
+        for proc in self.processes.values_mut() {
             if let Some(stderr) = proc.stderr.take() {
                 use tokio::io::AsyncReadExt;
                 let mut buf = [0u8; 2048];
@@ -788,6 +788,8 @@ impl<'a> DispatchState<'a> {
                 let _ = sender.send(OrchestratorMessage::Shutdown).await;
             }
             self.worker_pids.remove(&worker_id);
+            // Drop the old process handle — triggers kill_on_drop cleanup
+            self.processes.remove(&worker_id);
             self.respawn_worker();
         } else {
             self.idle_workers.push(worker_id);
@@ -798,6 +800,8 @@ impl<'a> DispatchState<'a> {
     async fn handle_disconnect(&mut self, worker_id: usize) {
         self.worker_pids.remove(&worker_id);
         self.workers_pending_memory_recycle.remove(&worker_id);
+        // Drop the process handle so it doesn't accumulate
+        self.processes.remove(&worker_id);
         // If the worker was already removed from worker_senders (by handle_result
         // during memory recycling), this is an expected disconnect.
         if !self.worker_senders.contains_key(&worker_id) && !self.active_mutants.contains_key(&worker_id) {
@@ -876,7 +880,7 @@ impl<'a> DispatchState<'a> {
         }
 
         let mut wait_set = tokio::task::JoinSet::new();
-        for mut proc in self.processes {
+        for mut proc in self.processes.into_values() {
             wait_set.spawn(async move { proc.wait().await });
         }
         let _ = tokio::time::timeout(Duration::from_secs(5), async {
@@ -961,7 +965,7 @@ async fn accept_handshake(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_work(
     listener: UnixListener,
-    processes: Vec<Child>,
+    processes: HashMap<usize, Child>,
     work_items: Vec<WorkItem>,
     config: &PoolConfig,
     harness_dir: &Path,

@@ -436,12 +436,14 @@ async fn phase_stats(
         validate_clean_run(
             &config.python, &ctx.project_dir, &ctx.pythonpath,
             &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+            config.stats_timeout,
         ).await?;
         eprintln!("  done");
         eprintln!("Running forced-fail validation...");
         validate_fail_run(
             &config.python, &ctx.project_dir, &ctx.pythonpath,
             &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+            config.stats_timeout,
         ).await?;
         eprintln!("  done");
         None
@@ -479,6 +481,7 @@ async fn phase_stats(
                 let validate_fut = validate_fail_run(
                     &config.python, &ctx.project_dir, &ctx.pythonpath,
                     &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+                    config.stats_timeout,
                 );
                 let (stats_result, validate_result) = tokio::join!(stats_handle, validate_fut);
                 let s = stats_result.unwrap().with_context(|| format!(
@@ -621,6 +624,7 @@ async fn phase_execute(
         let all_tests = discover_tests(
             &config.python, &ctx.project_dir, &ctx.pythonpath,
             &ctx.mutants_dir, &config.tests_dir, &config.pytest_add_cli_args,
+            config.stats_timeout,
         ).await?;
         work_items
             .into_iter()
@@ -1071,10 +1075,6 @@ const MIN_ESTIMATED_SECS: f64 = 0.5;
 /// for subprocess startup + pytest collection.
 const MIN_TIMEOUT_SECS: f64 = 5.0;
 
-/// Timeout (seconds) for validation subprocess calls (validate_clean_run, validate_fail_run,
-/// discover_tests). If pytest hangs during validation, the pipeline would block indefinitely
-/// without this ceiling.
-const VALIDATION_TIMEOUT_SECS: u64 = 120;
 
 /// Run each mutant in a fresh subprocess, sequentially.
 ///
@@ -1898,6 +1898,7 @@ async fn validate_clean_run(
     mutants_dir: &Path,
     tests_dir: &str,
     extra_pytest_args: &[String],
+    timeout_secs: u64,
 ) -> Result<()> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
     let mut args: Vec<&str> = vec!["-m", "pytest", "-x", "-q", "-p", "irradiate_harness", tests_dir];
@@ -1907,7 +1908,7 @@ async fn validate_clean_run(
         &args,
         &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
         project_dir,
-        VALIDATION_TIMEOUT_SECS,
+        timeout_secs,
         "clean test validation",
     )
     .await?;
@@ -1943,6 +1944,7 @@ async fn validate_fail_run(
     mutants_dir: &Path,
     tests_dir: &str,
     extra_pytest_args: &[String],
+    timeout_secs: u64,
 ) -> Result<()> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
     // --tb=no suppresses traceback formatting which is expensive when every
@@ -1960,7 +1962,7 @@ async fn validate_fail_run(
             ("IRRADIATE_ACTIVE_MUTANT", "fail"),
         ],
         project_dir,
-        VALIDATION_TIMEOUT_SECS,
+        timeout_secs,
         "forced-fail validation",
     )
     .await?;
@@ -1993,6 +1995,7 @@ async fn discover_tests(
     mutants_dir: &Path,
     tests_dir: &str,
     extra_pytest_args: &[String],
+    timeout_secs: u64,
 ) -> Result<Vec<String>> {
     let mutants_dir_str = mutants_dir.to_string_lossy();
     let mut args: Vec<&str> = vec!["-m", "pytest", "--collect-only", "-q", "-p", "irradiate_harness", tests_dir];
@@ -2002,7 +2005,7 @@ async fn discover_tests(
         &args,
         &[("PYTHONPATH", pythonpath), ("IRRADIATE_MUTANTS_DIR", &mutants_dir_str)],
         project_dir,
-        VALIDATION_TIMEOUT_SECS,
+        timeout_secs,
         "test discovery",
     )
     .await?;
@@ -2751,7 +2754,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_clean_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_ok(),
             "Clean project should pass validate_clean_run: {result:?}"
@@ -2776,7 +2779,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_ok(),
             "Pre-existing test failures (exit code 1) should be tolerated: {result:?}"
@@ -2799,7 +2802,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_err(),
             "Collection errors (exit code 2+) should cause validate_clean_run to return Err"
@@ -2825,7 +2828,7 @@ mod tests {
         generate_mutants(&[fixture.join("src")], tmp_mutants.path(), &[], None, "tests", false)
             .expect("mutant generation should succeed for fixture");
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_ok(),
             "validate_fail_run should succeed (harness must cause failure under active_mutant='fail'): {result:?}"
@@ -2845,7 +2848,7 @@ mod tests {
         // Empty mutants dir — no trampoline code, so tests will pass under active_mutant=fail
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_err(),
             "Empty mutants dir means tests pass → should Err (exit code 0 detected)"
@@ -2871,7 +2874,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_fail_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(
             result.is_err(),
             "No tests collected (exit 5) should Err, not silently succeed"
@@ -2896,7 +2899,7 @@ mod tests {
         // Empty mutants dir — tests pass, exit 0
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_fail_run(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         // The error must include the stdout/stderr sections so users can diagnose the issue
@@ -2926,7 +2929,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[project.path().to_path_buf()]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[]).await;
+        let result = validate_clean_run(&python, project.path(), &pythonpath, tmp_mutants.path(), "tests", &[], 60).await;
         assert!(result.is_err(), "Collection error should cause validate_clean_run to return Err");
 
         let err_msg = format!("{:?}", result.unwrap_err());
@@ -2946,7 +2949,7 @@ mod tests {
         let pythonpath = build_pythonpath(&harness_dir, &[fixture.join("src")]);
         let tmp_mutants = tempfile::tempdir().unwrap();
 
-        let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[])
+        let tests = discover_tests(&python, &fixture, &pythonpath, tmp_mutants.path(), "tests", &[], 60)
             .await
             .expect("discover_tests should not fail for a valid project");
 
@@ -2983,6 +2986,7 @@ mod tests {
             tmp_mutants.path(),
             "empty_tests",
             &[],
+            60,
         )
         .await
         .expect("discover_tests should not fail for empty test dir");
@@ -2993,14 +2997,12 @@ mod tests {
         );
     }
 
-    /// VALIDATION_TIMEOUT_SECS is a reasonable ceiling (>0, ≤600).
+    /// stats::DEFAULT_STATS_TIMEOUT_SECS is a reasonable default (>0, ≤600).
     #[test]
-    fn test_validation_timeout_constant_is_reasonable() {
-        assert!(VALIDATION_TIMEOUT_SECS > 0, "timeout must be positive");
-        assert!(
-            VALIDATION_TIMEOUT_SECS <= 600,
-            "timeout should not exceed 10 minutes: {VALIDATION_TIMEOUT_SECS}"
-        );
+    fn test_default_stats_timeout_is_reasonable() {
+        let timeout = crate::stats::DEFAULT_STATS_TIMEOUT_SECS;
+        assert!(timeout > 0, "timeout must be positive");
+        assert!(timeout <= 600, "timeout should not exceed 10 minutes: {timeout}");
     }
 
     /// compute_timeout: very small multiplier still produces at least MIN_TIMEOUT_SECS.
