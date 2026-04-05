@@ -807,11 +807,31 @@ impl<'a> DispatchState<'a> {
         if !self.worker_senders.contains_key(&worker_id) && !self.active_mutants.contains_key(&worker_id) {
             debug!("Worker {worker_id}: disconnected cleanly");
         } else {
-            self.crash_count += 1;
-            self.record_worker_error(worker_id);
+            // If the worker had an active mutant, record it as a timeout
+            // (likely an infinite loop from a mutation). Timeouts are expected
+            // in mutation testing and don't count toward the crash budget.
+            let was_timeout = self.active_mutants.contains_key(&worker_id);
+            if was_timeout {
+                if let Some(mutant_name) = self.active_mutants.remove(&worker_id) {
+                    info!("Worker {worker_id}: timed out on {mutant_name}");
+                    if let Some(ref mut pb) = self.progress {
+                        pb.worker_done(worker_id);
+                        pb.record(MutantStatus::Timeout);
+                    }
+                    self.results.push(MutantResult {
+                        mutant_name,
+                        exit_code: -1,
+                        duration: 0.0,
+                        status: MutantStatus::Timeout,
+                    });
+                }
+            } else {
+                self.crash_count += 1;
+                self.record_worker_error(worker_id);
+            }
             self.worker_senders.remove(&worker_id);
 
-            if self.crash_count >= self.max_crashes {
+            if !was_timeout && self.crash_count >= self.max_crashes {
                 warn!(
                     "Worker {worker_id} crashed ({}/{} crash budget exhausted). \
                      Not replacing — pool shrinking to {} workers. \
@@ -820,10 +840,12 @@ impl<'a> DispatchState<'a> {
                     self.worker_senders.len(),
                 );
             } else if !self.work_queue.is_empty() {
-                warn!(
-                    "Worker {worker_id} crashed ({}/{}). Respawning.",
-                    self.crash_count, self.max_crashes,
-                );
+                if !was_timeout {
+                    warn!(
+                        "Worker {worker_id} crashed ({}/{}). Respawning.",
+                        self.crash_count, self.max_crashes,
+                    );
+                }
                 self.respawn_worker();
             }
         }
