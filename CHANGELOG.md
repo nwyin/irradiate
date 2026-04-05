@@ -2,6 +2,17 @@
 
 All notable changes to irradiate are documented here.
 
+## 0.4.2 — 2026-04-05
+
+### Fixes
+
+- **Validation timeout respects `--stats-timeout`** — the forced-fail validation and test discovery phases previously used a hardcoded 120s timeout, ignoring `--stats-timeout`. Projects with large test suites (e.g. httpx with 1,400 tests) would fail during validation even with `--stats-timeout 600`. All validation phases now use the `--stats-timeout` value.
+- **Worker process cleanup on recycling** — when workers were recycled for exceeding the RSS memory limit, old process handles accumulated in memory and were never cleaned up. On long runs with `--max-worker-memory` enabled, this caused hundreds of zombie process handles. Worker handles are now removed immediately on recycle or disconnect.
+
+### Docs
+
+- Added "When Mutation Testing Is Worth It" guide covering where mutation testing pays for itself (parsers, compilers, protocol code) and where it doesn't (CRUD apps, ML training).
+
 ## 0.4.1 — 2026-04-04
 
 ### Fixes
