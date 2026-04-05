@@ -2,6 +2,12 @@
 
 All notable changes to irradiate are documented here.
 
+## 0.4.3 — 2026-04-05
+
+### Fixes
+
+- **Timeouts no longer exhaust crash budget** — when a mutant creates an infinite loop (common in parser code), the worker times out and gets replaced. Previously, each timeout counted as a "crash" toward the crash budget (`workers * 3`). On parser projects like mistune, the pool would die after ~12 timeouts and mark all remaining mutants as errors. Timeouts are now recorded as `Timeout` status and don't consume crash budget, which is reserved for real crashes (segfaults, import errors).
+
 ## 0.4.2 — 2026-04-05
 
 ### Fixes
