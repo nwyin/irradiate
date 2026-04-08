@@ -738,6 +738,7 @@ fn make_run_config(python: PathBuf, paths_to_mutate: PathBuf) -> irradiate::pipe
         type_checker: None,
         no_source_patch: false,
         no_fork: false,
+        operator_filter: None,
     }
 }
 

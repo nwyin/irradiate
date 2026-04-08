@@ -53,6 +53,13 @@ pub struct IrradiateConfig {
     /// Recycle workers whose RSS exceeds this many megabytes. 0 = disabled.
     /// Defaults to 1024 on macOS (no OOM killer), 0 on Linux.
     pub max_worker_memory_mb: Option<usize>,
+    /// Allowlist of mutation operators to run. Only these operators will be tested.
+    /// Supports glob patterns (e.g. `["binop_swap", "comp*"]`).
+    /// Mutually exclusive with `skip_operators`.
+    pub operators: Option<Vec<String>>,
+    /// Denylist of mutation operators to skip. Supports glob patterns (e.g. `["regex_*"]`).
+    /// Mutually exclusive with `operators`.
+    pub skip_operators: Option<Vec<String>>,
 }
 
 /// Deserialize a field that accepts either a TOML string or array of strings.
@@ -424,6 +431,42 @@ paths_to_mutate = "src"
         let irr = config.tool.irradiate.as_ref().unwrap();
         assert!(irr.workers.is_none());
         assert!(irr.max_worker_memory_mb.is_none());
+    }
+
+    #[test]
+    fn test_operators_allowlist() {
+        let toml_str = r#"
+[tool.irradiate]
+operators = ["binop_swap", "compop_swap"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert_eq!(irr.operators.as_ref().unwrap(), &["binop_swap", "compop_swap"]);
+        assert!(irr.skip_operators.is_none());
+    }
+
+    #[test]
+    fn test_operators_denylist() {
+        let toml_str = r#"
+[tool.irradiate]
+skip_operators = ["regex_*", "string_emptying"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert!(irr.operators.is_none());
+        assert_eq!(irr.skip_operators.as_ref().unwrap(), &["regex_*", "string_emptying"]);
+    }
+
+    #[test]
+    fn test_operators_absent() {
+        let toml_str = r#"
+[tool.irradiate]
+paths_to_mutate = "src"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let irr = config.tool.irradiate.as_ref().unwrap();
+        assert!(irr.operators.is_none());
+        assert!(irr.skip_operators.is_none());
     }
 
     #[test]

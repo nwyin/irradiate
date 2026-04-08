@@ -16,7 +16,7 @@ irradiate [OPTIONS] <COMMAND>
 
 | Flag        | Description   |
 | ----------- | ------------- |
-| `--version` | Print version (irradiate 0.4.2) |
+| `--version` | Print version (irradiate 0.4.3) |
 | `--help`    | Print help    |
 
 ## `irradiate run`
@@ -59,6 +59,8 @@ irradiate run [OPTIONS] [PATHS]...
 | `--type-checker <TYPE_CHECKER>` | -- | Run a type checker to filter mutants caught by static analysis. Accepts a preset name (mypy, pyright, ty) or a raw command string. Mutants that introduce type errors are marked as killed (exit code 37) |
 | `--no-source-patch` | -- | Disable source-patch mutations for decorated functions. Only trampoline-compatible functions (@property, @classmethod, @staticmethod) will be mutated. Skips the slower source-patch phase |
 | `--ignore <IGNORE>` | -- | Glob patterns for files to exclude from mutation. Can be repeated. Merged with do_not_mutate from pyproject.toml |
+| `--operators <OPERATORS>` | -- | Only run these mutation operators (allowlist). Supports glob patterns. Can be repeated. Mutually exclusive with --skip-operators |
+| `--skip-operators <SKIP_OPERATORS>` | -- | Skip these mutation operators (denylist). Supports glob patterns (e.g., regex_*). Can be repeated. Mutually exclusive with --operators |
 | `-h, --help` | -- | Print help |
 
 ### Examples

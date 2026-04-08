@@ -74,6 +74,32 @@ pub struct RunConfig {
     /// Disable fork-per-mutant: run tests in-process within the worker.
     /// Avoids memory pressure from fork() on macOS but provides less isolation.
     pub no_fork: bool,
+    /// Operator filter: allow only specific operators, or skip specific operators.
+    /// `None` = no filtering, all operators are tested.
+    pub operator_filter: Option<OperatorFilter>,
+}
+
+/// Filter mode for mutation operators, derived from config + CLI flags.
+#[derive(Debug, Clone)]
+pub enum OperatorFilter {
+    /// Only run operators matching these patterns.
+    Allow(Vec<String>),
+    /// Run all operators except those matching these patterns.
+    Deny(Vec<String>),
+}
+
+impl OperatorFilter {
+    /// Returns true if the given operator name passes this filter.
+    pub fn allows(&self, operator: &str) -> bool {
+        match self {
+            OperatorFilter::Allow(patterns) => {
+                patterns.iter().any(|pat| glob_match_seg(operator, pat))
+            }
+            OperatorFilter::Deny(patterns) => {
+                !patterns.iter().any(|pat| glob_match_seg(operator, pat))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,7 +276,7 @@ fn phase_generate(
 
     let phase_start = ctx.trace.now_us();
     let start = Instant::now();
-    let (generation, source_patches) = generate_mutants(
+    let (generation, mut source_patches) = generate_mutants(
         &config.paths_to_mutate,
         &ctx.mutants_dir,
         &config.do_not_mutate,
@@ -299,6 +325,22 @@ fn phase_generate(
         all_mutants.retain(|desc| filter.iter().any(|f| desc.mutant_name.contains(f)));
         if all_mutants.is_empty() {
             eprintln!("No mutants match the filter.");
+            return Ok(None);
+        }
+    }
+
+    // Operator filter: allow/deny specific mutation operator categories.
+    if let Some(ref op_filter) = config.operator_filter {
+        let before = all_mutants.len();
+        all_mutants.retain(|desc| op_filter.allows(&desc.operator));
+        let before_sp = source_patches.len();
+        source_patches.retain(|sp| op_filter.allows(&sp.patch.descriptor.operator));
+        let filtered = (before - all_mutants.len()) + (before_sp - source_patches.len());
+        if filtered > 0 {
+            eprintln!("  Operator filter: {filtered} mutants excluded");
+        }
+        if all_mutants.is_empty() && source_patches.is_empty() {
+            eprintln!("No mutants remain after operator filtering.");
             return Ok(None);
         }
     }
@@ -3320,6 +3362,7 @@ index 000..abc
             type_checker: None,
             no_source_patch: false,
             no_fork: false,
+            operator_filter: None,
         }
     }
 
@@ -3482,5 +3525,77 @@ index 000..abc
         let descs: Vec<MutantCacheDescriptor> = vec![];
         let sampled = sample_mutants(descs, 0.1, 0);
         assert!(sampled.is_empty());
+    }
+
+    // --- OperatorFilter ---
+
+    #[test]
+    fn operator_filter_allow_exact() {
+        let filter = OperatorFilter::Allow(vec!["binop_swap".to_string()]);
+        assert!(filter.allows("binop_swap"));
+        assert!(!filter.allows("compop_swap"));
+        assert!(!filter.allows("number_mutation"));
+    }
+
+    #[test]
+    fn operator_filter_allow_glob() {
+        let filter = OperatorFilter::Allow(vec!["*_swap".to_string()]);
+        assert!(filter.allows("binop_swap"));
+        assert!(filter.allows("compop_swap"));
+        assert!(filter.allows("method_swap"));
+        assert!(!filter.allows("number_mutation"));
+        assert!(!filter.allows("string_emptying"));
+    }
+
+    #[test]
+    fn operator_filter_deny_exact() {
+        let filter = OperatorFilter::Deny(vec!["string_emptying".to_string()]);
+        assert!(!filter.allows("string_emptying"));
+        assert!(filter.allows("binop_swap"));
+        assert!(filter.allows("number_mutation"));
+    }
+
+    #[test]
+    fn operator_filter_deny_glob() {
+        let filter = OperatorFilter::Deny(vec!["regex_*".to_string()]);
+        assert!(!filter.allows("regex_anchor_removal"));
+        assert!(!filter.allows("regex_quantifier_change"));
+        assert!(filter.allows("binop_swap"));
+        assert!(filter.allows("string_emptying"));
+    }
+
+    #[test]
+    fn operator_filter_deny_multiple_patterns() {
+        let filter = OperatorFilter::Deny(vec![
+            "string_*".to_string(),
+            "regex_*".to_string(),
+        ]);
+        assert!(!filter.allows("string_emptying"));
+        assert!(!filter.allows("regex_anchor_removal"));
+        assert!(filter.allows("binop_swap"));
+        assert!(filter.allows("number_mutation"));
+    }
+
+    #[test]
+    fn operator_filter_allow_empty_denies_all() {
+        let filter = OperatorFilter::Allow(vec![]);
+        assert!(!filter.allows("binop_swap"));
+        assert!(!filter.allows("anything"));
+    }
+
+    #[test]
+    fn operator_filter_deny_empty_allows_all() {
+        let filter = OperatorFilter::Deny(vec![]);
+        assert!(filter.allows("binop_swap"));
+        assert!(filter.allows("anything"));
+    }
+
+    #[test]
+    fn operator_filter_decorator_removal_glob() {
+        // decorator_removal descriptors store "decorator_removal: @cache" etc.
+        let filter = OperatorFilter::Allow(vec!["decorator_removal*".to_string()]);
+        assert!(filter.allows("decorator_removal: @cache"));
+        assert!(filter.allows("decorator_removal: @app.route"));
+        assert!(!filter.allows("binop_swap"));
     }
 }

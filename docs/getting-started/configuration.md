@@ -34,6 +34,8 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 | `type_checker`        | string          | --        | Type checker preset (`mypy`, `pyright`, `ty`) or raw command |
 | `workers`             | integer         | CPU count | Number of worker processes |
 | `max_worker_memory_mb`| integer         | 1024 (macOS), 0 (Linux) | Recycle workers exceeding this RSS in MB. 0 = off |
+| `operators`           | list of strings | -- (all)  | Allowlist of mutation operators to run. Supports globs. |
+| `skip_operators`      | list of strings | -- (none) | Denylist of mutation operators to skip. Supports globs. |
 
 The `do_not_mutate` patterns can also be passed from the CLI with `--ignore` (merged with config values):
 
@@ -56,6 +58,30 @@ irradiate run src --pytest-args "--ignore=tests/integration"
 
 See [Remote Cache](../guide/remote-cache.md) for details on cache sync hooks and garbage collection.
 
+### Operator filtering
+
+`operators` and `skip_operators` are mutually exclusive. Use one or the other.
+
+**Allowlist** — only run specific operators:
+
+```toml
+[tool.irradiate]
+operators = ["binop_swap", "compop_swap", "return_value"]
+```
+
+**Denylist** — run everything except noisy operators:
+
+```toml
+[tool.irradiate]
+skip_operators = ["regex_*", "string_emptying"]
+```
+
+Both fields support glob patterns (`*` and `?`). For example, `regex_*` matches all 11 regex operators.
+
+The same filters are available as CLI flags (`--operators`, `--skip-operators`), which override pyproject.toml values. See [Mutation Operators](../internals/mutation-operators.md) for the full list of operator names.
+
+Note: `decorator_removal` source-patch descriptors include the decorator name (e.g., `decorator_removal: @cache`). Use the glob `decorator_removal*` to match all variants.
+
 ### `mutmut` compatibility
 
 `[tool.mutmut]` is accepted with a deprecation warning. Rename to `[tool.irradiate]`.
@@ -77,12 +103,14 @@ All flags are for `irradiate run`. Run `irradiate run --help` for the full list.
 ### Incremental and filtering
 
 ```
---diff <REF>          Only mutate functions changed since this git ref
---covered-only        Skip mutants with no test coverage
---no-stats            Skip coverage collection; test all mutants against all tests
---fail-under <SCORE>  Exit 1 if mutation score is below this threshold (0-100)
---sample <N>          Test a random subset of mutants (0.0-1.0 = fraction, >1 = count)
---sample-seed <N>     RNG seed for --sample [default: 0]
+--diff <REF>              Only mutate functions changed since this git ref
+--covered-only            Skip mutants with no test coverage
+--no-stats                Skip coverage collection; test all mutants against all tests
+--fail-under <SCORE>      Exit 1 if mutation score is below this threshold (0-100)
+--sample <N>              Test a random subset of mutants (0.0-1.0 = fraction, >1 = count)
+--sample-seed <N>         RNG seed for --sample [default: 0]
+--operators <OP>          Only run these operators (allowlist, repeatable, supports globs)
+--skip-operators <OP>     Skip these operators (denylist, repeatable, supports globs)
 ```
 
 ### Execution

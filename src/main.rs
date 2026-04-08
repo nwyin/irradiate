@@ -197,6 +197,16 @@ enum Commands {
         /// Merged with do_not_mutate from pyproject.toml.
         #[arg(long)]
         ignore: Vec<String>,
+
+        /// Only run these mutation operators (allowlist). Supports glob patterns.
+        /// Can be repeated. Mutually exclusive with --skip-operators.
+        #[arg(long = "operators")]
+        operators: Vec<String>,
+
+        /// Skip these mutation operators (denylist). Supports glob patterns (e.g., regex_*).
+        /// Can be repeated. Mutually exclusive with --operators.
+        #[arg(long = "skip-operators")]
+        skip_operators: Vec<String>,
     },
 
     /// Display mutation testing results
@@ -293,6 +303,8 @@ async fn main() -> Result<()> {
             no_fork,
             fork,
             ignore,
+            operators,
+            skip_operators,
         } => {
             // Load pyproject.toml config; CLI flags override config values.
             let file_config = irradiate::config::load_config(&std::env::current_dir()?)?;
@@ -308,6 +320,19 @@ async fn main() -> Result<()> {
             // Merge positional paths and --paths-to-mutate (positional takes priority)
             let mut all_paths = paths;
             all_paths.extend(paths_to_mutate);
+
+            // Operator filter: CLI flags override config; allow and deny are mutually exclusive.
+            let op_allow = if !operators.is_empty() { Some(operators) } else { file_config.operators };
+            let op_deny = if !skip_operators.is_empty() { Some(skip_operators) } else { file_config.skip_operators };
+            let operator_filter = match (op_allow, op_deny) {
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "--operators and --skip-operators are mutually exclusive. \
+                     Use one or the other (check pyproject.toml too)."
+                ),
+                (Some(ops), None) => Some(irradiate::pipeline::OperatorFilter::Allow(ops)),
+                (None, Some(ops)) => Some(irradiate::pipeline::OperatorFilter::Deny(ops)),
+                (None, None) => None,
+            };
 
             irradiate::pipeline::run(irradiate::pipeline::RunConfig {
                 paths_to_mutate: {
@@ -362,6 +387,7 @@ async fn main() -> Result<()> {
                     // fork() memory pressure on machines with limited RAM.
                     cfg!(target_os = "macos")
                 },
+                operator_filter,
             })
             .await
         }
