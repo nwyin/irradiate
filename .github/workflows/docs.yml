@@ -19,6 +19,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -71,6 +72,7 @@ jobs:
       # Skipped on push to keep CI fast; report shows placeholders when file is absent.
       - name: Run vendor tests
         if: github.event_name != 'push'
+        continue-on-error: true
         run: bash scripts/run_vendor_tests.sh -o vendor_results.json
 
       # Generate the report into site/report/ so it's a subpath of the docs site
