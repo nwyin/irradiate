@@ -613,17 +613,9 @@ async fn test_memory_limit_run_completes() {
     let python = fixture_python();
     let (_tmp, mutant_names) = generate_test_mutants();
 
-    let add_mutant = mutant_names
-        .iter()
-        .find(|n| n.contains("x_add__irradiate_"))
-        .expect("Should have an add mutant");
-    let is_pos_mutant = mutant_names
-        .iter()
-        .find(|n| n.contains("x_is_positive__irradiate_"))
-        .expect("Should have an is_positive mutant");
-
     // 1 MB limit: any Python process will far exceed this.
-    // The periodic memory check will flag each worker after it starts.
+    // The periodic memory check (every 2s) will flag each worker after it starts.
+    // Use all mutants so the run lasts long enough for the memory check to fire.
     let config = PoolConfig {
         num_workers: 1,
         python,
@@ -636,37 +628,57 @@ async fn test_memory_limit_run_completes() {
         ..Default::default()
     };
 
-    let work_items = vec![
-        WorkItem {
-            mutant_name: add_mutant.clone(),
-            test_ids: vec!["tests/test_simple.py::test_add".to_string()],
-            estimated_duration_secs: 0.0,
-            timeout_secs: 300.0,
-        },
-        WorkItem {
-            mutant_name: is_pos_mutant.clone(),
-            test_ids: vec!["tests/test_simple.py::test_is_positive".to_string()],
-            estimated_duration_secs: 0.0,
-            timeout_secs: 300.0,
-        },
+    let all_tests = vec![
+        "tests/test_simple.py::test_add".to_string(),
+        "tests/test_simple.py::test_is_positive".to_string(),
+        "tests/test_simple.py::test_greet".to_string(),
     ];
+    let work_items: Vec<WorkItem> = mutant_names
+        .iter()
+        .map(|name| WorkItem {
+            mutant_name: name.clone(),
+            test_ids: all_tests.clone(),
+            estimated_duration_secs: 0.0,
+            timeout_secs: 300.0,
+        })
+        .collect();
+    let num_items = work_items.len();
 
     // Must complete without hanging, even if memory recycling respawns workers mid-run.
-    let (results, _trace) = run_worker_pool(&config, work_items, None)
+    let (results, trace) = run_worker_pool(&config, work_items, None)
         .await
         .expect("Worker pool must complete even with aggressive memory recycling");
 
-    assert_eq!(results.len(), 2, "All mutants must produce results despite memory recycling");
-    // Memory recycling must not corrupt results: each status must be a valid classification.
+    assert_eq!(results.len(), num_items, "All mutants must produce results despite memory recycling");
+
+    // Memory recycling must be transparent: results should be Killed or Survived, not Error.
     for result in &results {
         assert!(
-            matches!(
-                result.status,
-                MutantStatus::Killed | MutantStatus::Survived | MutantStatus::Error
-            ),
-            "Mutant {} must have a valid status after memory recycling, got {:?}",
-            result.mutant_name,
-            result.status
+            matches!(result.status, MutantStatus::Killed | MutantStatus::Survived),
+            "Mutant {} had unexpected status {:?} — recycling may have corrupted results",
+            result.mutant_name, result.status,
+        );
+    }
+
+    // Check if recycling actually happened. With max_worker_memory_mb=1, workers
+    // should exceed the limit — but the 2-second memory check interval may not fire
+    // if the run completes too quickly. When recycling does fire, we should see more
+    // worker_startup events than the initial worker count.
+    let startup_events = trace.events.iter()
+        .filter(|e| e.name == "worker_startup")
+        .count();
+    if startup_events > config.num_workers {
+        // Recycling fired — verify results are still correct (done above).
+        eprintln!(
+            "Memory recycling verified: {startup_events} startups for {} initial workers",
+            config.num_workers,
+        );
+    } else {
+        eprintln!(
+            "Note: memory check interval (2s) did not fire during this run \
+             ({startup_events} startups for {} workers). \
+             Run completed in <2s, so recycling was not exercised.",
+            config.num_workers,
         );
     }
 }
