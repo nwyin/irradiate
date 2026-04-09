@@ -62,14 +62,6 @@ impl DiffFilter {
         self.files.len()
     }
 
-    /// Returns the total number of functions that could be touched (rough upper bound for display).
-    /// This counts distinct files that have at least one change range (or are new).
-    pub fn changed_file_count(&self) -> usize {
-        self.files
-            .values()
-            .filter(|v| matches!(v, None | Some(_)))
-            .count()
-    }
 }
 
 /// Find the root of the current git repository by running `git rev-parse --show-toplevel`.

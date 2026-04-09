@@ -14,7 +14,6 @@ irradiate reads configuration from `pyproject.toml` under `[tool.irradiate]`. Al
 paths_to_mutate = "src/"
 tests_dir = "tests/"
 do_not_mutate = ["**/generated/*", "**/vendor/*"]
-also_copy = ["data/"]
 pytest_add_cli_args = ["-x", "--tb=short"]
 ```
 
@@ -25,7 +24,6 @@ pytest_add_cli_args = ["-x", "--tb=short"]
 | `paths_to_mutate`     | string          | `"src"`   | Source directory to mutate                        |
 | `tests_dir`           | string          | `"tests"` | Test directory                                    |
 | `do_not_mutate`       | list of strings | `[]`      | Glob patterns for files to skip                   |
-| `also_copy`           | list of strings | `[]`      | Extra directories to copy into the mutants tree   |
 | `pytest_add_cli_args` | list of strings | `[]`      | Extra arguments passed to every pytest invocation |
 | `cache_pre_sync`      | string          | --        | Shell command run before mutation testing (e.g. download cache) |
 | `cache_post_sync`     | string          | --        | Shell command run after mutation testing (e.g. upload cache) |

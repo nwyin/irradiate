@@ -27,7 +27,6 @@ pub struct IrradiateConfig {
     #[serde(default, deserialize_with = "deserialize_string_or_first_of_vec")]
     pub tests_dir: Option<String>,
     pub do_not_mutate: Option<Vec<String>>,
-    pub also_copy: Option<Vec<String>>,
     pub debug: Option<bool>,
     /// Extra arguments appended to every pytest invocation.
     /// Prefer a TOML array: `pytest_add_cli_args = ["-v", "--tb=short"]`.
@@ -313,7 +312,6 @@ future_unknown_key = "something"
 paths_to_mutate = "src"
 tests_dir = "tests"
 do_not_mutate = ["src/generated/*", "src/vendor/*"]
-also_copy = ["data/"]
 debug = false
 pytest_add_cli_args = ["-v", "--tb=short"]
 "#;
@@ -322,7 +320,6 @@ pytest_add_cli_args = ["-v", "--tb=short"]
         assert_eq!(m.paths_to_mutate, Some(vec!["src".to_string()]));
         assert_eq!(m.tests_dir.as_deref(), Some("tests"));
         assert_eq!(m.do_not_mutate.as_ref().unwrap().len(), 2);
-        assert_eq!(m.also_copy.as_ref().unwrap(), &["data/"]);
         assert_eq!(m.debug, Some(false));
         let args = m.pytest_add_cli_args.as_ref().unwrap();
         assert_eq!(args, &["-v", "--tb=short"]);
