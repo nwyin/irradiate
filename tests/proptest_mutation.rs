@@ -577,73 +577,10 @@ proptest! {
         }
     }
 
-    /// INV-2: Valid offsets — start < end, and end <= func source length.
-    #[test]
-    fn valid_offsets(source in python_func_strategy()) {
-        let fms = collect_file_mutations(&source);
-        for fm in &fms {
-            for m in &fm.mutations {
-                prop_assert!(
-                    m.start < m.end,
-                    "start ({}) must be < end ({}) for mutation {:?}",
-                    m.start, m.end, m.operator
-                );
-                prop_assert!(
-                    m.end <= fm.source.len(),
-                    "end ({}) must be <= source.len() ({}) for mutation {:?}",
-                    m.end, fm.source.len(), m.operator
-                );
-            }
-        }
-    }
-
-    /// INV-3: Original text matches source — the slice at [start..end] equals original.
-    #[test]
-    fn original_matches_source(source in python_func_strategy()) {
-        let fms = collect_file_mutations(&source);
-        for fm in &fms {
-            for m in &fm.mutations {
-                let slice = &fm.source[m.start..m.end];
-                prop_assert_eq!(
-                    slice, m.original.as_str(),
-                    "source[{}..{}] should equal original '{}', got '{}'",
-                    m.start, m.end, m.original, slice
-                );
-            }
-        }
-    }
-
-    /// INV-4: Replacement differs from original — mutations must actually change something.
-    #[test]
-    fn replacement_differs(source in python_func_strategy()) {
-        let fms = collect_file_mutations(&source);
-        for fm in &fms {
-            for m in &fm.mutations {
-                prop_assert_ne!(
-                    &m.original, &m.replacement,
-                    "mutation {:?} must produce a different replacement",
-                    m.operator
-                );
-            }
-        }
-    }
-
-    /// INV-5: apply_mutation length — resulting string length equals the expected formula.
-    #[test]
-    fn apply_mutation_length(source in python_func_strategy()) {
-        let fms = collect_file_mutations(&source);
-        for fm in &fms {
-            for m in &fm.mutations {
-                let mutated = apply_mutation(&fm.source, m);
-                let expected_len = fm.source.len() - m.original.len() + m.replacement.len();
-                prop_assert_eq!(
-                    mutated.len(), expected_len,
-                    "apply_mutation length mismatch for {:?}: got {} expected {}",
-                    m.operator, mutated.len(), expected_len
-                );
-            }
-        }
-    }
+    // INV-2 (valid_offsets), INV-3 (original_matches_source), INV-4 (replacement_differs),
+    // and INV-5 (apply_mutation_length) were individual proptests that are strict subsets of
+    // multi_func_all_invariants below. Removed to cut proptest runtime; the assert_core_invariants!
+    // macro (used by all downstream operator-specific tests) still covers these invariants.
 
     /// INV-2+3+4+5 combined over multi-function sources.
     #[test]
