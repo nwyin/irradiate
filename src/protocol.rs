@@ -72,16 +72,22 @@ pub enum MutantStatus {
     Error,
 }
 
+/// Exit codes used by the Python worker harness, expected by the orchestrator.
+pub const EXIT_SURVIVED: i32 = 0;
+pub const EXIT_KILLED: i32 = 1;
+pub const EXIT_NO_TESTS: i32 = 33;
+pub const EXIT_TYPE_CHECK: i32 = 37;
+
 impl MutantStatus {
     pub fn from_exit_code(exit_code: i32, timed_out: bool) -> Self {
         if timed_out {
             return MutantStatus::Timeout;
         }
         match exit_code {
-            0 => MutantStatus::Survived,
-            1 => MutantStatus::Killed,
-            33 => MutantStatus::NoTests,
-            37 => MutantStatus::TypeCheck,
+            EXIT_SURVIVED => MutantStatus::Survived,
+            EXIT_KILLED => MutantStatus::Killed,
+            EXIT_NO_TESTS => MutantStatus::NoTests,
+            EXIT_TYPE_CHECK => MutantStatus::TypeCheck,
             _ => MutantStatus::Error,
         }
     }

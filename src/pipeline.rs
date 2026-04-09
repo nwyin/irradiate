@@ -421,7 +421,7 @@ fn phase_type_check(
     for name in &caught_names {
         type_check_results.push(crate::protocol::MutantResult {
             mutant_name: name.clone(),
-            exit_code: 37,
+            exit_code: crate::protocol::EXIT_TYPE_CHECK,
             duration: 0.0,
             status: crate::protocol::MutantStatus::TypeCheck,
         });
@@ -691,7 +691,7 @@ async fn phase_execute(
         if item.work_item.test_ids.is_empty() {
             results.push(MutantResult {
                 mutant_name: item.work_item.mutant_name.clone(),
-                exit_code: 33,
+                exit_code: crate::protocol::EXIT_NO_TESTS,
                 duration: 0.0,
                 status: MutantStatus::NoTests,
             });
@@ -1238,7 +1238,7 @@ async fn run_source_patches(
             if tests.is_empty() && config.covered_only {
                 results.push(MutantResult {
                     mutant_name: mutant_name.clone(),
-                    exit_code: 33,
+                    exit_code: crate::protocol::EXIT_NO_TESTS,
                     duration: 0.0,
                     status: MutantStatus::NoTests,
                 });

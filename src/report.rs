@@ -1065,11 +1065,11 @@ mod tests {
         MutantResult {
             mutant_name: name.to_string(),
             exit_code: match status {
-                MutantStatus::Killed => 1,
-                MutantStatus::Survived => 0,
-                MutantStatus::NoTests => 33,
+                MutantStatus::Killed => crate::protocol::EXIT_KILLED,
+                MutantStatus::Survived => crate::protocol::EXIT_SURVIVED,
+                MutantStatus::NoTests => crate::protocol::EXIT_NO_TESTS,
                 MutantStatus::Timeout => -1,
-                MutantStatus::TypeCheck => 37,
+                MutantStatus::TypeCheck => crate::protocol::EXIT_TYPE_CHECK,
                 MutantStatus::Error => 2,
             },
             duration,
@@ -1583,10 +1583,10 @@ mod tests {
     #[test]
     fn test_json_results_valid_json_and_inv5_total() {
         let results = vec![
-            raw("mod.x_a__irradiate_1", 1),  // killed
-            raw("mod.x_b__irradiate_1", 0),  // survived
-            raw("mod.x_c__irradiate_1", 33), // no_tests
-            raw("mod.x_d__irradiate_1", 2),  // error
+            raw("mod.x_a__irradiate_1", crate::protocol::EXIT_KILLED),    // killed
+            raw("mod.x_b__irradiate_1", crate::protocol::EXIT_SURVIVED),  // survived
+            raw("mod.x_c__irradiate_1", crate::protocol::EXIT_NO_TESTS),  // no_tests
+            raw("mod.x_d__irradiate_1", 2),                               // error
         ];
         let json_out = build_json_results(&results, true);
         // INV-1: serializes to valid JSON
@@ -1669,9 +1669,9 @@ mod tests {
     #[test]
     fn test_json_results_show_all_true_includes_all() {
         let results = vec![
-            raw("a", 1),  // killed
-            raw("b", 0),  // survived
-            raw("c", 33), // no_tests
+            raw("a", crate::protocol::EXIT_KILLED),    // killed
+            raw("b", crate::protocol::EXIT_SURVIVED),  // survived
+            raw("c", crate::protocol::EXIT_NO_TESTS),  // no_tests
         ];
         let json_out = build_json_results(&results, true);
         assert_eq!(json_out.mutants.len(), 3);
@@ -1681,9 +1681,9 @@ mod tests {
     #[test]
     fn test_json_results_status_serialization_snake_case() {
         let results = vec![
-            raw("a", 0),  // survived
-            raw("b", 1),  // killed
-            raw("c", 33), // no_tests
+            raw("a", crate::protocol::EXIT_SURVIVED),  // survived
+            raw("b", crate::protocol::EXIT_KILLED),    // killed
+            raw("c", crate::protocol::EXIT_NO_TESTS),  // no_tests
         ];
         let json_out = build_json_results(&results, true);
         let serialized = serde_json::to_string(&json_out).unwrap();
