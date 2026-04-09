@@ -1,0 +1,20 @@
+# cargo-mutants configuration
+# Only mutate Tier 1 (correctness-critical) and Tier 2 (mutation quality) files.
+#
+# Included:
+#   orchestrator.rs, cache.rs, pipeline.rs, mutation.rs, protocol.rs, stats.rs
+#   tree_sitter_mutation.rs, codegen.rs, trampoline.rs, regex_mutation.rs, string_scanner.rs
+#
+# Excluded (not worth mutation testing):
+#   main.rs        — CLI arg parsing glue
+#   progress.rs    — terminal rendering
+#   trace.rs       — diagnostic trace output
+#   report.rs      — display formatting
+#   type_check.rs  — type checker integration
+#   git_diff.rs    — diff filtering
+#   config.rs      — config parsing
+#   harness.rs     — harness extraction
+
+exclude_re = [
+  "src/(main|progress|trace|report|type_check|git_diff|config|harness)\\.rs",
+]

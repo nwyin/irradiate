@@ -16,6 +16,7 @@ venv/
 tests/fixtures/simple_project/mutants/
 tests/fixtures/simple_project/.irradiate/
 mutants*
+!.cargo/mutants.toml
 
 # Vendor smoke test repos and results (downloaded at runtime)
 tests/vendor_repos/
