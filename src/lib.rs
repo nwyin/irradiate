@@ -10,6 +10,7 @@ pub mod progress;
 pub mod protocol;
 pub mod report;
 pub mod stats;
+pub mod string_scanner;
 pub mod trace;
 pub mod trampoline;
 pub mod type_check;

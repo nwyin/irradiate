@@ -208,14 +208,13 @@ pub fn mutate_file(
 
                 // Count open parens on the `def` line to detect multi-line signatures.
                 // String-aware: parens inside string literals don't count (e.g. `bounds="[)"`).
-                let mut paren_depth: i32 = 0;
-                count_parens_string_aware(line, &mut paren_depth);
+                let mut paren_depth: i32 = crate::string_scanner::paren_depth_change(line);
 
                 // If paren_depth > 0, the signature continues on the following lines.
                 // Advance past all continuation lines until the signature is closed.
                 i += 1;
                 while i < lines.len() && paren_depth > 0 {
-                    count_parens_string_aware(lines[i], &mut paren_depth);
+                    paren_depth += crate::string_scanner::paren_depth_change(lines[i]);
                     i += 1;
                 }
 
@@ -482,70 +481,6 @@ fn extract_func_name(line: &str) -> &str {
     };
 
     after_def.split('(').next().unwrap_or("")
-}
-
-/// Count parentheses in a line, skipping those inside string literals.
-/// Handles single-quoted, double-quoted, and triple-quoted strings.
-fn count_parens_string_aware(line: &str, depth: &mut i32) {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape = false;
-    let chars: Vec<char> = line.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        let ch = chars[i];
-        if escape {
-            escape = false;
-            i += 1;
-            continue;
-        }
-        if ch == '\\' && (in_single || in_double) {
-            escape = true;
-            i += 1;
-            continue;
-        }
-        if !in_single && !in_double {
-            // Check for triple quotes
-            if ch == '\'' && i + 2 < len && chars[i + 1] == '\'' && chars[i + 2] == '\'' {
-                in_single = true;
-                i += 3;
-                continue;
-            }
-            if ch == '"' && i + 2 < len && chars[i + 1] == '"' && chars[i + 2] == '"' {
-                in_double = true;
-                i += 3;
-                continue;
-            }
-            match ch {
-                '\'' => { in_single = true; }
-                '"' => { in_double = true; }
-                '(' => { *depth += 1; }
-                ')' => { *depth -= 1; }
-                '#' => { return; } // Rest of line is a comment
-                _ => {}
-            }
-        } else if in_single {
-            if ch == '\'' && i + 2 < len && chars[i + 1] == '\'' && chars[i + 2] == '\'' {
-                in_single = false;
-                i += 3;
-                continue;
-            }
-            if ch == '\'' {
-                in_single = false;
-            }
-        } else if in_double {
-            if ch == '"' && i + 2 < len && chars[i + 1] == '"' && chars[i + 2] == '"' {
-                in_double = false;
-                i += 3;
-                continue;
-            }
-            if ch == '"' {
-                in_double = false;
-            }
-        }
-        i += 1;
-    }
 }
 
 /// Indent every line of `code` by `indent` units using `indent_char`.
