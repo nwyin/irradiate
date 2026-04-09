@@ -642,6 +642,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_cache_key_returns_some_nonempty_string() {
+        // build_cache_key (the public wrapper) must delegate to build_cache_key_with_version
+        // and return a non-empty hash string for valid inputs.
+        let tmp = tempfile::tempdir().unwrap();
+        let test_file = tmp.path().join("tests").join("test_mod.py");
+        fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+        fs::write(&test_file, "def test_foo():\n    assert True\n").unwrap();
+        let test_ids = vec!["tests/test_mod.py::test_foo".to_string()];
+
+        let key = build_cache_key(
+            tmp.path(),
+            &descriptor(),
+            &test_ids,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(key.is_some(), "Valid inputs must produce a cache key");
+        let key_str = key.unwrap();
+        assert!(!key_str.is_empty(), "Cache key must not be empty");
+        assert!(key_str.len() > 10, "Cache key should be a hex hash, got: {key_str}");
+    }
+
+    #[test]
     fn test_build_cache_key_returns_none_for_unresolvable_test_id() {
         let tmp = tempfile::tempdir().unwrap();
         let test_ids = vec!["tests/missing.py::test_foo".to_string()];
@@ -800,6 +825,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_size_bare_bytes() {
+        // "b" unit and empty unit both mean bytes
+        assert_eq!(parse_size("1024b").unwrap(), 1024);
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1b").unwrap(), 1);
+        assert_eq!(parse_size("0b").unwrap(), 0);
+    }
+
+    #[test]
     fn test_parse_size_invalid() {
         assert!(parse_size("").is_err());
         assert!(parse_size("abc").is_err());
@@ -880,6 +914,93 @@ mod tests {
         assert_eq!(result.pruned, 1);
         // File still exists
         assert!(old.exists());
+    }
+
+    #[test]
+    fn test_gc_max_age_boundary_exact_threshold() {
+        // Entry age == max_age should NOT be pruned (only strictly older entries are)
+        let tmp = tempfile::tempdir().unwrap();
+        let p1 = create_cache_file(tmp.path(), "aabbcc", "data");
+        backdate_mtime(&p1, 100);
+
+        // max_age = 100s: entry is exactly 100s old, so age > max_age is false
+        let result = gc(tmp.path(), 100, u64::MAX, false).unwrap();
+        assert_eq!(result.pruned, 0, "Entry at exactly max_age should not be pruned");
+        assert!(p1.exists());
+    }
+
+    #[test]
+    fn test_gc_max_age_boundary_one_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p1 = create_cache_file(tmp.path(), "aabbcc", "data");
+        backdate_mtime(&p1, 101);
+
+        // max_age = 100s: entry is 101s old, strictly older
+        let result = gc(tmp.path(), 100, u64::MAX, false).unwrap();
+        assert_eq!(result.pruned, 1, "Entry older than max_age should be pruned");
+        assert!(!p1.exists());
+    }
+
+    #[test]
+    fn test_gc_max_size_boundary_exact_limit() {
+        // Total size == max_size should NOT trigger eviction
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(500);
+        let _p1 = create_cache_file(tmp.path(), "aabbcc", &content);
+        let _p2 = create_cache_file(tmp.path(), "ddeeff", &content);
+        // Total ~1000 bytes
+
+        let result = gc(tmp.path(), u64::MAX, 1000, false).unwrap();
+        assert_eq!(result.pruned, 0, "Total == max_size should not evict");
+    }
+
+    #[test]
+    fn test_gc_max_size_boundary_one_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(500);
+        let p1 = create_cache_file(tmp.path(), "aabbcc", &content);
+        let _p2 = create_cache_file(tmp.path(), "ddeeff", &content);
+        backdate_mtime(&p1, 100); // make p1 older so it's evicted first
+        // Total ~1000 bytes
+
+        let result = gc(tmp.path(), u64::MAX, 999, false).unwrap();
+        assert_eq!(result.pruned, 1, "Total > max_size should evict oldest");
+        assert!(!p1.exists(), "Oldest entry should be evicted");
+    }
+
+    #[test]
+    fn test_gc_size_eviction_accumulates_correctly() {
+        // Verify pruned_bytes and remaining_bytes are computed correctly
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(1000);
+        let p1 = create_cache_file(tmp.path(), "aabbcc", &content);
+        let p2 = create_cache_file(tmp.path(), "ddeeff", &content);
+        let _p3 = create_cache_file(tmp.path(), "gghhii", &content);
+        backdate_mtime(&p1, 300);
+        backdate_mtime(&p2, 200);
+
+        // Max 1500 bytes: need to evict 2 of 3
+        let result = gc(tmp.path(), u64::MAX, 1500, false).unwrap();
+        assert_eq!(result.pruned, 2);
+        assert_eq!(result.remaining, 1);
+        assert!(result.pruned_bytes >= 2000, "Should have pruned ~2000 bytes");
+        assert!(result.remaining_bytes >= 1000, "Should have ~1000 bytes remaining");
+    }
+
+    #[test]
+    fn test_gc_dry_run_preserves_all_files_and_reports_correctly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "x".repeat(500);
+        let p1 = create_cache_file(tmp.path(), "aabbcc", &content);
+        let p2 = create_cache_file(tmp.path(), "ddeeff", &content);
+        backdate_mtime(&p1, 100);
+
+        // Both age-based and size-based would prune
+        let result = gc(tmp.path(), 50, 100, true).unwrap();
+        assert!(result.pruned > 0);
+        // All files must still exist
+        assert!(p1.exists(), "dry_run must not delete files");
+        assert!(p2.exists(), "dry_run must not delete files");
     }
 
     #[test]
