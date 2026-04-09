@@ -55,15 +55,24 @@ jobs:
           tool: cargo-mutants
 
       - name: Generate diff
-        run: git diff HEAD~1..HEAD > diff.patch
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch: testing all mutants (no diff filter)"
+            touch diff.patch.skip
+          else
+            git diff HEAD~1..HEAD > diff.patch
+          fi
 
       - name: Run cargo-mutants on diff
         run: |
-          if [ ! -s diff.patch ]; then
+          if [ -f diff.patch.skip ]; then
+            cargo mutants --output mutants-out -- --lib 2>&1 | tee mutants.log
+          elif [ ! -s diff.patch ]; then
             echo "Empty diff, skipping mutation testing"
             exit 0
+          else
+            cargo mutants --in-diff diff.patch --output mutants-out -- --lib 2>&1 | tee mutants.log
           fi
-          cargo mutants --in-diff diff.patch --output mutants-out -- --lib 2>&1 | tee mutants.log
           echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
           tail -20 mutants.log >> "$GITHUB_STEP_SUMMARY"
 
