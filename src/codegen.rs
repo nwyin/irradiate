@@ -1727,6 +1727,192 @@ CACHED = make_cached_stream_func(42)
 
     use proptest::prelude::*;
 
+    /// The __future__ preamble scanner must correctly handle multiple preamble
+    /// elements (blank line, comment, future import, multi-line docstring) and
+    /// emit them all BEFORE the trampoline runtime. This exercises the loop
+    /// arithmetic that increments skip_until through each preamble element.
+    #[test]
+    fn test_preamble_multiple_elements_ordering() {
+        let source = concat!(
+            "\n",                                    // blank line
+            "# Module comment\n",                    // comment
+            "from __future__ import annotations\n",  // future import
+            "\n",                                    // another blank
+            "def add(a, b):\n",
+            "    return a + b\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should mutate");
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        // The first 4 lines (blank, comment, future import, blank) must appear
+        // BEFORE the trampoline preamble (which starts with "import importlib")
+        let preamble_idx = lines.iter().position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must exist");
+        let future_idx = lines.iter().position(|l| l.contains("from __future__"))
+            .expect("future import must exist");
+        assert!(
+            future_idx < preamble_idx,
+            "from __future__ (line {future_idx}) must come before trampoline preamble (line {preamble_idx})"
+        );
+
+        // The comment must also be before the preamble
+        let comment_idx = lines.iter().position(|l| l.contains("# Module comment"))
+            .expect("comment must exist");
+        assert!(
+            comment_idx < preamble_idx,
+            "comment (line {comment_idx}) must come before trampoline preamble (line {preamble_idx})"
+        );
+    }
+
+    /// Multi-line docstring in preamble: exercises the inner scanning loop (lines 123-129)
+    /// that advances idx through the docstring body.
+    #[test]
+    fn test_preamble_multiline_docstring_advances_correctly() {
+        let source = concat!(
+            "\"\"\"Module docstring\n",
+            "spans multiple lines\n",
+            "with various content.\"\"\"\n",
+            "from __future__ import annotations\n",
+            "\n",
+            "def greet(name):\n",
+            "    return f'Hello {name}'\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should mutate");
+        let lines: Vec<&str> = result.source.lines().collect();
+
+        // All docstring lines + future import must come before the trampoline preamble
+        let preamble_idx = lines.iter().position(|l| l.contains("import irradiate_harness"))
+            .expect("trampoline preamble must exist");
+        let docstring_start = lines.iter().position(|l| l.contains("Module docstring"))
+            .expect("docstring start must exist");
+        let future_idx = lines.iter().position(|l| l.contains("from __future__"))
+            .expect("future import must exist");
+        assert!(docstring_start < preamble_idx);
+        assert!(future_idx < preamble_idx);
+    }
+
+    /// Multi-line signature: paren_depth accumulation across continuation lines.
+    /// This exercises the while loop at line 216 where paren_depth is accumulated.
+    #[test]
+    fn test_multiline_signature_three_continuation_lines() {
+        let source = concat!(
+            "def complex_func(\n",
+            "    a,\n",
+            "    b,\n",
+            "    c\n",
+            "):\n",
+            "    return a + b + c\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should mutate");
+
+        // Should have mutated the function (binop_swap on + operators)
+        assert!(
+            !result.mutant_names.is_empty(),
+            "Must produce mutations for multi-line signature function"
+        );
+        // The function body must be preserved in the trampolined output
+        assert!(
+            result.source.contains("return a + b + c") || result.source.contains("__irradiate_"),
+            "Function body must be preserved or trampolined"
+        );
+    }
+
+    /// Triple-quote toggle tracking: verifies that lines inside triple-quoted strings
+    /// with zero indentation don't prematurely end the function body.
+    #[test]
+    fn test_triple_quote_body_not_premature_end() {
+        let source = concat!(
+            "def documented():\n",
+            "    x = 1\n",
+            "    msg = \"\"\"\n",
+            "This line has zero indent inside a triple-quoted string.\n",
+            "It should NOT end the function body.\n",
+            "\"\"\"\n",
+            "    return x + 1\n",
+        );
+        let result = mutate_file(source, "test_mod", None).expect("should mutate");
+
+        // Must have mutations (at least x + 1 → x - 1)
+        assert!(
+            !result.mutant_names.is_empty(),
+            "Must produce mutations even with zero-indent triple-quoted content"
+        );
+        // The trampolined output must include the return statement (not cut off by triple-quote)
+        // Check via descriptors: at least one mutation should target the "+" in "x + 1"
+        let has_plus_mutation = result.descriptors.iter().any(|d| d.original == "+");
+        assert!(has_plus_mutation, "return x + 1 must be in the function body, not cut off by triple-quote");
+    }
+
+    /// name_source_patches: verify counter increments correctly for multiple patches.
+    /// Uses a decorated function that produces source-patch mutations.
+    #[test]
+    fn test_name_source_patches_counter_increments() {
+        use crate::mutation::SourcePatchMutation;
+        let patches = vec![
+            SourcePatchMutation {
+                file_byte_start: 10,
+                file_byte_end: 11,
+                original: "+".to_string(),
+                replacement: "-".to_string(),
+                operator: "binop_swap",
+                function_name: "foo".to_string(),
+                class_name: None,
+                function_source: "def foo():\n    return 1 + 2\n".to_string(),
+                fn_byte_offset: 0,
+                start_line: 1,
+                decorator_text: None,
+                end_line: 2,
+            },
+            SourcePatchMutation {
+                file_byte_start: 10,
+                file_byte_end: 11,
+                original: "+".to_string(),
+                replacement: "*".to_string(),
+                operator: "binop_swap",
+                function_name: "foo".to_string(),
+                class_name: None,
+                function_source: "def foo():\n    return 1 + 2\n".to_string(),
+                fn_byte_offset: 0,
+                start_line: 1,
+                decorator_text: None,
+                end_line: 2,
+            },
+        ];
+        let named = name_source_patches(&patches, "my_mod");
+        assert_eq!(named.len(), 2, "Should produce 2 named patches");
+        // Counter must increment: _1, _2
+        assert!(named[0].mutant_name.ends_with("_1"), "First patch: {}", named[0].mutant_name);
+        assert!(named[1].mutant_name.ends_with("_2"), "Second patch: {}", named[1].mutant_name);
+        // Both should have the sp prefix (not decrem)
+        assert!(named[0].mutant_name.contains("__sp_"), "Expected __sp_ prefix: {}", named[0].mutant_name);
+    }
+
+    /// name_source_patches: decorator_removal uses __decrem prefix.
+    #[test]
+    fn test_name_source_patches_decorator_removal_prefix() {
+        use crate::mutation::SourcePatchMutation;
+        let patches = vec![
+            SourcePatchMutation {
+                file_byte_start: 0,
+                file_byte_end: 10,
+                original: "@cache\n".to_string(),
+                replacement: "".to_string(),
+                operator: "decorator_removal",
+                function_name: "foo".to_string(),
+                class_name: None,
+                function_source: "@cache\ndef foo():\n    pass\n".to_string(),
+                fn_byte_offset: 0,
+                start_line: 1,
+                decorator_text: Some("@cache".to_string()),
+                end_line: 3,
+            },
+        ];
+        let named = name_source_patches(&patches, "my_mod");
+        assert_eq!(named.len(), 1);
+        assert!(named[0].mutant_name.contains("__decrem_"), "Expected __decrem_ prefix: {}", named[0].mutant_name);
+        assert!(named[0].descriptor.operator.starts_with("decorator_removal: @cache"));
+    }
+
     /// Check whether python3 is available on this machine.
     fn python3_available() -> bool {
         std::process::Command::new("python3")
