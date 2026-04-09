@@ -1012,50 +1012,7 @@ async fn test_timeout_does_not_exhaust_crash_budget() {
     );
 }
 
-/// INV-2 + INV-3: The verify-survivors cache correction pipeline.
-///
-/// When verify-survivors detects a false negative (a mutant that survived the warm
-/// session but is killed in isolation), it calls force_update_entry to correct the
-/// stale Survived cache entry. This test verifies the cache is updated correctly.
-#[test]
-fn test_verify_survivors_cache_correction_pipeline() {
-    use irradiate::cache;
-    use irradiate::protocol::MutantStatus;
-
-    let tmp = tempfile::tempdir().unwrap();
-
-    // Simulate: warm-session run stored a Survived result in the cache
-    cache::store_entry(tmp.path(), "abc123def456", 0, 2.0, MutantStatus::Survived).unwrap();
-
-    let before = cache::load_entry(tmp.path(), "abc123def456")
-        .unwrap()
-        .expect("Entry should exist after store");
-    assert_eq!(before.status, MutantStatus::Survived, "Initial status must be Survived");
-
-    // Simulate: verify-survivors isolated run finds the mutant is actually Killed.
-    // The pipeline calls force_update_entry to correct the stale cache entry.
-    cache::force_update_entry(tmp.path(), "abc123def456", 1, 0.8, MutantStatus::Killed).unwrap();
-
-    // INV-3: Cache must now return Killed
-    let after = cache::load_entry(tmp.path(), "abc123def456")
-        .unwrap()
-        .expect("Entry should exist after force_update");
-    assert_eq!(
-        after.status,
-        MutantStatus::Killed,
-        "INV-3: force_update_entry must flip Survived→Killed for future cache hits"
-    );
-    assert_eq!(after.exit_code, 1);
-
-    // INV-3: A second store (simulating a new warm-session run) must not overwrite
-    // the already-corrected Killed entry (store_entry is immutable).
-    cache::store_entry(tmp.path(), "abc123def456", 0, 5.0, MutantStatus::Survived).unwrap();
-    let still_killed = cache::load_entry(tmp.path(), "abc123def456")
-        .unwrap()
-        .expect("Entry must still exist");
-    assert_eq!(
-        still_killed.status,
-        MutantStatus::Killed,
-        "store_entry must not overwrite an existing corrected entry"
-    );
-}
+// test_verify_survivors_cache_correction_pipeline was removed:
+// it was a pure cache unit test (store → force_update → store immutability)
+// duplicating test_force_update_entry_overwrites_existing and
+// test_store_entry_is_immutable in src/cache.rs.
