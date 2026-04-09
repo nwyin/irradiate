@@ -50,6 +50,7 @@ bench/results/
 bench/.venv/
 bench/corpora/
 bench/targets/*/.mutmut-cache
+bench-results/
 
 # Generated docs artifacts
 docs/artifacts/
@@ -63,3 +64,4 @@ site/
 
 # uv
 uv.lock
+
