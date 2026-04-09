@@ -700,18 +700,33 @@ async fn test_stats_collection() {
     println!("tests_by_function: {:?}", test_stats.tests_by_function);
     println!("duration_by_test: {:?}", test_stats.duration_by_test);
 
-    // We should have duration data for all 3 tests
+    // Must have timing data for all 3 tests in the fixture
     assert!(
         test_stats.duration_by_test.len() >= 3,
         "Should have duration data for at least 3 tests, got {}",
         test_stats.duration_by_test.len()
     );
 
-    // Check that function coverage was recorded
-    if !test_stats.tests_by_function.is_empty() {
-        let add_tests = test_stats.tests_for_function("simple_lib.x_add");
-        println!("Tests covering add: {:?}", add_tests);
-    }
+    // Coverage attribution must be populated — this drives covered-only mode.
+    // If this map is empty, the stats plugin failed to record function coverage.
+    assert!(
+        !test_stats.tests_by_function.is_empty(),
+        "tests_by_function is empty — coverage attribution is broken"
+    );
+
+    // Verify concrete mappings: add() should be covered by test_add
+    let add_tests = test_stats.tests_for_function("simple_lib.x_add");
+    assert!(
+        add_tests.iter().any(|t| t.contains("test_add")),
+        "simple_lib.x_add should be covered by test_add, got: {add_tests:?}"
+    );
+
+    // is_positive() should be covered by test_is_positive
+    let pos_tests = test_stats.tests_for_function("simple_lib.x_is_positive");
+    assert!(
+        pos_tests.iter().any(|t| t.contains("test_is_positive")),
+        "simple_lib.x_is_positive should be covered by test_is_positive, got: {pos_tests:?}"
+    );
 }
 
 // --- run_isolated tests ---
