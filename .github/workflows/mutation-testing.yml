@@ -11,7 +11,7 @@ on:
 jobs:
   mutants:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +29,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-mutants-
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache fixture venv
+        uses: actions/cache@v4
+        with:
+          path: tests/fixtures/simple_project/.venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('tests/fixtures/simple_project/pyproject.toml', 'tests/fixtures/simple_project/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-
+
+      - name: Set up fixture venv
+        run: cd tests/fixtures/simple_project && uv venv --python 3.12 --clear && uv pip install pytest
+
       - name: Install cargo-mutants
         uses: taiki-e/install-action@v2
         with:
@@ -44,9 +63,44 @@ jobs:
             exit 0
           fi
           cargo mutants --in-diff diff.patch --output mutants-out -- --lib 2>&1 | tee mutants.log
-          # Report results but don't fail CI yet — let the team calibrate first
           echo "## Mutation Testing Results" >> "$GITHUB_STEP_SUMMARY"
           tail -20 mutants.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for surviving mutants
+        if: always()
+        run: |
+          if [ -f mutants-out/caught.txt ]; then
+            caught=$(wc -l < mutants-out/caught.txt | tr -d ' ')
+          else
+            caught=0
+          fi
+          if [ -f mutants-out/missed.txt ]; then
+            missed=$(wc -l < mutants-out/missed.txt | tr -d ' ')
+          else
+            missed=0
+          fi
+          if [ -f mutants-out/unviable.txt ]; then
+            unviable=$(wc -l < mutants-out/unviable.txt | tr -d ' ')
+          else
+            unviable=0
+          fi
+          if [ -f mutants-out/timeout.txt ]; then
+            timeout=$(wc -l < mutants-out/timeout.txt | tr -d ' ')
+          else
+            timeout=0
+          fi
+          echo "Caught: $caught | Missed: $missed | Unviable: $unviable | Timeout: $timeout"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Caught | Missed | Unviable | Timeout |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|----------|---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| $caught | $missed | $unviable | $timeout |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$missed" -gt 0 ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat mutants-out/missed.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload mutants report
         if: always()
