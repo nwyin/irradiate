@@ -185,6 +185,126 @@ pub fn save_stats_fingerprint(
     let _ = std::fs::write(path, fingerprint);
 }
 
+/// Configuration for `run_stats_subprocess` — captures the divergent parts
+/// between `collect_stats` and `collect_stats_fast`.
+struct StatsRunConfig<'a> {
+    python: &'a Path,
+    project_dir: &'a Path,
+    pythonpath: &'a str,
+    tests_dir: &'a str,
+    extra_pytest_args: &'a [String],
+    timeout_secs: u64,
+    stats_output: &'a Path,
+    pytest_args: &'a [&'a str],
+    extra_env: Vec<(&'a str, String)>,
+    capture_stdout: bool,
+    label: &'a str,
+}
+
+/// Run a stats subprocess (shared between collect_stats and collect_stats_fast).
+///
+/// Handles directory setup, Command construction, stdout/stderr draining,
+/// timeout polling, and exit code checking.
+fn run_stats_subprocess(cfg: StatsRunConfig<'_>) -> Result<()> {
+    let parent = cfg.stats_output.parent()
+        .ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+
+    info!("Collecting stats ({}) with PYTHONPATH={}", cfg.label, cfg.pythonpath);
+
+    let mut cmd = Command::new(cfg.python);
+    cmd.arg("-m").arg("pytest");
+    for arg in cfg.pytest_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("-q")
+        .arg(cfg.tests_dir)
+        .args(cfg.extra_pytest_args)
+        .env("PYTHONPATH", cfg.pythonpath)
+        .env("IRRADIATE_STATS_OUTPUT", cfg.stats_output)
+        .current_dir(cfg.project_dir)
+        .stderr(Stdio::piped());
+
+    for (key, val) in &cfg.extra_env {
+        cmd.env(key, val);
+    }
+
+    if cfg.capture_stdout {
+        cmd.stdout(Stdio::piped());
+    } else {
+        cmd.stdout(Stdio::null());
+    }
+
+    let mut child = cmd.spawn()
+        .with_context(|| format!("Failed to start pytest for {} collection", cfg.label.to_lowercase()))?;
+
+    // Drain stdout and stderr in background threads to avoid pipe-buffer deadlock.
+    let stdout_handle = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stdout, &mut buf).ok();
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut stderr, &mut buf).ok();
+            buf
+        })
+    });
+
+    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "{} collection timed out after {}s. \
+                     Use --stats-timeout to increase (e.g. --stats-timeout 600)",
+                    cfg.label, cfg.timeout_secs,
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+
+    let status = child.wait()?;
+    let stdout_bytes = stdout_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_bytes = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code > 1 && !cfg.stats_output.exists() {
+        let mut detail = String::new();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        if !stdout.trim().is_empty() {
+            detail.push_str(&stdout);
+        }
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        if !stderr.trim().is_empty() {
+            if !detail.is_empty() { detail.push('\n'); }
+            detail.push_str(&stderr);
+        }
+        anyhow::bail!(
+            "{} collection failed (pytest exit code {exit_code}).\n\
+             Run pytest manually to debug: {} -m pytest {}\n\n\
+             {detail}",
+            cfg.label, cfg.python.display(), cfg.tests_dir,
+        );
+    }
+    if exit_code > 1 {
+        info!("{} run exited with code {exit_code} — details in stats.json", cfg.label);
+    }
+    if exit_code == 1 {
+        info!("{} collection completed with some test failures (exit code 1) — this is OK", cfg.label);
+    }
+
+    Ok(())
+}
+
 /// Run the test suite with the stats plugin to collect coverage information.
 ///
 /// This runs pytest once with `--irradiate-stats` and `MUTANT_UNDER_TEST=stats`
@@ -205,95 +325,22 @@ pub fn collect_stats(
     timeout_secs: u64,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
-    let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-
-    info!("Collecting stats with PYTHONPATH={pythonpath}");
-
-    let mut child = Command::new(python)
-        .arg("-m")
-        .arg("pytest")
-        .arg("--irradiate-stats")
-        .arg("-p")
-        .arg("irradiate_harness")
-        .arg("-p")
-        .arg("irradiate_harness.stats_plugin")
-        .arg("-q")
-        .arg(tests_dir)
-        .args(extra_pytest_args)
-        .env("PYTHONPATH", pythonpath)
-        .env("IRRADIATE_MUTANTS_DIR", mutants_dir)
-        .env("IRRADIATE_STATS_OUTPUT", &stats_output)
-        .current_dir(project_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to start pytest for stats collection")?;
-
-    // Wait with timeout. Stdout goes to /dev/null (stats are written to a JSON file,
-    // not stdout). Stderr is piped for error reporting but drained in a background
-    // thread to avoid pipe-buffer deadlock when pytest produces large output.
-    let stderr_handle = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut stderr, &mut buf).ok();
-            buf
-        })
-    });
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let start = Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "Stats collection timed out after {}s — the test suite may be too slow under the trampoline. \
-                     Use --stats-timeout to increase (e.g. --stats-timeout 600)",
-                    timeout_secs
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
-
-    let status = child.wait()?;
-    let stderr_bytes = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-
-    // The stats plugin writes exit_status, test_count, and fail_validated into
-    // the stats JSON. Pipeline reads those fields for validation. We only bail
-    // here if pytest couldn't even start (no output file at all).
-    let exit_code = status.code().unwrap_or(-1);
-    if exit_code > 1 {
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
-        // pytest_sessionfinish may still have written the file — check before bailing
-        if !stats_output.exists() {
-            anyhow::bail!(
-                "Stats collection failed (pytest exit code {exit_code}).\n\
-                 Run pytest manually to debug: {} -m pytest {tests_dir}\n\n\
-                 stderr:\n{stderr}",
-                python.display(),
-            );
-        }
-        info!("Stats run exited with code {exit_code} — details in stats.json");
-    }
-    if exit_code == 1 {
-        info!("Stats collection completed with some test failures (exit code 1) — this is OK");
-    }
-
-    info!(
-        "Stats collection complete, loading from {}",
-        stats_output.display()
-    );
-
+    run_stats_subprocess(StatsRunConfig {
+        python,
+        project_dir,
+        pythonpath,
+        tests_dir,
+        extra_pytest_args,
+        timeout_secs,
+        stats_output: &stats_output,
+        pytest_args: &["--irradiate-stats", "-p", "irradiate_harness", "-p", "irradiate_harness.stats_plugin"],
+        extra_env: vec![("IRRADIATE_MUTANTS_DIR", mutants_dir.as_os_str().to_string_lossy().into_owned())],
+        capture_stdout: false,
+        label: "Stats",
+    })?;
     if stats_output.exists() {
         TestStats::load(&stats_output)
     } else {
-        // Stats plugin may not have written anything if no trampolined functions were hit
         Ok(TestStats::default())
     }
 }
@@ -331,102 +378,20 @@ pub fn collect_stats_fast(
     timeout_secs: u64,
 ) -> Result<TestStats> {
     let stats_output = project_dir.join(".irradiate").join("stats.json");
-    let parent = stats_output.parent().ok_or_else(|| anyhow::anyhow!("stats output path has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-
     let function_map_path = project_dir.join(".irradiate").join("mutated_functions.json");
-
-    info!("Collecting stats (fast) with PYTHONPATH={pythonpath}");
-
-    let mut child = Command::new(python)
-        .arg("-m")
-        .arg("pytest")
-        .arg("--irradiate-fast-stats")
-        .arg("-p")
-        .arg("irradiate_harness.fast_stats_plugin")
-        .arg("-q")
-        .arg(tests_dir)
-        .args(extra_pytest_args)
-        .env("PYTHONPATH", pythonpath)
-        .env("IRRADIATE_STATS_OUTPUT", &stats_output)
-        .env("IRRADIATE_FUNCTION_MAP", &function_map_path)
-        // Note: no IRRADIATE_MUTANTS_DIR — import hook does not activate
-        .current_dir(project_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to start pytest for fast stats collection")?;
-
-    // Drain stdout and stderr in background threads to avoid pipe-buffer deadlock.
-    let stdout_handle = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut stdout, &mut buf).ok();
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut stderr, &mut buf).ok();
-            buf
-        })
-    });
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let start = Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => break,
-            None if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "Fast stats collection timed out after {}s. \
-                     Use --stats-timeout to increase (e.g. --stats-timeout 600)",
-                    timeout_secs
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(200)),
-        }
-    }
-
-    let status = child.wait()?;
-    let stdout_bytes = stdout_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    let stderr_bytes = stderr_handle
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-
-    let exit_code = status.code().unwrap_or(-1);
-    if exit_code > 1 {
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
-        if !stats_output.exists() {
-            // pytest exited before writing stats — surface both streams so the
-            // user sees the actual collection errors (missing deps, import failures, etc.).
-            let mut detail = String::new();
-            if !stdout.trim().is_empty() {
-                detail.push_str(&stdout);
-            }
-            if !stderr.trim().is_empty() {
-                if !detail.is_empty() { detail.push('\n'); }
-                detail.push_str(&stderr);
-            }
-            anyhow::bail!(
-                "Stats collection failed (pytest exit code {exit_code}).\n\
-                 Run pytest manually to debug: {} -m pytest {tests_dir}\n\n\
-                 {detail}",
-                python.display(),
-            );
-        }
-        info!("Fast stats run exited with code {exit_code} — details in stats.json");
-    }
-    if exit_code == 1 {
-        info!("Fast stats collection completed with some test failures (exit code 1) — this is OK");
-    }
-
+    run_stats_subprocess(StatsRunConfig {
+        python,
+        project_dir,
+        pythonpath,
+        tests_dir,
+        extra_pytest_args,
+        timeout_secs,
+        stats_output: &stats_output,
+        pytest_args: &["--irradiate-fast-stats", "-p", "irradiate_harness.fast_stats_plugin"],
+        extra_env: vec![("IRRADIATE_FUNCTION_MAP", function_map_path.to_string_lossy().into_owned())],
+        capture_stdout: true,
+        label: "Fast stats",
+    })?;
     if stats_output.exists() {
         TestStats::load(&stats_output)
     } else {
